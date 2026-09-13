@@ -1,0 +1,26 @@
+﻿# 构建产物
+build/
+build-*/
+out/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.exe
+
+# Visual Studio / CMake
+.vs/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# DSH 会话缓存
+/.dsh
+
+# 规划与草稿
+/不入库文件/
