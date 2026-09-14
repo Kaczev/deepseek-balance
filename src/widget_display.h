@@ -50,6 +50,14 @@ public:
     const std::string& rollNewText() const { return rollNewText_; }
     bool rolling() const { return rollFraction_ < 1.0 && !rollOldText_.empty(); }
 
+    // 滚动期间应当显示哪一段文本。
+    // ★ 数字必须**冻结**成"起点文本"或"目标文本"两者之一，不能每帧按插值后的
+    //   数值重算——那样每帧都换一套数字，看起来就是一闪一闪（实测确认：
+    //   每帧 text 从 20.30 变到 21.47 再变到 23.32，闪的来源就在这里）。
+    //   竖直偏移负责"动"，文本负责"内容"，两者不能同时变。
+    std::string TextToShow() const;
+    double AmountToShow() const;
+
     // 是否处于"连续两次采样都是 0"的确认态
     bool zeroConfirmed() const { return zeroConfirmed_; }
 

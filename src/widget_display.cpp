@@ -86,7 +86,10 @@ double DisplayedAmount::Update(double dtSeconds) {
     const double e = t * t * (3.0 - 2.0 * t);
     value_ = rollFromValue_ + (target_ - rollFromValue_) * e;
 
-    if (t >= 1.0) value_ = target_;            // 精确落位，不留 99.9997
+    if (t >= 1.0) {
+        value_ = target_;                      // 精确落位，不留 99.9997
+        rollOldText_.clear();                  // 滚动结束，文本回到"按数值算"
+    }
     return value_;
 }
 
@@ -105,6 +108,22 @@ const wchar_t* StatusTextFor(ConnState state) {
     }
 }
 
+std::string DisplayedAmount::TextToShow() const {
+    if (!hasValue_) return "--.--";
+    if (rolling()) return rollNewText_;        // 滚动期间冻结在目标文本上
+    return Amount{static_cast<AmountRaw>(std::llround(value_ * kUnitsPerYuan))}.ToString2();
+}
+
+double DisplayedAmount::AmountToShow() const {
+    if (!hasValue_) return 0.0;
+    if (rolling()) {
+        // 文本冻结在目标值上，所以显示值也按目标值报——否则"当前值"和
+        // "正在显示的文本"会互相矛盾（上一版就是这样：文本说 20.30，画面却在滚向 99.50）
+        return std::atof(rollNewText_.c_str());
+    }
+    return value_;
+}
+
 WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, bool currencyKnown,
                              const wchar_t* currencySymbol) {
     WidgetFrame f{};
@@ -116,8 +135,7 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     const bool haveNumber = amount.hasValue() && currencyKnown;
     f.showAmount = haveNumber;
     if (haveNumber) {
-        Amount a{static_cast<AmountRaw>(std::llround(amount.value() * kUnitsPerYuan))};
-        f.amountText = a.ToString2();
+        f.amountText = amount.TextToShow();     // 滚动期间是冻结的目标文本
         f.currencySymbol = currencySymbol ? currencySymbol : L"";
     } else {
         f.amountText = "--.--";                // 占位符，不是 0.00

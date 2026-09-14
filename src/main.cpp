@@ -44,6 +44,7 @@ bool g_debug = false;            // --debug：显示调试浮层
 bool g_selftestB = false;        // --selftest-b：金额解析与状态机的自检
 bool g_layoutProbe = false;      // --layout-probe：导出模式下打印布局数值
 int g_dpiOverride = 0;           // --dpi=N：覆盖画布缩放（0 = 用窗口真实 DPI）
+double g_uiScale = 1.0;          // --ui-scale=N：视觉缩放（1.0 = 按 DPI，设计意图）
 int g_rollFrames = 0;            // --roll=N：是否导出滚动瞬间（N 只用于日志，步数看 g_rollSteps）
 int g_rollSteps = 0;             // --roll=N：跳变之后推进多少帧（1/60 秒一步）
 bool g_rollLoop = false;         // --roll=loop：每 2 秒来回跳一次，用肉眼反复看滚动
@@ -215,6 +216,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_fake.SetSpeed(_wtof(argv[i] + 8));
         } else if (wcsncmp(argv[i], L"--dpi=", 6) == 0) {
             g_dpiOverride = _wtoi(argv[i] + 6);
+        } else if (wcsncmp(argv[i], L"--ui-scale=", 11) == 0) {
+            g_uiScale = _wtof(argv[i] + 11);
         } else if (wcsncmp(argv[i], L"--roll=", 7) == 0) {
             g_rollFrames = 1;                     // 只要出现这个参数就进入滚动抓帧模式
             if (wcscmp(argv[i] + 7, L"loop") == 0) {
@@ -285,6 +288,22 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     dshb::Renderer renderer;
     g_renderer = &renderer;
     dshb::CanvasSize size = dshb::Renderer::SizeForWindow(g_hwnd);
+
+    // ★ 视觉缩放（--ui-scale=）。默认 1.0 = 按 DPI 缩放，也就是设计意图。
+    //   存在的理由：在 200% 缩放的屏上，"315 DIP"要占 630 个物理像素，看起来偏大。
+    //   观感由所有者定，所以给他一个能当场拧的旋钮，而不是靠文档说服他。
+    if (g_uiScale > 0.0 && g_uiScale != 1.0) {
+        const double base = static_cast<double>(size.scale) * g_uiScale;
+        size.scale = static_cast<float>(base);
+        size.widthPx = static_cast<int>(dshb::kCanvasWidthDip * base + 0.5);
+        size.heightPx = static_cast<int>(dshb::kCanvasHeightDip * base + 0.5);
+        // 窗口也要跟着缩，否则画布缩了、窗口没缩，面板会在窗口里偏到一角
+        SetWindowPos(g_hwnd, nullptr, 0, 0, size.widthPx, size.heightPx,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        SelfTestLog(L"[render] 视觉缩放 %.2f -> 画布 %dx%d 像素", g_uiScale, size.widthPx,
+                    size.heightPx);
+    }
+
     // 导出用的缩放覆盖：让同一套 315×129 设计稿在 100% / 150% / 200% 下各导一张，
     // 这样字号能在真实尺寸下被判断（所有者指出过：只看 200% 的图看不出字号合不合适）。
     if (g_dpiOverride > 0) {
@@ -453,7 +472,17 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 g_states.OnSample(jump, jump.wallMs);
                 g_display.OnSample(g_states.lastGood());
             }
-            for (int i = 0; i < g_rollSteps; ++i) g_display.Update(1.0 / 60.0);
+            for (int i = 0; i < g_rollSteps; ++i) {
+                g_display.Update(1.0 / 60.0);
+                // 诊断：把每帧的显示值、滚动进度、以及"这一刻画出来的文本"都记下来。
+                // 数字一闪一闪的根源如果不在这里，这条日志会直接排除它。
+                const dshb::ConnState stD = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
+                const dshb::WidgetFrame fd = dshb::BuildWidgetFrame(
+                    stD, g_display, true, L"\u00A5");
+                SelfTestLog(L"[rollstep] i=%d value=%.2f frac=%.3f active=%d text=%hs",
+                            i, g_display.value(), g_display.rollFraction(),
+                            fd.roll.active ? 1 : 0, fd.amountText.c_str());
+            }
 
             SelfTestLog(L"[roll] 跳变前=%.2f 跳变后目标=%.2f 推进 %d 帧后显示=%.2f",
                         before, g_display.target(), g_rollSteps, g_display.value());
