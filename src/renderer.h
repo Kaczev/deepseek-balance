@@ -13,6 +13,8 @@
 
 #include <string>
 
+#include "widget_display.h"
+
 #include <cstdint>
 
 namespace dshb {
@@ -76,6 +78,12 @@ public:
     void SetDebugText(std::wstring text) { debugText_ = std::move(text); }
     const std::wstring& debugText() const { return debugText_; }
 
+    // ★ 正文（C 阶段）：标题/状态行、余额数字、币种符号、清零预估。
+    //   渲染层只认这个结构——它不关心余额是怎么来的，也不该知道
+    //   "余额为 0" 与 "查不到" 有什么区别（那是状态机的事）。
+    void SetWidgetFrame(const WidgetFrame& frame);
+    const WidgetFrame& widgetFrame() const { return widget_; }
+
     const CanvasSize& size() const { return size_; }
     bool ready() const { return ready_; }
 
@@ -86,8 +94,15 @@ private:
     bool spillout_ = false;
     double flashStart_ = -1000.0;   // 负值表示"没在闪"
     std::wstring debugText_;
+    WidgetFrame widget_{};
     struct Impl;
     Impl* impl_ = nullptr;
 };
+
+// 布局诊断开关（临时）：打开后把"算出来画在哪、实际量到多宽"记在内存里。
+// ★ 写文件必须由外面在**绘制结束之后**调用 DumpLayoutProbe 完成：
+//   在绘制路径里做文件 I/O 会让进程崩溃（实测 0xC0000409，试了两次）。
+void SetLayoutProbe(bool on);
+void DumpLayoutProbe();
 
 }  // namespace dshb

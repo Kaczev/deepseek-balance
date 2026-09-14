@@ -14,9 +14,75 @@
 #include <wincodec.h>     // 离屏导帧用
 
 #include <cmath>   // std::fmod
+#include <cstring> // std::strcmp
 #include <string>
 
 namespace dshb {
+
+namespace {
+
+// 布局诊断开关（临时）。定义必须在使用它的 SetLayoutProbe 之前——C++ 里
+// 名字要先声明，这一条我在别处已经踩过一次，不再踩。
+bool g_layoutProbe = false;
+
+// ★★ 两条用血换来的规矩：
+//   1. **绝不在绘制路径里做文件 I/O**。试过两次，两次都崩（0xC0000409），
+//      连"导出模式下只画一帧所以安全"这个想法也是错的。
+//      正确做法是：绘制期间只往内存里记，画完由外面调用 DumpLayoutProbe 写出去。
+//   2. 诊断代码也是代码，它一样会把程序弄崩。所以它要被挡在正常运行之外。
+struct LayoutProbeData {
+    bool enabled = false;
+    bool filled = false;
+    float centerX = 0, symbolW = 0, digitsW = 0, left = 0;
+    float boxLeft = 0, boxTop = 0, numberTop = 0, boxRight = 0;
+};
+LayoutProbeData g_probe;
+
+void LayoutProbe(const char* tag, float a, float b, float c, float d) {
+    if (!g_probe.enabled) return;
+    if (std::strcmp(tag, "number") == 0) {
+        g_probe.centerX = a;
+        g_probe.symbolW = b;
+        g_probe.digitsW = c;
+        g_probe.left = d;
+    } else if (std::strcmp(tag, "boxes") == 0) {
+        g_probe.boxLeft = a;
+        g_probe.boxTop = b;
+        g_probe.numberTop = c;
+        g_probe.boxRight = d;
+    }
+    g_probe.filled = true;
+}
+
+}  // namespace
+
+void SetLayoutProbe(bool on) {
+    g_layoutProbe = on;
+    g_probe.enabled = on;
+}
+
+// 画完之后由外面调用：把绘制期间记下的数值写出去。
+// **不在绘制路径里写文件**——那会把进程弄崩。
+void DumpLayoutProbe() {
+    if (!g_probe.enabled || !g_probe.filled) return;
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (wchar_t* slash = wcsrchr(exe, L'\\')) *(slash + 1) = L'\0';
+    std::wstring path = exe;
+    path += L"layout.log";
+
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"a, ccs=UTF-8") == 0 && f) {
+        fwprintf(f, L"[layout] 实体区中心 cx=%.2f 符号宽=%.2f 数字宽=%.2f 合并块左缘=%.2f\n",
+                 g_probe.centerX, g_probe.symbolW, g_probe.digitsW, g_probe.left);
+        fwprintf(f, L"[layout] 数字顶=%.2f 标题框=%.2f,%.2f 右边界=%.2f\n", g_probe.numberTop,
+                 g_probe.boxLeft, g_probe.boxTop, g_probe.boxRight);
+        const float blockCenter = g_probe.left + (g_probe.symbolW + g_probe.digitsW) * 0.5f;
+        fwprintf(f, L"[layout] 合并块中心=%.2f 与实体区中心之差=%.2f（目标：接近 0）\n",
+                 blockCenter, blockCenter - g_probe.centerX);
+        fclose(f);
+    }
+}
 
 namespace {
 
@@ -47,6 +113,9 @@ constexpr Rgba kWhite{1.0f, 1.0f, 1.0f, 0.9f};
 // ---------------------------------------------------------------------------
 enum class SceneMode { Normal, PremulProbe };
 SceneMode g_sceneMode = SceneMode::Normal;
+
+// 当前要画的正文。由 Renderer::SetWidgetFrame 填，绘制函数只读。
+WidgetFrame g_widgetFrame{};
 
 // 调试浮层用的 DirectWrite 工厂与文本格式。懒创建：不带调试开关时一行都不建。
 IDWriteFactory* DebugWriteFactory() {
@@ -110,6 +179,191 @@ double FlashPulse(double nowSeconds, double flashStart) {
     return wave;
 }
 
+// 文本格式的取用口。字号都是 DIP，所以观感与 DPI 无关。
+enum class FontRole { Title, Number, Unit, Estimate, Debug };
+
+IDWriteTextFormat* TextFormatFor(FontRole role) {
+    IDWriteFactory* dw = DebugWriteFactory();
+    if (!dw) return nullptr;
+
+    struct Slot {
+        IDWriteTextFormat* fmt = nullptr;
+        bool tried = false;
+    };
+    static Slot slots[5];
+
+    const int idx = static_cast<int>(role);
+    Slot& slot = slots[idx];
+    if (!slot.tried) {
+        slot.tried = true;
+        // 中文正文用雅黑；数字用同一族的等宽数字（tnum）避免滚动时左右抖
+        const wchar_t* family = (role == FontRole::Debug) ? L"Consolas" : L"Microsoft YaHei UI";
+        float size = 13.0f;
+        DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
+        switch (role) {
+        case FontRole::Title: size = 11.0f; break;
+        case FontRole::Number: size = 40.0f; weight = DWRITE_FONT_WEIGHT_SEMI_BOLD; break;
+        case FontRole::Unit: size = 18.0f; break;
+        case FontRole::Estimate: size = 12.0f; break;
+        case FontRole::Debug: size = 13.0f; break;
+        }
+        if (FAILED(dw->CreateTextFormat(family, nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
+                                        DWRITE_FONT_STRETCH_NORMAL, size, L"zh-cn", &slot.fmt))) {
+            slot.fmt = nullptr;
+        } else {
+            slot.fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            slot.fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            slot.fmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
+    }
+    return slot.fmt;
+}
+
+// 量一段文字在给定格式下的宽度（DIP）。
+// 居中、布局余量判断都靠它——"差不多居中"靠眼睛是判不出来的。
+float MeasureTextWidth(const std::wstring& text, IDWriteTextFormat* fmt) {
+    if (text.empty() || !fmt) return 0.0f;
+    IDWriteFactory* dw = DebugWriteFactory();
+    if (!dw) return 0.0f;
+    IDWriteTextLayout* layout = nullptr;
+    if (FAILED(dw->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), fmt,
+                                    4096.0f, 256.0f, &layout)) ||
+        !layout) {
+        return 0.0f;
+    }
+    DWRITE_TEXT_METRICS m{};
+    float width = 0.0f;
+    if (SUCCEEDED(layout->GetMetrics(&m))) width = m.widthIncludingTrailingWhitespace;
+    layout->Release();
+    return width;
+}
+
+// 在一行里画一段文字，横向居中对齐到 centerX（画布坐标）
+void DrawCentered(ID2D1RenderTarget* rt, const std::wstring& text, IDWriteTextFormat* fmt,
+                  float centerX, float topY, const D2D1_COLOR_F& color, float scale) {
+    if (text.empty() || !fmt) return;
+    IDWriteFactory* dw = DebugWriteFactory();
+    if (!dw) return;
+
+    ID2D1SolidColorBrush* brush = nullptr;
+    if (FAILED(rt->CreateSolidColorBrush(color, &brush)) || !brush) return;
+
+    IDWriteTextLayout* layout = nullptr;
+    if (SUCCEEDED(dw->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), fmt,
+                                       static_cast<float>(rt->GetSize().width), 256.0f,
+                                       &layout)) &&
+        layout) {
+        const float w = MeasureTextWidth(text, fmt);
+        rt->DrawTextLayout(D2D1::Point2F(centerX - w * 0.5f, topY), layout, brush,
+                           D2D1_DRAW_TEXT_OPTIONS_NONE);
+        layout->Release();
+    }
+    brush->Release();
+    (void)scale;
+}
+
+// 正文（C 阶段）：标题兼状态行、余额数字、币种符号、清零预估。
+//
+// 排布理由（设计 §9.2）：
+//   数字是主角，所以它最大；标题小、放左上；清零预估放底部。
+//   币种符号**放前缀**（¥12.34），不是后缀——中文习惯里 12.34¥ 读起来像单位换算。
+void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const WidgetFrame& f) {
+    if (g_sceneMode != SceneMode::Normal) return;
+
+    const float s = canvas.scale;
+    const float cx = (kMarginDip + kEntityWidthDip * 0.5f) * s;   // 实体区横向中心
+    const float top = kMarginDip * s;
+
+    IDWriteTextFormat* titleFmt = TextFormatFor(FontRole::Title);
+    IDWriteTextFormat* numFmt = TextFormatFor(FontRole::Number);
+    IDWriteTextFormat* unitFmt = TextFormatFor(FontRole::Unit);
+    IDWriteTextFormat* estFmt = TextFormatFor(FontRole::Estimate);
+
+    // 标题兼状态行：左上角。状态变了文字就换，不只靠颜色编码。
+    if (f.statusText && titleFmt) {
+        ID2D1SolidColorBrush* b = nullptr;
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 0.85f), &b)) && b) {
+            IDWriteTextLayout* layout = nullptr;
+            if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
+                    f.statusText, static_cast<UINT32>(wcslen(f.statusText)), titleFmt,
+                    kEntityWidthDip * s, 64.0f, &layout)) &&
+                layout) {
+                rt->DrawTextLayout(D2D1::Point2F((kMarginDip + 12.0f) * s, (kMarginDip + 8.0f) * s),
+                                   layout, b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                layout->Release();
+            }
+            b->Release();
+        }
+    }
+
+    // 余额数字：居中。数字与符号一起量宽度，保证"整体"居中而不是"数字"居中。
+    {
+        const std::wstring digits(f.amountText.begin(), f.amountText.end());
+        const std::wstring symbol = f.currencySymbol ? f.currencySymbol : L"";
+        const float digitsW = MeasureTextWidth(digits, numFmt);
+        const float symbolW = symbol.empty() ? 0.0f : MeasureTextWidth(symbol, unitFmt);
+        const float gap = symbol.empty() ? 0.0f : 2.0f * s;
+        const float totalW = symbolW + gap + digitsW;
+        const float left = cx - totalW * 0.5f;
+        const float numberTop = top + 34.0f * s;
+
+        // 诊断：把输入与结果都打出来（只在 --layout-probe 时写文件）
+        LayoutProbe("number", cx, symbolW, digitsW, left);
+        LayoutProbe("boxes", (kMarginDip + 12.0f) * s, (kMarginDip + 8.0f) * s,
+                    numberTop, (kMarginDip + kEntityWidthDip) * s);
+
+        if (!symbol.empty()) {
+            ID2D1SolidColorBrush* b = nullptr;
+            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 0.9f), &b)) && b) {
+                IDWriteTextLayout* layout = nullptr;
+                if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
+                        symbol.c_str(), static_cast<UINT32>(symbol.size()), unitFmt, 256.0f, 64.0f,
+                        &layout)) &&
+                    layout) {
+                    // 符号与数字的基线大致对齐：符号字号小，往下压一点
+                    rt->DrawTextLayout(D2D1::Point2F(left, numberTop + 14.0f * s), layout, b,
+                                       D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    layout->Release();
+                }
+                b->Release();
+            }
+        }
+
+        ID2D1SolidColorBrush* b = nullptr;
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 1.0f), &b)) && b) {
+            IDWriteTextLayout* layout = nullptr;
+            if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
+                    digits.c_str(), static_cast<UINT32>(digits.size()), numFmt, 2048.0f, 128.0f,
+                    &layout)) &&
+                layout) {
+                rt->DrawTextLayout(D2D1::Point2F(left + symbolW + gap, numberTop), layout, b,
+                                   D2D1_DRAW_TEXT_OPTIONS_NONE);
+                layout->Release();
+            }
+            b->Release();
+        }
+    }
+
+    // 清零预估：底部居中小字。C9 之前这里是空的——**不编假数据**。
+    if (!f.zeroTimeText.empty() && estFmt) {
+        const std::wstring t(f.zeroTimeText.begin(), f.zeroTimeText.end());
+        ID2D1SolidColorBrush* b = nullptr;
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 0.75f), &b)) && b) {
+            IDWriteTextLayout* layout = nullptr;
+            if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
+                    t.c_str(), static_cast<UINT32>(t.size()), estFmt, kEntityWidthDip * s, 64.0f,
+                    &layout)) &&
+                layout) {
+                const float w = MeasureTextWidth(t, estFmt);
+                rt->DrawTextLayout(D2D1::Point2F(cx - w * 0.5f, (kMarginDip + kEntityHeightDip - 26.0f) * s),
+                                   layout, b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                layout->Release();
+            }
+            b->Release();
+        }
+    }
+}
+
 void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedSeconds,
                 double flashAmount, const std::wstring& debugText) {
     if (g_sceneMode == SceneMode::PremulProbe) {
@@ -159,6 +413,9 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
             ring->Release();
         }
     }
+
+    // 正文（C 阶段）：标题、数字、符号、清零预估
+    PaintWidgetText(rt, canvas, g_widgetFrame);
 
     // 调试浮层（B6）：只在带调试开关时有内容。画在画布左上角，
     // 覆盖在余量区上——它是眼睛，不是产品界面。
@@ -335,6 +592,11 @@ void Renderer::Destroy() {
         impl_ = nullptr;
     }
     ready_ = false;
+}
+
+void Renderer::SetWidgetFrame(const WidgetFrame& frame) {
+    widget_ = frame;
+    g_widgetFrame = frame;
 }
 
 void Renderer::BeginActivationFlash(double nowSeconds) {

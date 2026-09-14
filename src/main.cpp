@@ -19,6 +19,7 @@
 #include <objbase.h>    // CoInitializeEx / COINIT_APARTMENTTHREADED
 #include <shellapi.h>   // CommandLineToArgvW
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -41,8 +42,10 @@ dshb::Renderer* g_renderer = nullptr;
 double g_elapsed = 0.0;          // 单调时钟累计秒数；帧循环和 WndProc 共用
 bool g_debug = false;            // --debug：显示调试浮层
 bool g_selftestB = false;        // --selftest-b：金额解析与状态机的自检
+bool g_layoutProbe = false;      // --layout-probe：导出模式下打印布局数值
 dshb::FakeSource g_fake;         // 模拟数据源（B3）
 dshb::StateMachine g_states;     // 连接状态机（B8）
+dshb::DisplayedAmount g_display; // 显示值（C2/C3）：跳变的测量值 -> 连续的显示值
 bool g_haveWindowFocus = false;
 
 // 高精度单调计时；dt 钳到 [0, 50 ms]，防止休眠唤醒后第一帧一步跳到位（设计 §9.6）
@@ -197,6 +200,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_debug = true;
         } else if (wcscmp(argv[i], L"--selftest-b") == 0) {
             g_selftestB = true;
+        } else if (wcscmp(argv[i], L"--layout-probe") == 0) {
+            g_layoutProbe = true;
         } else if (wcsncmp(argv[i], L"--scenario=", 11) == 0) {
             const int idx = _wtoi(argv[i] + 11);
             if (idx >= 0 && idx < static_cast<int>(dshb::Scenario::Count)) {
@@ -330,12 +335,31 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     if (g_exportFrame) {
         const double t = static_cast<double>(g_frameNo) / 60.0;   // 第 N 帧 ≈ N/60 秒
 
+        // 布局诊断只在这里开：它会在绘制路径里写文件，而每帧写文件会把进程弄崩
+        // （实测 0xC0000409）。导出模式只画一帧，所以安全。
+        if (g_layoutProbe) dshb::SetLayoutProbe(true);
+
         // 让模拟数据源在"虚拟时间"里跑起来：否则导出的图没有数据，浮层也是空的。
         // 虚拟时间按 1/60 秒一步推进，所以导出是确定的、可重复的。
         for (double vt = 0.0; vt <= t + 0.0001; vt += (1.0 / 60.0)) {
             const dshb::Sample s = g_fake.NextIfDue(vt);
-            if (s.wallMs != 0) g_states.OnSample(s, s.wallMs);
+            if (s.wallMs != 0) {
+                g_states.OnSample(s, s.wallMs);
+                // 显示值也在虚拟时间里推进，否则导出图上数字还停在 0 或没落位
+                g_display.OnSample(g_states.lastGood());
+            }
+            g_display.Update(1.0 / 60.0);
         }
+
+        // 组装正文（和真实运行时同一条路径），这样导出的图就是屏幕上会看到的图
+        {
+            const dshb::ConnState st = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
+            const bool currencyKnown = g_states.hasGood() && g_states.lastGood().CurrencyKnown();
+            renderer.SetWidgetFrame(dshb::BuildWidgetFrame(
+                st, g_display, currencyKnown,
+                g_states.hasGood() ? g_states.lastGood().CurrencySymbolW() : L""));
+        }
+
         if (g_debug) {
             const int64_t nowWall = static_cast<int64_t>(NowWallMs());
             const dshb::ConnState st = g_states.Evaluate(nowWall);
@@ -354,6 +378,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         }
 
         const bool ok = renderer.ExportFrame(g_exportPath, t);
+        // 诊断写文件放在绘制**之后**：绘制路径里做 I/O 会让进程崩（实测）
+        dshb::DumpLayoutProbe();
         SelfTestLog(L"[export] %ls 帧=%d 时刻=%.3fs 结果=%ls 画布=%dx%d",
                     g_exportPath, g_frameNo, t, ok ? L"成功" : L"失败",
                     size.widthPx, size.heightPx);
@@ -450,6 +476,61 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             expect(namesOk, L"情形名字表与枚举一一对齐（9 项）");
         }
 
+        // --- 正文组装（C2/C5/C7）：查不到时**绝不能**显示 0.00 ---
+        {
+            dshb::DisplayedAmount d;
+
+            // 1) 没有任何数据：占位符，不显示数字
+            dshb::WidgetFrame f1 = dshb::BuildWidgetFrame(dshb::ConnState::ColdStart, d, false, L"");
+            expect(!f1.showAmount && f1.amountText == "--.--",
+                   L"冷启动：不显示数字，用占位符 --.--");
+
+            // 2) 有数据但币种未知：同样不显示数字（USD 账户上显示 ¥ 是最危险的错）
+            dshb::Sample s{};
+            s.amountsOk = true;
+            s.total = dshb::Amount::FromYuan(110);
+            s.currency = "";
+            d.OnSample(s);
+            dshb::WidgetFrame f2 = dshb::BuildWidgetFrame(dshb::ConnState::Ok, d, false, L"");
+            expect(!f2.showAmount, L"币种未知：不显示数字（不默认 ¥）");
+
+            // 3) 币种已知：显示 ¥110.00
+            dshb::WidgetFrame f3 = dshb::BuildWidgetFrame(dshb::ConnState::Ok, d, true, L"\u00A5");
+            expect(f3.showAmount && f3.amountText == "110.00", L"币种已知：显示 110.00");
+
+            // 4) 读不到（没网）但有旧值：数字仍显示，但状态文案必须是"无法连接"
+            dshb::WidgetFrame f4 = dshb::BuildWidgetFrame(dshb::ConnState::NetworkError, d, true, L"\u00A5");
+            expect(f4.showAmount && wcsstr(f4.statusText, L"无法连接") != nullptr,
+                   L"没网：保留旧数字，但状态文案说'无法连接'");
+
+            // 5) 归零：显示 0.00，且状态仍是 Ok（余额 0 不是错误）
+            dshb::DisplayedAmount dz;
+            dshb::Sample z{};
+            z.amountsOk = true;
+            z.total = dshb::Amount::FromYuan(0);
+            z.currency = "CNY";
+            dz.OnSample(z);          // 第一次：待确认
+            dz.OnSample(z);          // 第二次：确认
+            dshb::WidgetFrame fz = dshb::BuildWidgetFrame(dshb::ConnState::Ok, dz, true, L"\u00A5");
+            expect(fz.showAmount && fz.amountText == "0.00", L"归零：显示 0.00（不是占位符）");
+
+            // 6) 显示值必须渐进跟随：阶跃后一小段时间应接近但不到达目标
+            dshb::DisplayedAmount dd;
+            dshb::Sample a100{};
+            a100.amountsOk = true;
+            a100.total = dshb::Amount::FromYuan(100);
+            dd.OnSample(a100);
+            dshb::Sample a200{};
+            a200.amountsOk = true;
+            a200.total = dshb::Amount::FromYuan(200);
+            dd.OnSample(a200);
+            dd.Update(0.18);         // 一个时间常数
+            expect(dd.value() > 150.0 && dd.value() < 200.0,
+                   L"显示值一个时间常数后到达约 63% 处（既没跳过去也没不动）");
+            for (int i = 0; i < 200; ++i) dd.Update(1.0 / 60.0);
+            expect(std::fabs(dd.value() - 200.0) < 0.001, L"最终吸附到目标值（不留 199.9997）");
+        }
+
         SelfTestLog(L"[check] 小计：失败 %d 项", failed);
         CoUninitialize();
         return failed == 0 ? 0 : 9;
@@ -498,6 +579,24 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             }
         }
 
+        // 布局诊断：**每帧绘制结束、回到这里之后**才写文件（不在绘制路径里写，
+        // 那样每帧开关一次文件会把进程弄崩）。只写第一帧一次。
+        if (g_layoutProbe) {
+            static bool dumped = false;
+            if (!dumped) {
+                dumped = true;
+                const int64_t nowWall2 = static_cast<int64_t>(NowWallMs());
+                const dshb::ConnState st2 = g_states.Evaluate(nowWall2);
+                SelfTestLog(L"[layout] state=%ls showAmount=%d symbol=%ls amount=%hs",
+                            dshb::ConnStateName(st2), renderer.widgetFrame().showAmount ? 1 : 0,
+                            renderer.widgetFrame().currencySymbol,
+                            renderer.widgetFrame().amountText.c_str());
+                SelfTestLog(L"[layout] display: hasValue=%d value=%.4f target=%.4f tau=%.2f",
+                            g_display.hasValue() ? 1 : 0, g_display.value(), g_display.target(),
+                            g_display.tau);
+            }
+        }
+
         // 调试浮层：把状态机的判断摊开给人看。**它只显示，不参与任何逻辑。**
         if (g_debug) {
             const int64_t nowWall = static_cast<int64_t>(NowWallMs());
@@ -521,6 +620,19 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                        g_states.hasGood() ? 1 : 0, g_states.NoKey() ? 0 : 1, focused ? 1 : 0,
                        g_fake.speed());
             renderer.SetDebugText(line);
+        }
+
+        // 显示值推进（C3）：测量值可以跳，显示值必须连续跟随
+        g_display.OnSample(g_states.lastGood());
+        g_display.Update(dt);
+
+        // 组装这一帧要显示的东西，交给渲染层。渲染层不关心余额是怎么来的。
+        {
+            const dshb::ConnState st = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
+            const bool currencyKnown = g_states.hasGood() && g_states.lastGood().CurrencyKnown();
+            renderer.SetWidgetFrame(dshb::BuildWidgetFrame(
+                st, g_display, currencyKnown,
+                g_states.hasGood() ? g_states.lastGood().CurrencySymbolW() : L""));
         }
 
         LARGE_INTEGER a, b, freq;

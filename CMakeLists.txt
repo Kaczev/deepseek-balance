@@ -22,7 +22,8 @@ add_executable(dshb
     src/single_instance.cpp
     src/amount.cpp
     src/sampling.cpp
-    src/state_machine.cpp)
+    src/state_machine.cpp
+    src/widget_display.cpp)
 
 set_target_properties(dshb PROPERTIES WIN32_EXECUTABLE TRUE)
 
