@@ -428,7 +428,15 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                 const float chX = (i < charXs.size()) ? (left + charXs[i]) : left;
                 const float w = MeasureCharWidth(target[i], numFmt);
 
-                if (isDigit && digitLayouts[0] && f.roll.active) {
+                if (isDigit && digitLayouts[0]) {
+                    // ★★ 永远走轮子，**不要**在"滚动结束"时切到另一条静止路径。
+                    //   所有者报的"滚动结束时严重跳变"就是这条切换造成的：
+                    //     滚动中：y = numberTop + rowPx * (1 - frac + row)
+                    //             frac==0 且 row==0 时 -> numberTop + rowPx
+                    //     静止时：y = numberTop            <- 整整差一行（40 px）
+                    //   我把这两条路径当成等价了，其实不等价，于是切换那一帧数字跳一行。
+                    //   轮子本身就是"该位当前值"的完整表达：frac==0 时画出来的就是静止
+                    //   状态。所以只留一条路径，**"切换"这个动作根本不存在**。
                     // 鈽?鐢ㄥ崟鐙祴杩囩殑绾嚱鏁扮畻甯﹀瓙锛屾覆鏌撳眰涓嶅啀鑷繁绠椾綅鏉冦€?
                     //   涓婁竴鐗堣繖閲屾槸鍐呰仈鐨勪竴濂楁暟瀛︼紝杩為敊鍥涙閮介潬鐪嬪浘鐚滃師鍥狅紱
                     //   鎶藉嚭鏉ヤ箣鍚庣敱 --selftest-b 鐩存帴鏂█"钀戒綅琛岄湶鍑虹殑鏁板瓧 = 鏂囨湰鏈韩"銆?
@@ -451,18 +459,17 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                     //   带子被整体挪偏一行，而画面上表现为"数字根本不是余额"。
                     //   位权只允许在 wheel.cpp 里实现一次。
                     double wheelValue = 0.0;
-                    if (!dshb::WheelValueAt(f.amountText, static_cast<int>(i), f.roll.amount,
-                                            &wheelValue)) {
-                        continue;
-                    }
-                    const double frac = wheelValue - std::floor(wheelValue);
-                    for (const dshb::WheelDraw& wd : wheels) {
-                        if (wd.slot != static_cast<int>(i)) continue;
-                        if (!digitLayouts[wd.digit]) continue;
-                        const float y = static_cast<float>(
-                            numberTop + rowPx * (1.0 - frac + wd.row));
-                        rt->DrawTextLayout(D2D1::Point2F(chX, y), digitLayouts[wd.digit], b,
-                                           D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    if (dshb::WheelValueAt(f.amountText, static_cast<int>(i), f.roll.amount,
+                                           &wheelValue)) {
+                        const double frac = wheelValue - std::floor(wheelValue);
+                        for (const dshb::WheelDraw& wd : wheels) {
+                            if (wd.slot != static_cast<int>(i)) continue;
+                            if (!digitLayouts[wd.digit]) continue;
+                            const float y = static_cast<float>(
+                                numberTop + rowPx * (1.0 - frac + wd.row));
+                            rt->DrawTextLayout(D2D1::Point2F(chX, y), digitLayouts[wd.digit], b,
+                                               D2D1_DRAW_TEXT_OPTIONS_NONE);
+                        }
                     }
                     rt->PopAxisAlignedClip();
                 } else {
