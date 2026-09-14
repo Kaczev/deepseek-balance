@@ -259,12 +259,15 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     const DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
                           WS_EX_NOREDIRECTIONBITMAP;
 
-    // 先按主屏 DPI 开一个窗口，拿到 HWND 之后再用窗口所在显示器的 DPI 算真实画布。
-    // （窗口落在哪块屏要等它存在才知道，所以顺序只能是"先建窗、后定尺寸"。）
-    const UINT sysDpi = GetDpiForSystem();
-    const double sysScale = static_cast<double>(sysDpi) / 96.0;
-    const int w0 = static_cast<int>(dshb::kCanvasWidthDip * sysScale + 0.5);
-    const int h0 = static_cast<int>(dshb::kCanvasHeightDip * sysScale + 0.5);
+    // ★ 尺寸单位：**屏幕像素**（所有者明确定下的）。
+    //   设计稿里的 315×129 就是屏幕上 315×129 个像素，与显示器缩放无关。
+    //   这台机器缩放 200%，早先按 DIP 解释会得到 630×258 个像素——那是我理解错了。
+    //
+    //   注意这**不是**"关掉 DPI 感知"：进程仍声明 Per-Monitor V2（清单），
+    //   窗口尺寸也仍按像素给，只是绘制用的缩放固定为 1.0。
+    //   二者结果一样，但不关 DPI 感知能让文字保持矢量清晰，而不是被系统位图拉伸。
+    const int w0 = static_cast<int>(dshb::kCanvasWidthDip + 0.5);
+    const int h0 = static_cast<int>(dshb::kCanvasHeightDip + 0.5);
 
     g_hwnd = CreateWindowExW(exStyle, kClassName, L"deepseek-balance", WS_POPUP,
                              240, 240, w0, h0, nullptr, nullptr, instance, nullptr);
@@ -274,13 +277,14 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     }
 
     const UINT dpi = GetDpiForWindow(g_hwnd);
-    const int clientW = static_cast<int>(dshb::kEntityWidthDip * (dpi / 96.0) + 0.5);
-    const int clientH = static_cast<int>(dshb::kEntityHeightDip * (dpi / 96.0) + 0.5);
+    const int clientW = dshb::kEntityWidthDip;    // 屏幕像素，不乘缩放
+    const int clientH = dshb::kEntityHeightDip;
 
     RECT wr{};
     GetWindowRect(g_hwnd, &wr);
-    SelfTestLog(L"[win] dpi(system)=%u dpi(window)=%u exStyle=0x%08lX",
-                sysDpi, dpi, static_cast<unsigned long>(GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE)));
+    SelfTestLog(L"[win] dpi(system)=%u dpi(window)=%u exStyle=0x%08lX（缩放固定 1.0，不随 DPI）",
+                GetDpiForSystem(), dpi,
+                static_cast<unsigned long>(GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE)));
     SelfTestLog(L"[win] 窗口矩形=(%ld,%ld,%ld,%ld) 尺寸=%ldx%ld 实体区(理论)=%dx%d",
                 wr.left, wr.top, wr.right, wr.bottom, wr.right - wr.left, wr.bottom - wr.top,
                 clientW, clientH);
@@ -289,9 +293,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     g_renderer = &renderer;
     dshb::CanvasSize size = dshb::Renderer::SizeForWindow(g_hwnd);
 
-    // ★ 视觉缩放（--ui-scale=）。默认 1.0 = 按 DPI 缩放，也就是设计意图。
-    //   存在的理由：在 200% 缩放的屏上，"315 DIP"要占 630 个物理像素，看起来偏大。
-    //   观感由所有者定，所以给他一个能当场拧的旋钮，而不是靠文档说服他。
+    // ★ 视觉缩放：默认 1.0，即"一个设计像素 = 一个屏幕像素"。
+    //   早先默认按 DPI 缩放（200% 屏上得到 630×258），所有者判定偏大，
+    //   并明确定下"物理像素就是屏幕像素"。所以 1.0 是默认，旋钮保留备用。
     if (g_uiScale > 0.0 && g_uiScale != 1.0) {
         const double base = static_cast<double>(size.scale) * g_uiScale;
         size.scale = static_cast<float>(base);
@@ -661,7 +665,13 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             dshb::WidgetFrame fz = dshb::BuildWidgetFrame(dshb::ConnState::Ok, dz, true, L"\u00A5");
             expect(fz.showAmount && fz.amountText == "0.00", L"归零：显示 0.00（不是占位符）");
 
-            // 6) 显示值必须渐进跟随：阶跃后一小段时间应接近但不到达目标
+            // 6) 显示值必须渐进跟随，而且是**定时长**（不是指数逼近）。
+            //    ★ 这条测试曾经断言"一个时间常数后到 63%"——那是旧设计的判据。
+            //      改成固定时长 + 缓动之后，那个断言自然失败：**测试过时了，不是产品坏了**。
+            //      所以判据也要跟着换成新设计该有的性质：
+            //        · 中途在两端之间（既没跳过去，也没不动）
+            //        · 到时长就精确落位，不留尾巴
+            //        · 之后再推进也不会过冲
             dshb::DisplayedAmount dd;
             dshb::Sample a100{};
             a100.amountsOk = true;
@@ -671,11 +681,22 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             a200.amountsOk = true;
             a200.total = dshb::Amount::FromYuan(200);
             dd.OnSample(a200);
-            dd.Update(0.18);         // 一个时间常数
-            expect(dd.value() > 150.0 && dd.value() < 200.0,
-                   L"显示值一个时间常数后到达约 63% 处（既没跳过去也没不动）");
-            for (int i = 0; i < 200; ++i) dd.Update(1.0 / 60.0);
-            expect(std::fabs(dd.value() - 200.0) < 0.001, L"最终吸附到目标值（不留 199.9997）");
+
+            // 走到时长的一半：缓动中点应当正好落在中值附近
+            const int halfSteps = static_cast<int>(dd.rollSeconds * 60.0 / 2.0);
+            for (int i = 0; i < halfSteps; ++i) dd.Update(1.0 / 60.0);
+            expect(dd.value() > 120.0 && dd.value() < 180.0,
+                   L"滚动中途落在两端之间（既没跳过去也没不动）");
+
+            // 走到时长结束：必须精确落位
+            const int restSteps = static_cast<int>(dd.rollSeconds * 60.0) - halfSteps + 2;
+            for (int i = 0; i < restSteps; ++i) dd.Update(1.0 / 60.0);
+            expect(std::fabs(dd.value() - 200.0) < 0.001, L"到时长精确落位（不留 199.9997）");
+
+            // 结束之后再推进，不得过冲
+            for (int i = 0; i < 120; ++i) dd.Update(1.0 / 60.0);
+            expect(std::fabs(dd.value() - 200.0) < 0.001, L"落位后不漂移、不过冲");
+            expect(!dd.rolling(), L"落位后 rolling 状态应结束（文本恢复按数值算）");
         }
 
         SelfTestLog(L"[check] 小计：失败 %d 项", failed);

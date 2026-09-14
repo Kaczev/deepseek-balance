@@ -571,14 +571,17 @@ struct Renderer::Impl {
 Renderer::~Renderer() { Destroy(); }
 
 CanvasSize Renderer::SizeForWindow(HWND hwnd) {
-    // ★ 用窗口所在显示器的 DPI。GetDpiForSystem 在多屏不同缩放时会把画布按主屏算，
-    //   而窗口可能落在另一块屏上，内容就会被裁或留空边（A0 实验室用的就是后者）。
-    UINT dpi = hwnd ? GetDpiForWindow(hwnd) : 0;
-    if (dpi == 0) dpi = GetDpiForSystem();
+    // ★ 缩放固定为 1.0：**一个设计像素 = 一个屏幕像素**（所有者定下的单位）。
+    //   这里早先是 dpi/96，于是 200% 缩放的屏上得到 630×258，所有者判定偏大。
+    //   设计稿的 315×129 指的是屏幕像素，所以不乘 DPI。
+    //
+    //   为什么不用"进程不声明 DPI 感知"来达到同样效果：那样窗口会被系统位图拉伸，
+    //   文字会糊。保持 Per-Monitor V2 + 缩放 1.0，文字仍是矢量清晰的。
+    (void)hwnd;
     CanvasSize s;
-    s.scale = static_cast<float>(dpi) / 96.0f;
-    s.widthPx = static_cast<int>(kCanvasWidthDip * s.scale + 0.5f);
-    s.heightPx = static_cast<int>(kCanvasHeightDip * s.scale + 0.5f);
+    s.scale = 1.0f;
+    s.widthPx = kCanvasWidthDip;
+    s.heightPx = kCanvasHeightDip;
     return s;
 }
 
