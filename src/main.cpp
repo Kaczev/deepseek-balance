@@ -44,6 +44,8 @@ bool g_debug = false;            // --debug：显示调试浮层
 bool g_selftestB = false;        // --selftest-b：金额解析与状态机的自检
 bool g_layoutProbe = false;      // --layout-probe：导出模式下打印布局数值
 int g_dpiOverride = 0;           // --dpi=N：覆盖画布缩放（0 = 用窗口真实 DPI）
+int g_rollFrames = 0;            // --roll=N：是否导出滚动瞬间（N 只用于日志，步数看 g_rollSteps）
+int g_rollSteps = 0;             // --roll=N：跳变之后推进多少帧（1/60 秒一步）
 dshb::FakeSource g_fake;         // 模拟数据源（B3）
 dshb::StateMachine g_states;     // 连接状态机（B8）
 dshb::DisplayedAmount g_display; // 显示值（C2/C3）：跳变的测量值 -> 连续的显示值
@@ -212,6 +214,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_fake.SetSpeed(_wtof(argv[i] + 8));
         } else if (wcsncmp(argv[i], L"--dpi=", 6) == 0) {
             g_dpiOverride = _wtoi(argv[i] + 6);
+        } else if (wcsncmp(argv[i], L"--roll=", 7) == 0) {
+            g_rollFrames = 1;                     // 只要出现这个参数就进入滚动抓帧模式
+            g_rollSteps = _wtoi(argv[i] + 7);     // N = 跳变之后推进多少帧（0 = 跳变前）
         }
     }
     if (argv) LocalFree(argv);
@@ -354,14 +359,50 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
         // 让模拟数据源在"虚拟时间"里跑起来：否则导出的图没有数据，浮层也是空的。
         // 虚拟时间按 1/60 秒一步推进，所以导出是确定的、可重复的。
-        for (double vt = 0.0; vt <= t + 0.0001; vt += (1.0 / 60.0)) {
-            const dshb::Sample s = g_fake.NextIfDue(vt);
-            if (s.wallMs != 0) {
-                g_states.OnSample(s, s.wallMs);
-                // 显示值也在虚拟时间里推进，否则导出图上数字还停在 0 或没落位
+        //
+        // --roll=N：把"余额跳变之后第 N/60 秒"这一瞬间单独抓出来。
+        // 用途是**看滚动动画**——静态单帧看不出数字是怎么滚过去的，
+        // 连拍若干张不同 N 的图才能看出过程（动画也是要人眼判的东西）。
+        if (g_rollFrames > 0 || g_rollFrames == 0) {
+            // --roll=N：把"余额跳变之后第 N 帧"这一瞬间单独抓出来。
+            // 用途是**看滚动动画**——静态单帧看不出数字是怎么滚过去的，
+            // 连拍若干张不同 N 的图才能看出过程（动画也是要人眼判的东西）。
+            //
+            // ★ 第一版这里错了：预热循环跑了 8 秒虚拟时间，而显示值每帧都在推进，
+            //   于是"跳变前"那张图上的数字早就滚到 100 了（抓到的其实是过程末尾）。
+            //   正确做法是**只喂样本、不推进显示值**，让起点精确落在第一个值上。
+            dshb::FakeSource pre;
+            pre.SetSpeed(0.01);
+            pre.Select(dshb::Scenario::Recharge);   // 起点 20 元
+            const dshb::Sample first = pre.NextIfDue(0.0);
+            if (first.wallMs != 0) {
+                g_states.OnSample(first, first.wallMs);
+                g_display.OnSample(g_states.lastGood());   // 直接落位到 19.90
+            }
+            const double before = g_display.value();
+
+            // 现在把"充值跳变"塞进去，再从这一刻开始逐帧推进
+            g_fake.Select(dshb::Scenario::Recharge);
+            g_fake.TriggerRecharge();               // 余额跳到 100
+            const dshb::Sample jump = g_fake.NextIfDue(0.0);
+            if (jump.wallMs != 0) {
+                g_states.OnSample(jump, jump.wallMs);
                 g_display.OnSample(g_states.lastGood());
             }
-            g_display.Update(1.0 / 60.0);
+            for (int i = 0; i < g_rollSteps; ++i) g_display.Update(1.0 / 60.0);
+
+            SelfTestLog(L"[roll] 跳变前=%.2f 跳变后目标=%.2f 推进 %d 帧后显示=%.2f",
+                        before, g_display.target(), g_rollSteps, g_display.value());
+        } else {
+            for (double vt = 0.0; vt <= t + 0.0001; vt += (1.0 / 60.0)) {
+                const dshb::Sample s = g_fake.NextIfDue(vt);
+                if (s.wallMs != 0) {
+                    g_states.OnSample(s, s.wallMs);
+                    // 显示值也在虚拟时间里推进，否则导出图上数字还停在 0 或没落位
+                    g_display.OnSample(g_states.lastGood());
+                }
+                g_display.Update(1.0 / 60.0);
+            }
         }
 
         // 组装正文（和真实运行时同一条路径），这样导出的图就是屏幕上会看到的图
