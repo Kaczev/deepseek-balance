@@ -41,8 +41,9 @@ void FakeSource::Select(Scenario s) {
     clockJumped_ = false;
 }
 
-void FakeSource::TriggerRecharge() {
+void FakeSource::TriggerRecharge(double jumpToYuan) {
     rechargePending_ = true;
+    rechargeTo_ = jumpToYuan;
 }
 
 void FakeSource::TriggerClockJump() {
@@ -103,7 +104,10 @@ Sample FakeSource::NextIfDue(double nowSeconds) {
     case Scenario::Recharge:
         balance_.raw -= 1000;
         if (rechargePending_) {
-            balance_ = Amount::FromYuan(100);        // 正跳变
+            // 跳到指定金额（默认 100）。测试时需要控制"位数是否变化"，
+            // 所以这个目标值是可指定的。
+            const double cents = rechargeTo_ * 100.0;
+            balance_.raw = static_cast<AmountRaw>(cents) * 100;
             rechargePending_ = false;
         }
         s.transportOk = true;

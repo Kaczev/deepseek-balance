@@ -85,7 +85,9 @@ public:
     const wchar_t* scenarioName() const { return ScenarioName(scenario_); }
 
     // 触发一次性事件（B7）。目前只有"充值跳变"与"时钟跳变"需要。
-    void TriggerRecharge();
+    // jumpToYuan 可指定跳到多少（默认 100）。用来构造"位数相同/不同"两种跳变，
+    // 因为逐位滚动只在位数相同时成立。
+    void TriggerRecharge(double jumpToYuan = 100.0);
     void TriggerClockJump();
 
     // 推进到 nowSeconds（单调秒），返回这一拍应当产生的采样。
@@ -116,6 +118,7 @@ private:
     Sample last_{};
     Amount balance_ = Amount::FromYuan(100);
     bool rechargePending_ = false;
+    double rechargeTo_ = 100.0;
     bool clockJumped_ = false;
 };
 

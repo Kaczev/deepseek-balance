@@ -15,16 +15,23 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace dshb {
 
 // 余额数字的显示状态
+//
+// ★ 为什么是"定时长"而不是"指数逼近"（被实测逼出来的结论）：
+//   指数逼近永远到不了目标，只能无限接近。它的后果不只是"数字慢"——
+//   滚动期间渲染层必须显示"起点文本"，于是**数字看起来一直停在旧值上**，
+//   直到逼近到吸附阈值为止（实测约 1 秒）。视觉上就是"数字根本没变"。
+//   改成固定时长 + 缓动：滚动期明确开始、明确结束，两头都能对上。
 class DisplayedAmount {
 public:
-    // 滚动时间常数（秒）。C4 会调它——数值本身是可变的，要点是它**不与采样间隔挂钩**。
-    double tau = 0.18;
+    // 滚动时长（秒）。C4 会调它——要点是它**不与采样间隔挂钩**（采样固定 10 秒）。
+    double rollSeconds = 0.40;
 
-    // 吸附阈值（元）：差距小于这个就直接贴上去，不再慢慢逼近。
+    // 吸附阈值（元）：差距小于这个就直接贴上去，不做无意义的滚动。
     double snapYuan = 0.005;
 
     // 收到新样本。做一次确认，避免"瞬间 0"把界面闪成灰色。
@@ -37,6 +44,12 @@ public:
     double value() const { return value_; }
     double target() const { return target_; }
 
+    // 滚动进度：0 = 停在旧值，1 = 已落在新值上。逐位滚动的竖直偏移由它驱动。
+    double rollFraction() const { return rollFraction_; }
+    const std::string& rollOldText() const { return rollOldText_; }
+    const std::string& rollNewText() const { return rollNewText_; }
+    bool rolling() const { return rollFraction_ < 1.0 && !rollOldText_.empty(); }
+
     // 是否处于"连续两次采样都是 0"的确认态
     bool zeroConfirmed() const { return zeroConfirmed_; }
 
@@ -47,9 +60,34 @@ private:
     bool zeroPending_ = false;
     bool zeroConfirmed_ = false;
     double latest_ = 0.0;
+
+    // 逐位滚动用的量：起点值、目标值、以及已经滚了多久。
+    // rollFraction_ 由 rollElapsed_/rollSeconds 算出，**不自己衰减**——
+    // 让进度和数值各走一套是上一版的错误来源。
+    std::string rollOldText_;
+    std::string rollNewText_;
+    double rollFromValue_ = 0.0;
+    double rollElapsed_ = 0.0;
+    double rollFraction_ = 1.0;
 };
 
 // 一帧要显示的东西。**渲染层只认这个结构**，它不关心余额是怎么来的。
+//
+// ★ 数字滚动的正确理解（所有者明确纠正过一次）：
+//   "滚动"不是指数值平滑逼近，而是**每一位数字上下滑动**——旧数字往上滑出去、
+//   新数字从下面滑进来，像里程表。第一版只做了数值插值，数字在原地变脸，
+//   看起来只是"数字变了"，没有滚动的痕迹。
+struct NumberRoll {
+    bool active = false;
+    // 变化的那一段：旧文本与新文本。长度相同（同一个格式，等宽数字），
+    // 所以可以逐位配对。
+    std::string oldText;
+    std::string newText;
+    int changeFrom = 0;      // 第一个不同的位置
+    int changeTo = 0;        // 最后一个不同的位置（含）
+    double fraction = 1.0;   // 0 = 还在旧位置，1 = 已落位
+};
+
 struct WidgetFrame {
     ConnState state = ConnState::ColdStart;
     bool showAmount = false;        // 数字该不该显示（无数据时显示占位符）
@@ -57,6 +95,7 @@ struct WidgetFrame {
     const wchar_t* currencySymbol = L"";   // 空串 = 币种未知，**不默认 ¥**
     const wchar_t* statusText = L"";       // 标题行/状态文案
     std::string zeroTimeText;       // 清零预估（C9 填；现在留占位）
+    NumberRoll roll;
 };
 
 // 把状态 + 显示值组装成一帧。放在这里而不是渲染层，是为了让"显示什么"

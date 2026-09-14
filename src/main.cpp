@@ -46,6 +46,7 @@ bool g_layoutProbe = false;      // --layout-probe：导出模式下打印布局
 int g_dpiOverride = 0;           // --dpi=N：覆盖画布缩放（0 = 用窗口真实 DPI）
 int g_rollFrames = 0;            // --roll=N：是否导出滚动瞬间（N 只用于日志，步数看 g_rollSteps）
 int g_rollSteps = 0;             // --roll=N：跳变之后推进多少帧（1/60 秒一步）
+bool g_rollLoop = false;         // --roll=loop：每 2 秒来回跳一次，用肉眼反复看滚动
 dshb::FakeSource g_fake;         // 模拟数据源（B3）
 dshb::StateMachine g_states;     // 连接状态机（B8）
 dshb::DisplayedAmount g_display; // 显示值（C2/C3）：跳变的测量值 -> 连续的显示值
@@ -216,7 +217,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_dpiOverride = _wtoi(argv[i] + 6);
         } else if (wcsncmp(argv[i], L"--roll=", 7) == 0) {
             g_rollFrames = 1;                     // 只要出现这个参数就进入滚动抓帧模式
-            g_rollSteps = _wtoi(argv[i] + 7);     // N = 跳变之后推进多少帧（0 = 跳变前）
+            if (wcscmp(argv[i] + 7, L"loop") == 0) {
+                g_rollLoop = true;                // 循环跳变，供肉眼观察
+            } else {
+                g_rollSteps = _wtoi(argv[i] + 7); // N = 跳变之后推进多少帧（0 = 跳变前）
+            }
         }
     }
     if (argv) LocalFree(argv);
@@ -381,9 +386,68 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             }
             const double before = g_display.value();
 
-            // 现在把"充值跳变"塞进去，再从这一刻开始逐帧推进
+            // ★ 循环模式（--roll=loop）：每 2 秒来回跳一次，便于用肉眼观察滚动。
+            //   观感是要人看的东西，一次性跳变太快，看不住。
+            if (g_rollLoop) {
+                SelfTestLog(L"[roll] 循环模式：20.00 <-> 99.50 每 2 秒一次");
+                g_fake.Select(dshb::Scenario::Recharge);
+                g_fake.TriggerRecharge(99.5);
+                bool high = true;
+                double sinceSwitch = 0.0;
+                // 循环模式有自己的时钟与累计时间：导帧路径在帧循环之前，
+                // 后面那些变量还没声明（第一版直接引用它们，编译不过）。
+                Clock rollClock;
+                double rollElapsed = 0.0;
+                while (g_running) {
+                    MSG msg{};
+                    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                        if (msg.message == WM_QUIT) g_running = false;
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    if (!g_running) break;
+
+                    const double dt = rollClock.Tick();
+                    rollElapsed += dt;
+                    g_elapsed = rollElapsed;
+                    sinceSwitch += dt;
+                    if (sinceSwitch >= 2.0) {
+                        sinceSwitch = 0.0;
+                        high = !high;
+                        g_fake.Select(dshb::Scenario::Recharge);
+                        g_fake.TriggerRecharge(high ? 99.5 : 20.0);
+                    }
+
+                    const dshb::Sample s = g_fake.NextIfDue(rollElapsed);
+                    if (s.wallMs != 0) {
+                        g_states.OnSample(s, s.wallMs);
+                        g_display.OnSample(g_states.lastGood());
+                    }
+                    g_display.Update(dt);
+
+                    const dshb::ConnState st = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
+                    const bool currencyKnown =
+                        g_states.hasGood() && g_states.lastGood().CurrencyKnown();
+                    renderer.SetWidgetFrame(dshb::BuildWidgetFrame(
+                        st, g_display, currencyKnown,
+                        g_states.hasGood() ? g_states.lastGood().CurrencySymbolW() : L""));
+                    renderer.RenderFrame(rollElapsed);
+
+                    if (g_runSeconds > 0.0 && rollElapsed >= g_runSeconds) break;
+                    MsgWaitForMultipleObjectsEx(0, nullptr, 1, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                }
+                renderer.Destroy();
+                g_renderer = nullptr;
+                DestroyWindow(g_hwnd);
+                CoUninitialize();
+                return 0;
+            }
+
+            // 现在把"充值跳变"塞进去，再从这一刻开始逐帧推进。
+            // 目标 99.50 是刻意选的：它和起点 20.00 都是 5 个字符，
+            // 格位对得上，所以逐位滚动能真正发生（位数不同的跳变不能逐位滚）。
             g_fake.Select(dshb::Scenario::Recharge);
-            g_fake.TriggerRecharge();               // 余额跳到 100
+            g_fake.TriggerRecharge(99.5);
             const dshb::Sample jump = g_fake.NextIfDue(0.0);
             if (jump.wallMs != 0) {
                 g_states.OnSample(jump, jump.wallMs);
@@ -645,9 +709,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                             dshb::ConnStateName(st2), renderer.widgetFrame().showAmount ? 1 : 0,
                             renderer.widgetFrame().currencySymbol,
                             renderer.widgetFrame().amountText.c_str());
-                SelfTestLog(L"[layout] display: hasValue=%d value=%.4f target=%.4f tau=%.2f",
+                SelfTestLog(L"[layout] display: hasValue=%d value=%.4f target=%.4f rollSeconds=%.2f",
                             g_display.hasValue() ? 1 : 0, g_display.value(), g_display.target(),
-                            g_display.tau);
+                            g_display.rollSeconds);
             }
         }
 

@@ -238,6 +238,22 @@ float MeasureTextWidth(const std::wstring& text, IDWriteTextFormat* fmt) {
     return width;
 }
 
+// 量单个字符的宽度（DIP）。逐位滚动要把每一位画在各自的格子里，
+// 所以需要每个字符单独的位置——整体量宽度的方法在这里不够用。
+float MeasureCharWidth(wchar_t ch, IDWriteTextFormat* fmt) {
+    if (!fmt) return 0.0f;
+    const wchar_t s[2] = {ch, 0};
+    return MeasureTextWidth(std::wstring(s), fmt);
+}
+
+// 平滑缓动：逐位滚动的观感全在这里。线性会显得机械发闷，
+// 这条曲线两端慢、中间快，像齿轮拨过一格。
+double Smoothstep(double x) {
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) return 1.0;
+    return x * x * (3.0 - 2.0 * x);
+}
+
 // 在一行里画一段文字，横向居中对齐到 centerX（画布坐标）
 void DrawCentered(ID2D1RenderTarget* rt, const std::wstring& text, IDWriteTextFormat* fmt,
                   float centerX, float topY, const D2D1_COLOR_F& color, float scale) {
@@ -301,33 +317,105 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
     {
         const std::wstring digits(f.amountText.begin(), f.amountText.end());
         const std::wstring symbol = f.currencySymbol ? f.currencySymbol : L"";
-        const float digitsW = MeasureTextWidth(digits, numFmt);
+
+        // 逐位滚动时，格子按**目标文本**定格。
+        // ★ 第一版这里用的是旧文本，于是滚动期间整块数字还在画旧值，
+        //   看起来就是"数字根本没变"——渲染层必须画这一帧真正的目标文本，
+        //   旧值只用来做"往上滑出去"的那一份。
+        const std::wstring& measureText = digits;
+
+        const float digitsW = MeasureTextWidth(measureText, numFmt);
         const float symbolW = symbol.empty() ? 0.0f : MeasureTextWidth(symbol, unitFmt);
         const float gap = symbol.empty() ? 0.0f : 2.0f * s;
         const float totalW = digitsW + gap + symbolW;
         const float left = cx - totalW * 0.5f;
-        // 数字的垂直位置：坐在实体区中线上而不是贴上边。
-        // 曲线（D 阶段）会绕着这条中线做氛围，所以中线是它的锚点。
-        // 具体的 28 DIP 偏移先用"量到的字形像素"校准一次再定。
         const float entityMidY = (kMarginDip + kEntityHeightDip * 0.5f) * s;
         const float numberTop = entityMidY - 28.0f * s;
 
-        // 诊断：把输入与结果都打出来（只在 --layout-probe 时记内存）
+        // 诊断：把输入与结果都记下来（只在 --layout-probe 时写文件）
         LayoutProbe("number", cx, symbolW, digitsW, left);
         LayoutProbe("boxes", (kMarginDip + 12.0f) * s, (kMarginDip + 8.0f) * s,
                     numberTop, (kMarginDip + kEntityWidthDip) * s);
 
-        // 数字在前
         ID2D1SolidColorBrush* b = nullptr;
         if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 1.0f), &b)) && b) {
-            IDWriteTextLayout* layout = nullptr;
-            if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
-                    digits.c_str(), static_cast<UINT32>(digits.size()), numFmt, 2048.0f, 128.0f,
-                    &layout)) &&
-                layout) {
-                rt->DrawTextLayout(D2D1::Point2F(left, numberTop), layout, b,
-                                   D2D1_DRAW_TEXT_OPTIONS_NONE);
-                layout->Release();
+            // 每一位一个格子。逐位推进 x，所以每位能独立做竖直偏移。
+            const std::wstring& target = measureText;
+            float x = left;
+            for (size_t i = 0; i < target.size(); ++i) {
+                const float w = MeasureCharWidth(target[i], numFmt);
+
+                const bool inSpan = f.roll.active &&
+                                    static_cast<int>(i) >= f.roll.changeFrom &&
+                                    static_cast<int>(i) <= f.roll.changeTo;
+                const bool isDigit = target[i] >= L'0' && target[i] <= L'9';
+
+                if (inSpan && isDigit) {
+                    // ★ 逐位滚动：旧数字往上滑出去、新数字从下面滑进来。
+                    //   关键在**裁剪**：不加裁剪，两行数字会同时可见，
+                    //   看起来像叠了两个数字，而不像在格子里滚（实测就是这个问题）。
+                    //   所以每一位都要压一个和它等高的裁剪区，只露出自己的那一格。
+                    const double e = Smoothstep(f.roll.fraction);
+                    const double dy = 40.0 * s;          // 一行的位移
+                    const float oldY = static_cast<float>(numberTop - e * dy);
+                    const float newY = static_cast<float>(numberTop + (1.0 - e) * dy);
+
+                    // ★ 这是"里程表"：旧数字与新数字是**同一条带子上的两行**，
+                    //   通过一个**只有一行高的窗口**看过去，所以任一时刻只看得见一行。
+                    //   窗口 = 字形实际所在的带子（不是排版行高，也不是整段行程）：
+                    //     · 做成整段行程 -> 两行同时可见，像叠了两个数字（错在这）
+                    //     · 做成排版行高 -> 看不出哪一行是主行，且上沿会把字切掉
+                    //   带子的上下沿由字形实际范围定，这里按 40 DIP 字号的实际
+                    //   字形高（约 29 DIP）加一点余量取 34 DIP，居中于 numberTop 起算的行。
+                    const float bandTop = numberTop + static_cast<float>(9.0 * s);
+                    const float bandBottom = bandTop + static_cast<float>(34.0 * s);
+                    rt->PushAxisAlignedClip(
+                        D2D1::RectF(x, bandTop, x + w, bandBottom),
+                        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+                    const wchar_t oldCh = (i < f.roll.oldText.size())
+                                              ? static_cast<wchar_t>(f.roll.oldText[i])
+                                              : target[i];
+                    const wchar_t newCh = target[i];
+
+                    // 旧的那位（往上走）
+                    if (oldCh != newCh) {
+                        IDWriteTextLayout* lo = nullptr;
+                        const wchar_t buf[2] = {oldCh, 0};
+                        if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
+                                buf, 1, numFmt, 256.0f, 128.0f, &lo)) &&
+                            lo) {
+                            rt->DrawTextLayout(D2D1::Point2F(x, oldY), lo, b,
+                                               D2D1_DRAW_TEXT_OPTIONS_NONE);
+                            lo->Release();
+                        }
+                    }
+                    // 新的那位（从下面进来）
+                    {
+                        IDWriteTextLayout* ln = nullptr;
+                        const wchar_t buf[2] = {newCh, 0};
+                        if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
+                                buf, 1, numFmt, 256.0f, 128.0f, &ln)) &&
+                            ln) {
+                            rt->DrawTextLayout(D2D1::Point2F(x, newY), ln, b,
+                                               D2D1_DRAW_TEXT_OPTIONS_NONE);
+                            ln->Release();
+                        }
+                    }
+                    rt->PopAxisAlignedClip();
+                } else {
+                    // 小数点、逗号、以及没变的那几位：原地画
+                    IDWriteTextLayout* l = nullptr;
+                    const wchar_t buf[2] = {target[i], 0};
+                    if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
+                            buf, 1, numFmt, 256.0f, 128.0f, &l)) &&
+                        l) {
+                        rt->DrawTextLayout(D2D1::Point2F(x, numberTop), l, b,
+                                           D2D1_DRAW_TEXT_OPTIONS_NONE);
+                        l->Release();
+                    }
+                }
+                x += w;
             }
             b->Release();
         }
