@@ -142,6 +142,9 @@ bool Renderer::Create(HWND hwnd, const CanvasSize& size) {
     if (FAILED(d.compTarget->SetRoot(d.compVisual))) return false;
     if (FAILED(d.compDevice->Commit())) return false;
 
+    // 区域必须跟着画布走：DPI 变更或重建之后都要重设，否则可点区域会和画面对不上
+    ApplyInputRegion(false);
+
     ready_ = true;
     return true;
 }
@@ -162,6 +165,39 @@ void Renderer::Destroy() {
         impl_ = nullptr;
     }
     ready_ = false;
+}
+
+bool Renderer::ApplyInputRegion(bool particlesSpillout) {
+    if (!impl_ || !hwnd_) return false;
+    if (spillout_ == particlesSpillout && spillout_ == true) {
+        // 已经扩到全画布，不用重复设置
+    }
+
+    // 区域坐标是窗口坐标（无边框窗口的窗口矩形 == 客户区）
+    int left = 0, top = 0, right = size_.widthPx, bottom = size_.heightPx;
+    if (!particlesSpillout) {
+        const int m = static_cast<int>(kMarginDip * size_.scale + 0.5f);
+        left = m;
+        top = m;
+        right = m + static_cast<int>(kEntityWidthDip * size_.scale + 0.5f);
+        bottom = m + static_cast<int>(kEntityHeightDip * size_.scale + 0.5f);
+    }
+    const int radius = particlesSpillout
+        ? 0
+        : static_cast<int>(kCornerRadiusDip * size_.scale + 0.5f);
+
+    HRGN region = particlesSpillout
+        ? CreateRectRgn(left, top, right, bottom)
+        : CreateRoundRectRgn(left, top, right + 1, bottom + 1, radius * 2, radius * 2);
+    if (!region) return false;
+
+    // SetWindowRgn 成功后区域归系统所有，不能再 DeleteObject
+    if (SetWindowRgn(hwnd_, region, TRUE) == 0) {
+        DeleteObject(region);
+        return false;
+    }
+    spillout_ = particlesSpillout;
+    return true;
 }
 
 HRESULT Renderer::RenderFrame(double elapsedSeconds) {

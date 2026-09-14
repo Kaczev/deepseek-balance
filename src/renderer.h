@@ -48,6 +48,11 @@ public:
     // 画一帧并提交。返回 Present 的结果（便于这里直接发现失败）。
     HRESULT RenderFrame(double elapsedSeconds);
 
+    // ★ 输入形状：DirectComposition 的窗口矩形整体都会吃鼠标事件，
+    //   透明余量不会自动穿透（A4b 实测）。所以必须自己把窗口区域收到实体区之内。
+    //   particlesSpillout = true 时扩到整个画布，用于粒子飞出实体区的那段时间。
+    bool ApplyInputRegion(bool particlesSpillout);
+
     const CanvasSize& size() const { return size_; }
     bool ready() const { return ready_; }
 
@@ -55,6 +60,7 @@ private:
     HWND hwnd_ = nullptr;
     CanvasSize size_{};
     bool ready_ = false;
+    bool spillout_ = false;
 
     struct Impl;
     Impl* impl_ = nullptr;

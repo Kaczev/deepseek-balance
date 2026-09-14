@@ -53,12 +53,16 @@ echo [build] compiling ... >> "%LOG%"
 call "%VCVARS%" >nul 2>&1
 if errorlevel 1 exit /b 3
 "%CMAKE%" --build build >> "%LOG%" 2>&1
-if errorlevel 1 exit /b 5
+set "BUILD_RC=%ERRORLEVEL%"
+if not "%BUILD_RC%"=="0" (
+  echo [build] FAILED rc=%BUILD_RC% -- see the lines above in this log >> "%LOG%"
+  exit /b 5
+)
 
 if exist "build\dshb.exe" (
   echo [build] OK build\dshb.exe >> "%LOG%"
   exit /b 0
 ) else (
-  echo [build] build succeeded but no artifact found >> "%LOG%"
+  echo [build] build reported success but no artifact found >> "%LOG%"
   exit /b 6
 )
