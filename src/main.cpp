@@ -43,6 +43,7 @@ double g_elapsed = 0.0;          // 单调时钟累计秒数；帧循环和 WndP
 bool g_debug = false;            // --debug：显示调试浮层
 bool g_selftestB = false;        // --selftest-b：金额解析与状态机的自检
 bool g_layoutProbe = false;      // --layout-probe：导出模式下打印布局数值
+int g_dpiOverride = 0;           // --dpi=N：覆盖画布缩放（0 = 用窗口真实 DPI）
 dshb::FakeSource g_fake;         // 模拟数据源（B3）
 dshb::StateMachine g_states;     // 连接状态机（B8）
 dshb::DisplayedAmount g_display; // 显示值（C2/C3）：跳变的测量值 -> 连续的显示值
@@ -209,6 +210,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             }
         } else if (wcsncmp(argv[i], L"--speed=", 8) == 0) {
             g_fake.SetSpeed(_wtof(argv[i] + 8));
+        } else if (wcsncmp(argv[i], L"--dpi=", 6) == 0) {
+            g_dpiOverride = _wtoi(argv[i] + 6);
         }
     }
     if (argv) LocalFree(argv);
@@ -271,7 +274,17 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
     dshb::Renderer renderer;
     g_renderer = &renderer;
-    const dshb::CanvasSize size = dshb::Renderer::SizeForWindow(g_hwnd);
+    dshb::CanvasSize size = dshb::Renderer::SizeForWindow(g_hwnd);
+    // 导出用的缩放覆盖：让同一套 315×129 设计稿在 100% / 150% / 200% 下各导一张，
+    // 这样字号能在真实尺寸下被判断（所有者指出过：只看 200% 的图看不出字号合不合适）。
+    if (g_dpiOverride > 0) {
+        const double scale = g_dpiOverride / 96.0;
+        size.scale = static_cast<float>(scale);
+        size.widthPx = static_cast<int>(dshb::kCanvasWidthDip * scale + 0.5);
+        size.heightPx = static_cast<int>(dshb::kCanvasHeightDip * scale + 0.5);
+        SelfTestLog(L"[render] 缩放被 --dpi 覆盖为 %d%% -> 画布 %dx%d", g_dpiOverride * 100 / 96,
+                    size.widthPx, size.heightPx);
+    }
     if (!renderer.Create(g_hwnd, size)) {
         SelfTestLog(L"[main] 渲染器创建失败（D3D11 / DComp / 交换链）");
         DestroyWindow(g_hwnd);

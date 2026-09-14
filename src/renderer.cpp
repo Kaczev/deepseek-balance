@@ -264,9 +264,10 @@ void DrawCentered(ID2D1RenderTarget* rt, const std::wstring& text, IDWriteTextFo
 
 // 正文（C 阶段）：标题兼状态行、余额数字、币种符号、清零预估。
 //
-// 排布理由（设计 §9.2）：
+// 排布理由（设计 §9.2，符号位置经所有者指定）：
 //   数字是主角，所以它最大；标题小、放左上；清零预估放底部。
-//   币种符号**放前缀**（¥12.34），不是后缀——中文习惯里 12.34¥ 读起来像单位换算。
+//   币种符号**放后缀**（100.00¥）——所有者明确指定，不改。
+//   曲线是**氛围**，与数字叠加在同一个区域（D 阶段），不是"先在曲线上方再放数字"。
 void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const WidgetFrame& f) {
     if (g_sceneMode != SceneMode::Normal) return;
 
@@ -303,32 +304,20 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
         const float digitsW = MeasureTextWidth(digits, numFmt);
         const float symbolW = symbol.empty() ? 0.0f : MeasureTextWidth(symbol, unitFmt);
         const float gap = symbol.empty() ? 0.0f : 2.0f * s;
-        const float totalW = symbolW + gap + digitsW;
+        const float totalW = digitsW + gap + symbolW;
         const float left = cx - totalW * 0.5f;
-        const float numberTop = top + 34.0f * s;
+        // 数字的垂直位置：坐在实体区中线上而不是贴上边。
+        // 曲线（D 阶段）会绕着这条中线做氛围，所以中线是它的锚点。
+        // 具体的 28 DIP 偏移先用"量到的字形像素"校准一次再定。
+        const float entityMidY = (kMarginDip + kEntityHeightDip * 0.5f) * s;
+        const float numberTop = entityMidY - 28.0f * s;
 
-        // 诊断：把输入与结果都打出来（只在 --layout-probe 时写文件）
+        // 诊断：把输入与结果都打出来（只在 --layout-probe 时记内存）
         LayoutProbe("number", cx, symbolW, digitsW, left);
         LayoutProbe("boxes", (kMarginDip + 12.0f) * s, (kMarginDip + 8.0f) * s,
                     numberTop, (kMarginDip + kEntityWidthDip) * s);
 
-        if (!symbol.empty()) {
-            ID2D1SolidColorBrush* b = nullptr;
-            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 0.9f), &b)) && b) {
-                IDWriteTextLayout* layout = nullptr;
-                if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
-                        symbol.c_str(), static_cast<UINT32>(symbol.size()), unitFmt, 256.0f, 64.0f,
-                        &layout)) &&
-                    layout) {
-                    // 符号与数字的基线大致对齐：符号字号小，往下压一点
-                    rt->DrawTextLayout(D2D1::Point2F(left, numberTop + 14.0f * s), layout, b,
-                                       D2D1_DRAW_TEXT_OPTIONS_NONE);
-                    layout->Release();
-                }
-                b->Release();
-            }
-        }
-
+        // 数字在前
         ID2D1SolidColorBrush* b = nullptr;
         if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 1.0f), &b)) && b) {
             IDWriteTextLayout* layout = nullptr;
@@ -336,11 +325,28 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                     digits.c_str(), static_cast<UINT32>(digits.size()), numFmt, 2048.0f, 128.0f,
                     &layout)) &&
                 layout) {
-                rt->DrawTextLayout(D2D1::Point2F(left + symbolW + gap, numberTop), layout, b,
+                rt->DrawTextLayout(D2D1::Point2F(left, numberTop), layout, b,
                                    D2D1_DRAW_TEXT_OPTIONS_NONE);
                 layout->Release();
             }
             b->Release();
+        }
+
+        // 符号在后（所有者指定）。符号字号小，往下压一点让基线大致对齐。
+        if (!symbol.empty()) {
+            ID2D1SolidColorBrush* sb = nullptr;
+            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 0.9f), &sb)) && sb) {
+                IDWriteTextLayout* layout = nullptr;
+                if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
+                        symbol.c_str(), static_cast<UINT32>(symbol.size()), unitFmt, 256.0f, 64.0f,
+                        &layout)) &&
+                    layout) {
+                    rt->DrawTextLayout(D2D1::Point2F(left + digitsW + gap, numberTop + 14.0f * s),
+                                       layout, sb, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    layout->Release();
+                }
+                sb->Release();
+            }
         }
     }
 
@@ -388,17 +394,10 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
         brush->Release();
     }
 
-    // 一个跟着时间走的方块：证明帧循环在跑、画面在刷新（后面会被真正的曲线取代）
-    ID2D1SolidColorBrush* white = nullptr;
-    if (SUCCEEDED(rt->CreateSolidColorBrush(
-            StraightRgba(kWhite.r, kWhite.g, kWhite.b, kWhite.a), &white)) && white) {
-        const float side = 28.0f * s;
-        const float travel = ew - side * 2;
-        const float x = cx + side + std::fmod(static_cast<float>(elapsedSeconds * 60.0), travel);
-        const float y = cy + eh * 0.5f - side * 0.5f;
-        rt->FillRectangle(D2D1::RectF(x, y, x + side, y + side), white);
-        white->Release();
-    }
+    // 这里原来有一个"跟着时间走的白色方块"，用途只是证明帧循环在跑。
+    // 数字上屏之后它就变成噪声了——而且它压在数字上，还和"曲线是氛围、
+    // 与数字叠加"的设计冲突。所以删掉：帧循环是否在跑，调试浮层里的
+    // 刷新率数字已经能回答。这个位置留给 D 阶段的曲线。
 
     // 激活反馈（A11）：一圈由粗到细、再消失的描边。透明度跟 flashAmount 走。
     if (flashAmount > 0.001) {
