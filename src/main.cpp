@@ -8,7 +8,9 @@
 //   把窗口与 DPI 的事实、帧统计写进 build\selftest.log。
 //   不弹对话框：Start-Process -PassThru 的 HasExited 在弹窗时会永远读成 false（踩过）。
 
+#include "paths.h"
 #include "renderer.h"
+#include "single_instance.h"
 
 #include <windows.h>
 #include <objbase.h>    // CoInitializeEx / COINIT_APARTMENTTHREADED
@@ -27,11 +29,13 @@ bool g_selfTest = false;
 double g_runSeconds = 0.0;        // 0 = 不自动退出，等用户按 Esc（--seconds=N 可改）
 double g_selfTestSeconds = 1.5;
 bool g_exportFrame = false;       // 离屏导一帧，然后退出
+bool g_premulProbe = false;       // 预乘自检（A8c）
 wchar_t g_exportPath[MAX_PATH] = L"frame.png";
 int g_frameNo = 1;
 HWND g_hwnd = nullptr;
 bool g_running = true;
 dshb::Renderer* g_renderer = nullptr;
+double g_elapsed = 0.0;          // 单调时钟累计秒数；帧循环和 WndProc 共用
 
 // 高精度单调计时；dt 钳到 [0, 50 ms]，防止休眠唤醒后第一帧一步跳到位（设计 §9.6）
 struct Clock {
@@ -88,6 +92,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             PostQuitMessage(0);
         }
         return 0;
+    case dshb::kMsgActivate:
+        // 有人又双击了一次 exe（A11）。这个窗口不抢焦点、也不进 Alt+Tab，
+        // 所以"提到前台"没有落点，改为闪一次描边作为可见反馈。
+        if (g_renderer) g_renderer->BeginActivationFlash(g_elapsed);
+        SelfTestLog(L"[single] 收到重复启动通知，已触发激活反馈 t=%.3f", g_elapsed);
+        return 0;
     case WM_DPICHANGED: {
         // 用系统给的建议矩形重设窗口；不用它会导致跨屏拖动时指针漂移（设计 §11.2.1）
         const RECT* suggested = reinterpret_cast<const RECT*>(lp);
@@ -128,11 +138,24 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_frameNo = _wtoi(argv[i] + 15);
         } else if (wcsncmp(argv[i], L"--out=", 6) == 0) {
             wcsncpy_s(g_exportPath, argv[i] + 6, _TRUNCATE);
+        } else if (wcscmp(argv[i], L"--premul-probe") == 0) {
+            g_premulProbe = true;
         }
     }
     if (argv) LocalFree(argv);
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    // ---- 单实例（A11）----
+    // 放在建窗之前：第二个实例不该先建出一个窗口再退出，那样屏幕上会闪一下。
+    // 注意导帧/自检这类离屏模式也不该受单实例限制（它们不显示窗口），
+    // 所以只在"要显示窗口"的路径上做这个检查。
+    const bool offscreenMode = g_exportFrame || g_premulProbe;
+    if (!offscreenMode && !dshb::AcquireSingleInstance()) {
+        SelfTestLog(L"[single] 已有实例在运行，本进程退出（已通知它闪一次）");
+        CoUninitialize();
+        return 0;
+    }
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -189,7 +212,53 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     SelfTestLog(L"[render] 画布=%dx%d scale=%.4f（外扩 %d DIP 余量）",
                 size.widthPx, size.heightPx, size.scale, dshb::kMarginDip);
 
+    // A12b：路径解析结果必须留痕。降级（目录不可写）时尤其要让用户找得到原因，
+    // 否则他会以为历史一直在正常记录。
+    {
+        const dshb::AppPaths& paths = dshb::Paths();
+        SelfTestLog(L"[paths] 数据目录=%ls 可写=%ls", paths.dataDir.c_str(),
+                    paths.writable ? L"是" : L"否");
+        SelfTestLog(L"[paths] 采样=%ls", paths.samples.c_str());
+        SelfTestLog(L"[paths] 日志=%ls", paths.log.c_str());
+        SelfTestLog(L"[paths] 设置=%ls", paths.config.c_str());
+        if (!paths.writable) {
+            SelfTestLog(L"[paths] 降级：目录不可写（%ls），采样只留在内存，重启后没有历史",
+                        paths.unwritableReason.c_str());
+        }
+    }
+
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+
+    // ---- 预乘自检（A8c）：先于导帧，因为它可能顺便导一张探针 PNG ----
+    // 判据不是"R 等于多少"，而是 **R 与 A 的关系**：
+    //   R <= A  -> 已预乘（PREMULTIPLIED 模式下 D2D 以 alpha 为权重解释颜色，
+    //              于是 R 恰好等于 a * 255）
+    //   R >  A  -> 直通数据被当预乘用（错误），症状是半透明处发白/发黑、圆角一圈灰毛边
+    // 两种都是"自洽"的，所以不能靠数值好不好看判，只能看 R 与 A 的关系。
+    if (g_premulProbe) {
+        uint8_t bgra[4]{};
+        int px = 0, py = 0;
+        const bool ok = renderer.PremulProbe(bgra, &px, &py);
+        const bool straight = ok && bgra[2] > bgra[3];
+        const bool premultiplied = ok && !straight;
+        SelfTestLog(L"[premul] 像素(%d,%d) BGRA=(%u,%u,%u,%u) alpha=%u",
+                    px, py, bgra[0], bgra[1], bgra[2], bgra[3], bgra[3]);
+        SelfTestLog(L"[premul] R>A 吗？%ls  →  结论：%ls",
+                    straight ? L"是（直通数据，错误）" : L"否",
+                    premultiplied ? L"已预乘（正确）" : L"读取失败（错误）");
+
+        if (g_exportFrame) {
+            const bool saved = renderer.ExportFrame(g_exportPath, 0.0);
+            SelfTestLog(L"[export] 预乘探针 PNG: %ls 结果=%ls", g_exportPath,
+                        saved ? L"成功" : L"失败");
+        }
+
+        renderer.Destroy();
+        g_renderer = nullptr;
+        DestroyWindow(g_hwnd);
+        CoUninitialize();
+        return premultiplied ? 0 : 8;
+    }
 
     // ---- 离屏导帧模式：渲一帧到 PNG 就退出 ----
     // 用来做"用像素说话"的验收：居中错位、颜色、残影、粒子越界都靠它量。

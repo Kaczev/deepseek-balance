@@ -58,6 +58,15 @@ public:
     //   都要靠它量。它渲染的是同一套画面，所以屏幕上的错在 PNG 里也会错。
     bool ExportFrame(const wchar_t* path, double elapsedSeconds);
 
+    // ★ 预乘自检（A8c）：渲一张"50% 透明纯红块"到位图，并回读像素。
+    //   预期 (128,0,0,128) 而不是 (255,0,0,128)——后者说明没预乘。
+    bool PremulProbe(uint8_t* outBgra, int* outX, int* outY);
+
+    // ★ 有人重复启动了程序（A11）。这个窗口不会抢焦点、也不进 Alt+Tab，
+    //   所以"把已有窗口提到前台"没有落点——只能用一次可见反馈代替。
+    void BeginActivationFlash(double nowSeconds);
+    double ActivationFlash(double nowSeconds) const;
+
     const CanvasSize& size() const { return size_; }
     bool ready() const { return ready_; }
 
@@ -66,6 +75,7 @@ private:
     CanvasSize size_{};
     bool ready_ = false;
     bool spillout_ = false;
+    double flashStart_ = -1000.0;   // 负值表示"没在闪"
 
     struct Impl;
     Impl* impl_ = nullptr;

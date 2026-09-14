@@ -20,14 +20,66 @@ namespace {
 
 constexpr float kPanelOpacity = 0.95f;
 
+// ★ 颜色纪律（A8c，已按实测纠正过一次）：
+//   **Direct2D 画刷要的是直通（straight）颜色**——预乘是 D2D 按目标 alpha 模式
+//   内部做的。曾经在这里手动预乘，结果预乘了两次：50% 纯红读出来是 64 而不是 128。
+//   症状不会报错，只会让半透明处整体偏暗。
+//   约定：代码里写设计色（直通 RGBA），交给 D2D；只有**离屏位图回读**和
+//   手工写位图时才需要自己预乘。
+const D2D1_COLOR_F StraightRgba(float r, float g, float b, float a) {
+    return D2D1::ColorF(r, g, b, a);
+}
+
+// 设计色（直通的 0-1 分量）。设计文档里的十六进制色号一律换算到这里。
+struct Rgba {
+    float r, g, b, a;
+};
+
+// #6c89f6（充足档基准色）
+constexpr Rgba kBaseColor{108.0f / 255.0f, 137.0f / 255.0f, 246.0f / 255.0f, kPanelOpacity};
+constexpr Rgba kWhite{1.0f, 1.0f, 1.0f, 0.9f};
+
+// ---------------------------------------------------------------------------
+// 预乘自检用的画面（A8c）：一个 50% 不透明的纯红方块。
+// 它与正常画面走同一条 PaintScene，所以"导出的 PNG"和"屏幕"验的是同一个东西。
+// ---------------------------------------------------------------------------
+enum class SceneMode { Normal, PremulProbe };
+SceneMode g_sceneMode = SceneMode::Normal;
+
+void PaintPremulProbe(ID2D1RenderTarget* rt) {
+    rt->Clear(D2D1::ColorF(0, 0.0f));
+    ID2D1SolidColorBrush* red = nullptr;
+    // 直通颜色交给 D2D；不要在这里再乘 alpha
+    if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1.0f, 0.0f, 0.0f, 0.5f), &red)) && red) {
+        rt->FillRectangle(D2D1::RectF(40.0f, 40.0f, 100.0f, 100.0f), red);
+        red->Release();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 画面内容：一处定义，屏幕与离屏导帧共用同一份代码。
 // 这样"导出的 PNG 是对的"才能推出"屏幕上的也是对的"。
 // 注意：本函数自己 BeginDraw / EndDraw，调用者不要再套一层（A0 的坑：
 // 嵌套会让 EndDraw 返回 D2DERR_WRONG_STATE 并且整帧被丢弃）。
 // ---------------------------------------------------------------------------
-void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedSeconds) {
-    rt->Clear(D2D1::ColorF(0, 0.0f));   // 画布整体透明，外扩余量必须完全透
+// 激活反馈：一次 1.2 秒的描边脉冲。用余弦做出的"起-落"曲线，
+// 首尾都归零，所以不会突然出现或突然消失（设计 §9.6 的连续性要求）。
+constexpr double kFlashSeconds = 1.2;
+
+double FlashPulse(double nowSeconds, double flashStart) {
+    const double t = nowSeconds - flashStart;
+    if (t < 0.0 || t > kFlashSeconds) return 0.0;
+    const double phase = t / kFlashSeconds;              // 0..1
+    const double wave = 0.5 - 0.5 * cos(2.0 * 3.14159265 * phase);  // 0→1→0
+    return wave;
+}
+
+void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedSeconds,
+                double flashAmount) {
+    if (g_sceneMode == SceneMode::PremulProbe) {
+        PaintPremulProbe(rt);
+        return;
+    }    rt->Clear(D2D1::ColorF(0, 0.0f));   // 画布整体透明，外扩余量必须完全透
 
     const float s = canvas.scale;
     const float cx = kMarginDip * s;
@@ -36,12 +88,10 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
     const float eh = kEntityHeightDip * s;
     const float radius = kCornerRadiusDip * s;
 
-    const D2D1_COLOR_F base = D2D1::ColorF(108.0f / 255, 137.0f / 255, 246.0f / 255, kPanelOpacity);
-    const D2D1_COLOR_F premul =
-        D2D1::ColorF(base.r * base.a, base.g * base.a, base.b * base.a, base.a);
+    const D2D1_COLOR_F base = StraightRgba(kBaseColor.r, kBaseColor.g, kBaseColor.b, kBaseColor.a);
 
     ID2D1SolidColorBrush* brush = nullptr;
-    if (SUCCEEDED(rt->CreateSolidColorBrush(premul, &brush)) && brush) {
+    if (SUCCEEDED(rt->CreateSolidColorBrush(base, &brush)) && brush) {
         const D2D1_ROUNDED_RECT rr =
             D2D1::RoundedRect(D2D1::RectF(cx, cy, cx + ew, cy + eh), radius, radius);
         rt->FillRoundedRectangle(rr, brush);
@@ -50,13 +100,28 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
 
     // 一个跟着时间走的方块：证明帧循环在跑、画面在刷新（后面会被真正的曲线取代）
     ID2D1SolidColorBrush* white = nullptr;
-    if (SUCCEEDED(rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.9f), &white)) && white) {
+    if (SUCCEEDED(rt->CreateSolidColorBrush(
+            StraightRgba(kWhite.r, kWhite.g, kWhite.b, kWhite.a), &white)) && white) {
         const float side = 28.0f * s;
         const float travel = ew - side * 2;
         const float x = cx + side + std::fmod(static_cast<float>(elapsedSeconds * 60.0), travel);
         const float y = cy + eh * 0.5f - side * 0.5f;
         rt->FillRectangle(D2D1::RectF(x, y, x + side, y + side), white);
         white->Release();
+    }
+
+    // 激活反馈（A11）：一圈由粗到细、再消失的描边。透明度跟 flashAmount 走。
+    if (flashAmount > 0.001) {
+        ID2D1SolidColorBrush* ring = nullptr;
+        const float a = static_cast<float>(flashAmount) * 0.9f;
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1.0f, 1.0f, 1.0f, a), &ring)) && ring) {
+            const float inset = 2.0f * s + static_cast<float>(1.0 - flashAmount) * 6.0f * s;
+            const D2D1_ROUNDED_RECT rr2 = D2D1::RoundedRect(
+                D2D1::RectF(cx + inset, cy + inset, cx + ew - inset, cy + eh - inset),
+                radius * 0.65f, radius * 0.65f);
+            rt->DrawRoundedRectangle(rr2, ring, 3.0f * s);
+            ring->Release();
+        }
     }
 }
 
@@ -209,8 +274,15 @@ void Renderer::Destroy() {
     ready_ = false;
 }
 
-bool Renderer::ApplyInputRegion(bool particlesSpillout) {
-    if (!impl_ || !hwnd_) return false;
+void Renderer::BeginActivationFlash(double nowSeconds) {
+    flashStart_ = nowSeconds;
+}
+
+double Renderer::ActivationFlash(double nowSeconds) const {
+    return FlashPulse(nowSeconds, flashStart_);
+}
+
+bool Renderer::ApplyInputRegion(bool particlesSpillout) {    if (!impl_ || !hwnd_) return false;
     if (spillout_ == particlesSpillout && spillout_ == true) {
         // 已经扩到全画布，不用重复设置
     }
@@ -249,7 +321,7 @@ HRESULT Renderer::RenderFrame(double elapsedSeconds) {
     // 注意：EndDraw 是唯一会报错的一步；BeginDraw 返回 void。
     // 这里自己 BeginDraw/EndDraw，画内容的函数不要再各调一次（A0 的坑）。
     d.dc->BeginDraw();
-    PaintScene(d.dc, size_, elapsedSeconds);
+    PaintScene(d.dc, size_, elapsedSeconds, ActivationFlash(elapsedSeconds));
     const HRESULT hrEnd = d.dc->EndDraw();
     if (FAILED(hrEnd)) {
         // A0 的教训：这里失败时 Present 仍会返回 S_OK，画面上却什么都没有，
@@ -287,7 +359,7 @@ bool Renderer::ExportFrame(const wchar_t* path, double elapsedSeconds) {
 
         // 同一份绘制代码，只是画到离屏位图上：屏幕上的错在这里也会错
         rt->BeginDraw();
-        PaintScene(rt, size_, elapsedSeconds);
+        PaintScene(rt, size_, elapsedSeconds, 0.0);
         if (FAILED(rt->EndDraw())) break;
 
         IWICBitmapEncoder* encoder = nullptr;
@@ -304,7 +376,10 @@ bool Renderer::ExportFrame(const wchar_t* path, double elapsedSeconds) {
             if (FAILED(frame->Initialize(bag))) break;
             if (FAILED(frame->SetSize(static_cast<UINT>(size_.widthPx),
                                       static_cast<UINT>(size_.heightPx)))) break;
-            WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+            // ★ 源位图是**预乘** alpha，必须如实声明为 PBGRA，让 WIC 去做预乘→直通的转换。
+            //   声明成 32bppBGRA（直通）会把预乘数据当直通读，导出的 PNG 整体偏暗——
+            //   而 PNG 是后面所有像素级验收的依据，错了会一路骗下去。
+            WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppPBGRA;
             if (FAILED(frame->SetPixelFormat(&fmt))) break;
             if (FAILED(frame->WriteSource(bitmap, nullptr))) break;
             if (FAILED(frame->Commit())) break;
@@ -322,6 +397,65 @@ bool Renderer::ExportFrame(const wchar_t* path, double elapsedSeconds) {
     if (bitmap) bitmap->Release();
     wic->Release();
     (void)elapsedSeconds;
+    return ok;
+}
+
+bool Renderer::PremulProbe(uint8_t* outBgra, int* outX, int* outY) {
+    if (!impl_ || !outBgra) return false;
+    Impl& d = *impl_;
+
+    // 让导出与屏幕都渲染同一个探针画面：否则"从 PNG 里量"量的是别的东西（踩过）
+    g_sceneMode = SceneMode::PremulProbe;
+
+    IWICImagingFactory* wic = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&wic)))) {
+        return false;
+    }
+
+    IWICBitmap* bitmap = nullptr;
+    ID2D1RenderTarget* rt = nullptr;
+    bool ok = false;
+    do {
+        if (FAILED(wic->CreateBitmap(static_cast<UINT>(size_.widthPx),
+                                     static_cast<UINT>(size_.heightPx),
+                                     GUID_WICPixelFormat32bppPBGRA,
+                                     WICBitmapCacheOnLoad, &bitmap))) {
+            break;
+        }
+        const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            0, 0, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_FEATURE_LEVEL_DEFAULT);
+        if (FAILED(d.d2dFactory->CreateWicBitmapRenderTarget(bitmap, props, &rt)) || !rt) break;
+
+        rt->BeginDraw();
+        PaintPremulProbe(rt);
+        if (FAILED(rt->EndDraw())) break;
+
+        const int sampleX = 70;
+        const int sampleY = 70;
+        if (outX) *outX = sampleX;
+        if (outY) *outY = sampleY;
+
+        IWICBitmapLock* lock = nullptr;
+        WICRect rc{sampleX, sampleY, 1, 1};
+        if (FAILED(bitmap->Lock(&rc, WICBitmapLockRead, &lock)) || !lock) break;
+        UINT cb = 0;
+        BYTE* data = nullptr;
+        if (SUCCEEDED(lock->GetDataPointer(&cb, &data)) && data && cb >= 4) {
+            outBgra[0] = data[0];  // B
+            outBgra[1] = data[1];  // G
+            outBgra[2] = data[2];  // R
+            outBgra[3] = data[3];  // A
+            ok = true;
+        }
+        lock->Release();
+    } while (false);
+
+    if (rt) rt->Release();
+    if (bitmap) bitmap->Release();
+    wic->Release();
     return ok;
 }
 
