@@ -360,9 +360,8 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
         // 璇婃柇锛氭覆鏌撳眰瀹為檯鎷垮埌鐨勬枃鏈笌婊氬姩閲忥紙鍙湪 --layout-probe 鏃惰褰曪級
         {
             char buf[256];
-            std::snprintf(buf, sizeof(buf), "text=%s rollActive=%d rollAmount=%.3f old=%s new=%s",
-                          f.amountText.c_str(), f.roll.active ? 1 : 0, f.roll.amount,
-                          f.roll.oldText.c_str(), f.roll.newText.c_str());
+            std::snprintf(buf, sizeof(buf), "text=%s rollActive=%d rollAmount=%.4f",
+                          f.amountText.c_str(), f.roll.active ? 1 : 0, f.roll.amount);
             LayoutProbe(buf, 0, 0, 0, 0);
         }
 

@@ -490,9 +490,14 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 const dshb::ConnState stD = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
                 const dshb::WidgetFrame fd = dshb::BuildWidgetFrame(
                     stD, g_display, true, L"\u00A5");
-                SelfTestLog(L"[rollstep] i=%d value=%.2f frac=%.3f active=%d text=%hs",
-                            i, g_display.value(), g_display.rollFraction(),
-                            fd.roll.active ? 1 : 0, fd.amountText.c_str());
+                // 打印"还剩多少比例没走完"：连续函数应当每帧等比缩小，
+                // 而且与帧率无关（这里固定 1/60 秒一步）。
+                const double tgt = g_display.target();
+                const double span = 19.90 - tgt;
+                const double rem = (span == 0.0) ? 0.0 : (g_display.value() - tgt) / span;
+                SelfTestLog(L"[rollstep] i=%d value=%.4f target=%.4f 剩余=%.4f active=%d text=%hs",
+                            i, g_display.value(), tgt, rem, fd.roll.active ? 1 : 0,
+                            fd.amountText.c_str());
             }
 
             SelfTestLog(L"[roll] 跳变前=%.2f 跳变后目标=%.2f 推进 %d 帧后显示=%.2f",
@@ -739,13 +744,15 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             dshb::WidgetFrame fz = dshb::BuildWidgetFrame(dshb::ConnState::Ok, dz, true, L"\u00A5");
             expect(fz.showAmount && fz.amountText == "0.00", L"归零：显示 0.00（不是占位符）");
 
-            // 6) 显示值必须渐进跟随，而且是**定时长**（不是指数逼近）。
-            //    ★ 这条测试曾经断言"一个时间常数后到 63%"——那是旧设计的判据。
-            //      改成固定时长 + 缓动之后，那个断言自然失败：**测试过时了，不是产品坏了**。
-            //      所以判据也要跟着换成新设计该有的性质：
-            //        · 中途在两端之间（既没跳过去，也没不动）
-            //        · 到时长就精确落位，不留尾巴
-            //        · 之后再推进也不会过冲
+            // 6) 显示值必须渐进跟随，而且运动由**速率（τ）**决定，不由时长决定。
+            //    ★ 这条测试的判据换过两次，每次都是因为设计变了、断言没跟上：
+            //      指数逼近时代断言"一个 τ 后到 63%"，还在用；
+            //      中间一度改成"固定时长 + 缓动"，那时断言"中途在中值附近"——
+            //      **测试过时不是产品坏了**，但也不能放着不管。
+            //    ★ 判据换成"速率 + 连续函数"该有的性质（所有者的纠正）：
+            //      · 运动由 τ 决定：一个 τ 之后应走掉约 63%
+            //      · 差到看不见就截断（吸附），最后一位干脆落定
+            //      · 落位后不漂移、不过冲
             dshb::DisplayedAmount dd;
             dshb::Sample a100{};
             a100.amountsOk = true;
@@ -754,23 +761,66 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             dshb::Sample a200{};
             a200.amountsOk = true;
             a200.total = dshb::Amount::FromYuan(200);
-            dd.OnSample(a200);
+            dd.OnSample(a200);   // 从 100 追向 200
 
-            // 走到时长的一半：缓动中点应当正好落在中值附近
-            const int halfSteps = static_cast<int>(dd.rollSeconds * 60.0 / 2.0);
-            for (int i = 0; i < halfSteps; ++i) dd.Update(1.0 / 60.0);
-            expect(dd.value() > 120.0 && dd.value() < 180.0,
-                   L"滚动中途落在两端之间（既没跳过去也没不动）");
+            // 推进正好一个 τ（用细小步长逼近连续时间），应走掉约 63% 的差距
+            {
+                const double step = dd.tau / 200.0;
+                for (int i = 0; i < 200; ++i) dd.Update(step);
+                const double walked = (dd.value() - 100.0) / 100.0;
+                if (walked < 0.6 || walked > 0.66) {
+                    SelfTestLog(L"[check]   一个 τ 后走了 %.3f（期望约 0.63）", walked);
+                }
+                expect(walked > 0.6 && walked < 0.66, L"一个时间常数后走掉约 63%（速率决定运动）");
+            }
 
-            // 走到时长结束：必须精确落位
-            const int restSteps = static_cast<int>(dd.rollSeconds * 60.0) - halfSteps + 2;
-            for (int i = 0; i < restSteps; ++i) dd.Update(1.0 / 60.0);
-            expect(std::fabs(dd.value() - 200.0) < 0.001, L"到时长精确落位（不留 199.9997）");
+            // 继续推进：应当被截断吸附到精确目标
+            for (int i = 0; i < 600; ++i) dd.Update(1.0 / 60.0);
+            expect(dd.value() == 200.0, L"截断后精确落位（不是 199.9997）");
+            expect(!dd.rolling(), L"落位后 rolling 结束");
 
-            // 结束之后再推进，不得过冲
+            // 落位后继续推进：不得漂移、不得过冲
             for (int i = 0; i < 120; ++i) dd.Update(1.0 / 60.0);
-            expect(std::fabs(dd.value() - 200.0) < 0.001, L"落位后不漂移、不过冲");
-            expect(!dd.rolling(), L"落位后 rolling 状态应结束（文本恢复按数值算）");
+            expect(dd.value() == 200.0, L"落位后不漂移、不过冲");
+
+            // 中途来新样本：从当前位置接着追，不跳变。
+            // ★ 判据要写成**不变量**，而且用例的数值差距要明显大于截断阈值——
+            //   第一版用 100->200 走一帧再改 150，差距落在 snapYuan 附近，
+            //   吸附与否全看浮点尾数，断言于是变成掷骰子。测试本身要选
+            //   "答案明确"的用例，不该去考边界。
+            {
+                dshb::DisplayedAmount de;
+                dshb::Sample s0{};
+                s0.amountsOk = true;
+                s0.total = dshb::Amount::FromYuan(100);
+                de.OnSample(s0);
+                dshb::Sample s300{};
+                s300.amountsOk = true;
+                s300.total = dshb::Amount::FromYuan(300);
+                de.OnSample(s300);                 // 目标 300，差距 200，远大于阈值
+                de.Update(1.0 / 60.0);
+                const double mid = de.value();
+                expect(mid > 100.0 && mid < 200.0, L"追赶途中：位置严格在两端之间");
+
+                dshb::Sample s150{};
+                s150.amountsOk = true;
+                s150.total = dshb::Amount::FromYuan(150);
+                de.OnSample(s150);                 // 目标改成更低的 150
+                expect(de.value() == mid, L"新样本不改动当前显示值（只有目标是突变的）");
+
+                de.Update(1.0 / 60.0);              // 一帧最多走 5.4% 的差距
+                const double after = de.value();
+                // 总是打印，别让它藏在条件里——上一版就是这么白查一轮的
+                SelfTestLog(L"[check]   追赶中途: mid=%.4f after=%.4f target=150", mid, after);
+
+                // ★ 断言"朝新目标走、且不越过去"，方向由目标决定，不由我想当然决定。
+                //   上一版这里写的是"after < mid"（假设它该下降），可当前值 110.8
+                //   低于新目标 150，它本来就该上升——**测试自己写反了方向**。
+                const double moved = after - mid;
+                const double toGo = 150.0 - mid;
+                expect(moved != 0.0 && ((moved > 0) == (toGo > 0)) && std::fabs(moved) < std::fabs(toGo),
+                       L"接着朝新目标走：方向对、一帧不跳过去");
+            }
         }
 
         SelfTestLog(L"[check] 小计：失败 %d 项", failed);
@@ -833,9 +883,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                             dshb::ConnStateName(st2), renderer.widgetFrame().showAmount ? 1 : 0,
                             renderer.widgetFrame().currencySymbol,
                             renderer.widgetFrame().amountText.c_str());
-                SelfTestLog(L"[layout] display: hasValue=%d value=%.4f target=%.4f rollSeconds=%.2f",
+                SelfTestLog(L"[layout] display: hasValue=%d value=%.4f target=%.4f tau=%.3f",
                             g_display.hasValue() ? 1 : 0, g_display.value(), g_display.target(),
-                            g_display.rollSeconds);
+                            g_display.tau);
             }
         }
 

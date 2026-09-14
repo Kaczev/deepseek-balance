@@ -13,6 +13,7 @@
 
 #include "state_machine.h"
 
+#include <cmath>     // std::fabs（rolling() 用）
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -21,17 +22,40 @@ namespace dshb {
 
 // 余额数字的显示状态
 //
-// ★ 为什么是"定时长"而不是"指数逼近"（被实测逼出来的结论）：
-//   指数逼近永远到不了目标，只能无限接近。它的后果不只是"数字慢"——
-//   滚动期间渲染层必须显示"起点文本"，于是**数字看起来一直停在旧值上**，
-//   直到逼近到吸附阈值为止（实测约 1 秒）。视觉上就是"数字根本没变"。
-//   改成固定时长 + 缓动：滚动期明确开始、明确结束，两头都能对上。
+// ★ 为什么是"速率 + 连续函数"而不是"定时长"（所有者纠正过一次，这里记清楚）：
+//
+//   设计里写的是"各状态的变化都用连续的方法去控制；变量可以突变，但显示变量
+//   必须逐渐变化、跟着那个突变变量"。那就是**速率参数**驱动的连续函数。
+//
+//   我一度改成"固定时长 0.40 秒 + 缓动"，那是为了绕开指数逼近的尾巴而打的补丁，
+//   副作用有两个：
+//     1. 引入了设计里没有的东西（一次跳跃有自己的时长）——于是"0.4 秒是什么时长"
+//        这个问题本身就说明它不对；
+//     2. 它和采样间隔（10 秒）脱钩：数字 0.4 秒走完，然后 9.6 秒纹丝不动。
+//        这和"绑在采样间隔上"是同一类毛病，只是换了个方向。
+//
+//   正确的形态：**目标值每 10 秒换一次**，所以"永远降不到 0"根本不发生——
+//   显示值一直在追一个一直在动的目标。唯一的危害是"最后半格磨蹭"，
+//   那由截断（吸附阈值）解决：差到看不见就直接贴上去。
+//
+//   于是只有一个参数 τ（速率），没有时长。
 class DisplayedAmount {
 public:
-    // 滚动时长（秒）。C4 会调它——要点是它**不与采样间隔挂钩**（采样固定 10 秒）。
-    double rollSeconds = 0.40;
+    // 速率：显示值每秒钟走掉剩余差距的 (1 - e^(-dt/τ))。
+    //
+    // ★ 默认 0.10 秒是**量出来的**，不是拍的（tools/tauprobe.cpp 可复现）：
+    //     τ     截断(走完)   99% 到位
+    //     0.30    2.90 s      1.37 s    太慢，对 10 秒采样明显滞后
+    //     0.20    1.93 s      0.92 s    偏慢
+    //     0.10    0.97 s      0.45 s    ← 正对初稿写的"1 秒恰好滚动完成"
+    //     0.06    0.57 s      0.27 s    偏急
+    //     0.04    0.38 s      0.18 s    像瞬跳，失去滚动感
+    //   τ 仍远小于采样间隔（10 秒），所以每次采样后数字都早早到位、看起来始终新鲜。
+    double tau = 0.10;
 
-    // 吸附阈值（元）：差距小于这个就直接贴上去，不做无意义的滚动。
+    // 截断阈值（元，= 半个最小显示单位）：差距小于这个就直接吸附。
+    // 指数逼近的尾巴在数值上永远不为 0，但在视觉上早就没有移动了；
+    // 这条截断把那截"看不见的尾巴"切掉，最后一位数字才能干脆落定。
     double snapYuan = 0.005;
 
     // 收到新样本。做一次确认，避免"瞬间 0"把界面闪成灰色。
@@ -44,39 +68,34 @@ public:
     double value() const { return value_; }
     double target() const { return target_; }
 
-    // 滚动进度：0 = 停在旧值，1 = 已落在新值上。逐位滚动的竖直偏移由它驱动。
-    double rollFraction() const { return rollFraction_; }
-    const std::string& rollOldText() const { return rollOldText_; }
-    const std::string& rollNewText() const { return rollNewText_; }
-    bool rolling() const { return rollFraction_ < 1.0 && !rollOldText_.empty(); }
+    // 是否正在追一个还没到位的目标（渲染层据此决定轮子要不要转）
+    bool rolling() const { return hasValue_ && std::fabs(target_ - value_) > 0.0; }
+
+    // 距离目标的剩余比例，仅用于日志与自检（渲染不再需要）
+    double remaining() const {
+        const double span = rollFromValue_ - target_;
+        return (span == 0.0) ? 0.0 : (value_ - target_) / span;
+    }
 
     // 滚动期间应当显示哪一段文本。
-    // ★ 数字必须**冻结**成"起点文本"或"目标文本"两者之一，不能每帧按插值后的
-    //   数值重算——那样每帧都换一套数字，看起来就是一闪一闪（实测确认：
-    //   每帧 text 从 20.30 变到 21.47 再变到 23.32，闪的来源就在这里）。
-    //   竖直偏移负责"动"，文本负责"内容"，两者不能同时变。
+    // ★ 数字文本只由**目标值**决定，不按每帧插值后的数值重算——那样每帧换一套
+    //   数字，看起来就是一闪一闪（实测确认过）。竖直偏移（由当前值驱动）负责"动"，
+    //   文本负责"内容"，两者不能同时变。
     std::string TextToShow() const;
-    double AmountToShow() const;
 
     // 是否处于"连续两次采样都是 0"的确认态
     bool zeroConfirmed() const { return zeroConfirmed_; }
 
 private:
     bool hasValue_ = false;
-    double value_ = 0.0;
-    double target_ = 0.0;
+    double value_ = 0.0;      // 当前显示值：连续函数追着 target_ 走
+    double target_ = 0.0;     // 目标值：每次采样直接改写（可以突变）
     bool zeroPending_ = false;
     bool zeroConfirmed_ = false;
     double latest_ = 0.0;
 
-    // 逐位滚动用的量：起点值、目标值、以及已经滚了多久。
-    // rollFraction_ 由 rollElapsed_/rollSeconds 算出，**不自己衰减**——
-    // 让进度和数值各走一套是上一版的错误来源。
-    std::string rollOldText_;
-    std::string rollNewText_;
+    // 这一段的起点值，用于自检报告"走了多少比例"
     double rollFromValue_ = 0.0;
-    double rollElapsed_ = 0.0;
-    double rollFraction_ = 1.0;
 };
 
 // ★ 逐位里程表的正确模型（所有者指出）：
@@ -91,9 +110,6 @@ struct NumberRoll {
     // 这一帧的连续金额。各位的带子位置由它除以各自的位权算出。
     // **它不是"动画参数"，就是当前显示值本身**——滚动没有自己的时长。
     double amount = 0.0;
-    // 起点与终点文本（用于日志与自检；渲染不再按位配对）
-    std::string oldText;
-    std::string newText;
 };
 
 struct WidgetFrame {

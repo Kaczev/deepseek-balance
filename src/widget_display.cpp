@@ -47,49 +47,41 @@ void DisplayedAmount::OnSample(const Sample& s) {
         zeroConfirmed_ = false;
     }
 
-    // ★ 逐位滚动：记下起点值/起点文本、目标文本，并重新开始计时。
-    //   起点取"当前显示值"，所以动画中途来新样本不会跳——从当前位置接着滚。
-    const std::string newText =
-        Amount{static_cast<AmountRaw>(std::llround(yuan * kUnitsPerYuan))}.ToString2();
-
-    if (hasValue_) {
-        const std::string oldText =
-            Amount{static_cast<AmountRaw>(std::llround(value_ * kUnitsPerYuan))}.ToString2();
-        rollOldText_ = oldText;
-        rollNewText_ = newText;
-        rollFromValue_ = value_;
-        rollElapsed_ = 0.0;
-        rollFraction_ = 0.0;
-    } else {
-        // 第一次拿到值就直接落位，不要从 0 滚上去——那会让人以为余额在涨
-        value_ = yuan;
-        hasValue_ = true;
-        rollOldText_.clear();
-        rollNewText_.clear();
-        rollFraction_ = 1.0;
-        rollElapsed_ = rollSeconds;
-    }
+    // ★ 目标值直接改写（可以突变），显示值照旧慢慢追——这就是设计里那句
+    //   "变量可以突变，但要套一个显示变量，那个显示变量是逐渐变化、跟着那个突变变量的"。
+    //   起点值只记来给自检报告"走了多少比例"，不参与计算。
+    rollFromValue_ = hasValue_ ? value_ : yuan;
 
     target_ = yuan;
+    if (!hasValue_) {
+        // 第一次拿到值就直接落位：从 0 滚上去会让人以为余额在涨
+        value_ = yuan;
+        hasValue_ = true;
+    }
 }
 
 double DisplayedAmount::Update(double dtSeconds) {
     if (!hasValue_) return 0.0;
 
-    // 固定时长 + 缓动。到点就是到点，不留尾巴，也不再"永远差一点"。
-    rollElapsed_ += dtSeconds;
-    double t = (rollSeconds > 0.0) ? (rollElapsed_ / rollSeconds) : 1.0;
-    if (t >= 1.0) t = 1.0;
-    rollFraction_ = t;
+    const double diff = target_ - value_;
+    if (diff == 0.0) return value_;
 
-    // 缓动：两端慢、中间快。线性会显得发闷，这条像齿轮拨过一格。
-    const double e = t * t * (3.0 - 2.0 * t);
-    value_ = rollFromValue_ + (target_ - rollFromValue_) * e;
-
-    if (t >= 1.0) {
-        value_ = target_;                      // 精确落位，不留 99.9997
-        rollOldText_.clear();                  // 滚动结束，文本回到"按数值算"
+    // 截断：差到看不见就直接吸附。
+    // ★ 指数逼近的尾巴在数值上永远不为 0，但在视觉上早就不动了。
+    //   这一条把那段"看不见的尾巴"切掉，最后一位数字才能干脆落定；
+    //   没有它，数字会在 99.997 这种地方磨蹭很久（实测过）。
+    if (std::fabs(diff) <= snapYuan) {
+        value_ = target_;
+        return value_;
     }
+
+    // 连续函数：每帧走掉剩余差距的一部分。步长与 dt 挂钩，所以帧率变化不影响手感。
+    // 这是**唯一的**运动规律——没有"某次滚动的时长"这个参数。
+    const double step = 1.0 - std::exp(-dtSeconds / tau);
+    value_ += diff * step;
+
+    // 走完这一步可能刚好越过了截断线，顺手再判一次，避免多花一帧
+    if (std::fabs(target_ - value_) <= snapYuan) value_ = target_;
     return value_;
 }
 
@@ -110,18 +102,10 @@ const wchar_t* StatusTextFor(ConnState state) {
 
 std::string DisplayedAmount::TextToShow() const {
     if (!hasValue_) return "--.--";
-    if (rolling()) return rollNewText_;        // 滚动期间冻结在目标文本上
-    return Amount{static_cast<AmountRaw>(std::llround(value_ * kUnitsPerYuan))}.ToString2();
-}
-
-double DisplayedAmount::AmountToShow() const {
-    if (!hasValue_) return 0.0;
-    if (rolling()) {
-        // 文本冻结在目标值上，所以显示值也按目标值报——否则"当前值"和
-        // "正在显示的文本"会互相矛盾（上一版就是这样：文本说 20.30，画面却在滚向 99.50）
-        return std::atof(rollNewText_.c_str());
-    }
-    return value_;
+    // 文本只由目标值决定：滚动期间冻结在目标上，落位后 value_ == target_，
+    // 两种情形其实是同一个式子。这样"内容"与"竖直偏移"永远不同时变。
+    const double shown = rolling() ? target_ : value_;
+    return Amount{static_cast<AmountRaw>(std::llround(shown * kUnitsPerYuan))}.ToString2();
 }
 
 WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, bool currencyKnown,
@@ -150,8 +134,6 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     if (haveNumber && amount.rolling()) {
         f.roll.active = true;
         f.roll.amount = amount.value();
-        f.roll.oldText = amount.rollOldText();
-        f.roll.newText = amount.rollNewText();
     }
     return f;
 }
