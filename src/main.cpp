@@ -26,6 +26,9 @@ constexpr wchar_t kSelfTestLog[] = L"selftest.log";
 bool g_selfTest = false;
 double g_runSeconds = 0.0;        // 0 = 不自动退出，等用户按 Esc（--seconds=N 可改）
 double g_selfTestSeconds = 1.5;
+bool g_exportFrame = false;       // 离屏导一帧，然后退出
+wchar_t g_exportPath[MAX_PATH] = L"frame.png";
+int g_frameNo = 1;
 HWND g_hwnd = nullptr;
 bool g_running = true;
 dshb::Renderer* g_renderer = nullptr;
@@ -53,25 +56,24 @@ struct Clock {
 };
 
 void SelfTestLog(const wchar_t* fmt, ...) {
-    FILE* f = nullptr;
-    va_list args;
-    // 绝对路径：相对路径会落到"启动时的工作目录"里，而不是它该在的地方（踩过）
-    wchar_t path[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
-    if (wchar_t* slash = wcsrchr(path, L'\\')) *(slash + 1) = L'\0';
-    wcscat_s(path, kSelfTestLog);
+    // 这个程序是 GUI 子系统，没有控制台：往 stdout 写等于丢掉。
+    // 所以日志只落文件。路径必须是绝对的——相对路径会落到"启动时的工作目录"里。
+    static wchar_t path[MAX_PATH] = L"";
+    if (path[0] == L'\0') {
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        if (wchar_t* slash = wcsrchr(path, L'\\')) *(slash + 1) = L'\0';
+        wcscat_s(path, kSelfTestLog);
+    }
 
+    FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"a, ccs=UTF-8") == 0 && f) {
+        va_list args;
         va_start(args, fmt);
         vfwprintf(f, fmt, args);
         va_end(args);
         fwprintf(f, L"\n");
         fclose(f);
     }
-    va_start(args, fmt);
-    vwprintf(fmt, args);
-    va_end(args);
-    wprintf(L"\n");
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -121,6 +123,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         } else if (wcsncmp(argv[i], L"--seconds=", 10) == 0) {
             g_runSeconds = _wtof(argv[i] + 10);
             g_selfTestSeconds = g_runSeconds;
+        } else if (wcsncmp(argv[i], L"--export-frame=", 15) == 0) {
+            g_exportFrame = true;
+            g_frameNo = _wtoi(argv[i] + 15);
+        } else if (wcsncmp(argv[i], L"--out=", 6) == 0) {
+            wcsncpy_s(g_exportPath, argv[i] + 6, _TRUNCATE);
         }
     }
     if (argv) LocalFree(argv);
@@ -183,6 +190,22 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 size.widthPx, size.heightPx, size.scale, dshb::kMarginDip);
 
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+
+    // ---- 离屏导帧模式：渲一帧到 PNG 就退出 ----
+    // 用来做"用像素说话"的验收：居中错位、颜色、残影、粒子越界都靠它量。
+    // 注意它渲染的是同一份绘制代码，所以屏幕上的错在 PNG 里也会错。
+    if (g_exportFrame) {
+        const double t = static_cast<double>(g_frameNo) / 60.0;   // 第 N 帧 ≈ N/60 秒
+        const bool ok = renderer.ExportFrame(g_exportPath, t);
+        SelfTestLog(L"[export] %ls 帧=%d 时刻=%.3fs 结果=%ls 画布=%dx%d",
+                    g_exportPath, g_frameNo, t, ok ? L"成功" : L"失败",
+                    size.widthPx, size.heightPx);
+        renderer.Destroy();
+        g_renderer = nullptr;
+        DestroyWindow(g_hwnd);
+        CoUninitialize();
+        return ok ? 0 : 7;
+    }
 
     Clock clock;
     double elapsed = 0.0;

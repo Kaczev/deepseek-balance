@@ -32,9 +32,9 @@ target_compile_definitions(dshb PRIVATE
     NOMINMAX
     _WIN32_WINNT=0x0A00)
 
-# 与静态 CRT 搭配的库；d2d1/d3d11/dcomp/dwrite 都是 Windows 自带组件，不需要分发
+# 与静态 CRT 搭配的库；d2d1/d3d11/dcomp/dwrite/windowscodecs 都是 Windows 自带组件，不需要分发
 target_link_libraries(dshb PRIVATE
-    d2d1 d3d11 dcomp dwrite
+    d2d1 d3d11 dcomp dwrite windowscodecs
     user32 gdi32 ole32 uuid shell32)
 
 # Per-Monitor V2 DPI 感知：靠清单声明，不靠运行时 API（设计 §11.2.1）

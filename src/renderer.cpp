@@ -9,6 +9,8 @@
 #include <d2d1helper.h>
 #include <d3d11.h>
 #include <dcomp.h>
+#include <objbase.h>      // CoCreateInstance
+#include <wincodec.h>     // 离屏导帧用
 
 #include <cmath>   // std::fmod
 
@@ -17,6 +19,46 @@ namespace dshb {
 namespace {
 
 constexpr float kPanelOpacity = 0.95f;
+
+// ---------------------------------------------------------------------------
+// 画面内容：一处定义，屏幕与离屏导帧共用同一份代码。
+// 这样"导出的 PNG 是对的"才能推出"屏幕上的也是对的"。
+// 注意：本函数自己 BeginDraw / EndDraw，调用者不要再套一层（A0 的坑：
+// 嵌套会让 EndDraw 返回 D2DERR_WRONG_STATE 并且整帧被丢弃）。
+// ---------------------------------------------------------------------------
+void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedSeconds) {
+    rt->Clear(D2D1::ColorF(0, 0.0f));   // 画布整体透明，外扩余量必须完全透
+
+    const float s = canvas.scale;
+    const float cx = kMarginDip * s;
+    const float cy = kMarginDip * s;
+    const float ew = kEntityWidthDip * s;
+    const float eh = kEntityHeightDip * s;
+    const float radius = kCornerRadiusDip * s;
+
+    const D2D1_COLOR_F base = D2D1::ColorF(108.0f / 255, 137.0f / 255, 246.0f / 255, kPanelOpacity);
+    const D2D1_COLOR_F premul =
+        D2D1::ColorF(base.r * base.a, base.g * base.a, base.b * base.a, base.a);
+
+    ID2D1SolidColorBrush* brush = nullptr;
+    if (SUCCEEDED(rt->CreateSolidColorBrush(premul, &brush)) && brush) {
+        const D2D1_ROUNDED_RECT rr =
+            D2D1::RoundedRect(D2D1::RectF(cx, cy, cx + ew, cy + eh), radius, radius);
+        rt->FillRoundedRectangle(rr, brush);
+        brush->Release();
+    }
+
+    // 一个跟着时间走的方块：证明帧循环在跑、画面在刷新（后面会被真正的曲线取代）
+    ID2D1SolidColorBrush* white = nullptr;
+    if (SUCCEEDED(rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.9f), &white)) && white) {
+        const float side = 28.0f * s;
+        const float travel = ew - side * 2;
+        const float x = cx + side + std::fmod(static_cast<float>(elapsedSeconds * 60.0), travel);
+        const float y = cy + eh * 0.5f - side * 0.5f;
+        rt->FillRectangle(D2D1::RectF(x, y, x + side, y + side), white);
+        white->Release();
+    }
+}
 
 double NowSeconds() {
     static LARGE_INTEGER freq{};
@@ -207,39 +249,7 @@ HRESULT Renderer::RenderFrame(double elapsedSeconds) {
     // 注意：EndDraw 是唯一会报错的一步；BeginDraw 返回 void。
     // 这里自己 BeginDraw/EndDraw，画内容的函数不要再各调一次（A0 的坑）。
     d.dc->BeginDraw();
-    d.dc->Clear(D2D1::ColorF(0, 0.0f));
-
-    const float s = size_.scale;
-    const float cx = kMarginDip * s;
-    const float cy = kMarginDip * s;
-    const float ew = kEntityWidthDip * s;
-    const float eh = kEntityHeightDip * s;
-    const float radius = kCornerRadiusDip * s;
-
-    const D2D1_COLOR_F base = D2D1::ColorF(108.0f / 255, 137.0f / 255, 246.0f / 255, kPanelOpacity);
-    const D2D1_COLOR_F premul =
-        D2D1::ColorF(base.r * base.a, base.g * base.a, base.b * base.a, base.a);
-
-    ID2D1SolidColorBrush* brush = nullptr;
-    if (SUCCEEDED(d.dc->CreateSolidColorBrush(premul, &brush)) && brush) {
-        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(
-            D2D1::RectF(cx, cy, cx + ew, cy + eh), radius, radius);
-        d.dc->FillRoundedRectangle(rr, brush);
-        brush->Release();
-    }
-
-    // 一个跟着时间走的方块：证明帧循环在跑、画面在刷新（后面会被真正的曲线取代）
-    ID2D1SolidColorBrush* white = nullptr;
-    if (SUCCEEDED(d.dc->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.9f), &white)) && white) {
-        const float side = 28.0f * s;
-        const float travel = ew - side * 2;
-        const float t = static_cast<float>(elapsedSeconds * 60.0);
-        const float x = cx + side + std::fmod(t, travel);
-        const float y = cy + eh * 0.5f - side * 0.5f;
-        d.dc->FillRectangle(D2D1::RectF(x, y, x + side, y + side), white);
-        white->Release();
-    }
-
+    PaintScene(d.dc, size_, elapsedSeconds);
     const HRESULT hrEnd = d.dc->EndDraw();
     if (FAILED(hrEnd)) {
         // A0 的教训：这里失败时 Present 仍会返回 S_OK，画面上却什么都没有，
@@ -247,6 +257,72 @@ HRESULT Renderer::RenderFrame(double elapsedSeconds) {
         return hrEnd;
     }
     return d.swapchain->Present(1, 0);
+}
+
+bool Renderer::ExportFrame(const wchar_t* path, double elapsedSeconds) {
+    if (!impl_ || !path) return false;
+    Impl& d = *impl_;
+
+    IWICImagingFactory* wic = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&wic)))) {
+        return false;
+    }
+
+    IWICBitmap* bitmap = nullptr;
+    bool ok = false;
+    ID2D1RenderTarget* rt = nullptr;
+    do {
+        if (FAILED(wic->CreateBitmap(static_cast<UINT>(size_.widthPx),
+                                     static_cast<UINT>(size_.heightPx),
+                                     GUID_WICPixelFormat32bppPBGRA,
+                                     WICBitmapCacheOnLoad, &bitmap))) {
+            break;
+        }
+        const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            0, 0, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_FEATURE_LEVEL_DEFAULT);
+        if (FAILED(d.d2dFactory->CreateWicBitmapRenderTarget(bitmap, props, &rt)) || !rt) break;
+
+        // 同一份绘制代码，只是画到离屏位图上：屏幕上的错在这里也会错
+        rt->BeginDraw();
+        PaintScene(rt, size_, elapsedSeconds);
+        if (FAILED(rt->EndDraw())) break;
+
+        IWICBitmapEncoder* encoder = nullptr;
+        IWICStream* stream = nullptr;
+        IWICBitmapFrameEncode* frame = nullptr;
+        IPropertyBag2* bag = nullptr;
+        bool encoded = false;
+        do {
+            if (FAILED(wic->CreateStream(&stream))) break;
+            if (FAILED(stream->InitializeFromFilename(path, GENERIC_WRITE))) break;
+            if (FAILED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder))) break;
+            if (FAILED(encoder->Initialize(stream, WICBitmapEncoderNoCache))) break;
+            if (FAILED(encoder->CreateNewFrame(&frame, &bag))) break;
+            if (FAILED(frame->Initialize(bag))) break;
+            if (FAILED(frame->SetSize(static_cast<UINT>(size_.widthPx),
+                                      static_cast<UINT>(size_.heightPx)))) break;
+            WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+            if (FAILED(frame->SetPixelFormat(&fmt))) break;
+            if (FAILED(frame->WriteSource(bitmap, nullptr))) break;
+            if (FAILED(frame->Commit())) break;
+            if (FAILED(encoder->Commit())) break;
+            encoded = true;
+        } while (false);
+        if (bag) bag->Release();
+        if (frame) frame->Release();
+        if (encoder) encoder->Release();
+        if (stream) stream->Release();
+        ok = encoded;
+    } while (false);
+
+    if (rt) rt->Release();
+    if (bitmap) bitmap->Release();
+    wic->Release();
+    (void)elapsedSeconds;
+    return ok;
 }
 
 }  // namespace dshb

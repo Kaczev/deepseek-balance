@@ -53,6 +53,11 @@ public:
     //   particlesSpillout = true 时扩到整个画布，用于粒子飞出实体区的那段时间。
     bool ApplyInputRegion(bool particlesSpillout);
 
+    // ★ 离屏导帧：用同一份绘制代码渲染到一张离屏位图并写成 PNG。
+    //   用途是"用像素说话"——居中错位、颜色、残影、粒子越界这些肉眼判不了的东西，
+    //   都要靠它量。它渲染的是同一套画面，所以屏幕上的错在 PNG 里也会错。
+    bool ExportFrame(const wchar_t* path, double elapsedSeconds);
+
     const CanvasSize& size() const { return size_; }
     bool ready() const { return ready_; }
 
