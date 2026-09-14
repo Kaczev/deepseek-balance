@@ -1,0 +1,63 @@
+// deepseek-balance v0.2 —— 渲染器：DirectComposition + D3D11 翻转模型
+//
+// 路径由 A0 实验裁决（设计文档 §12.3.3b）：两路视觉一致，代价差约 15 倍，
+// 定案走这条路。四条在 A0 里踩过、必须遵守的规矩：
+//   1. 用 CreateSwapChainForComposition 的窗口必须带 WS_EX_NOREDIRECTIONBITMAP
+//   2. BeginDraw / EndDraw 不能嵌套（嵌套会让 EndDraw 返回 WRONG_STATE 且整帧被丢弃）
+//   3. 画布尺寸用 GetDpiForWindow，不是 GetDpiForSystem
+//   4. DPI 变更时重建交换链与画布
+
+#pragma once
+
+#include <windows.h>
+
+#include <cstdint>
+
+namespace dshb {
+
+// 画布尺寸（DIP）：实体视觉区 315x129，四周各 80 的外扩透明余量 → 475x289
+constexpr int kEntityWidthDip = 315;
+constexpr int kEntityHeightDip = 129;
+constexpr int kMarginDip = 80;
+constexpr int kCanvasWidthDip = kEntityWidthDip + kMarginDip * 2;
+constexpr int kCanvasHeightDip = kEntityHeightDip + kMarginDip * 2;
+constexpr int kCornerRadiusDip = 12;
+
+// 设计基准色 #6c89f6（充足档）
+constexpr uint32_t kBaseColorBgra = 0xF6896C;  // 0xAABBGGRR 里的 RGB 部分
+
+struct CanvasSize {
+    int widthPx = 0;
+    int heightPx = 0;
+    float scale = 1.0f;
+};
+
+class Renderer {
+public:
+    ~Renderer();
+
+    // 按窗口所在显示器的 DPI 算出画布物理尺寸。必须在 Create 之前调用。
+    static CanvasSize SizeForWindow(HWND hwnd);
+
+    bool Create(HWND hwnd, const CanvasSize& size);
+    void Destroy();
+
+    // 重建画布（DPI 变更时用）
+    bool Resize(HWND hwnd);
+
+    // 画一帧并提交。返回 Present 的结果（便于这里直接发现失败）。
+    HRESULT RenderFrame(double elapsedSeconds);
+
+    const CanvasSize& size() const { return size_; }
+    bool ready() const { return ready_; }
+
+private:
+    HWND hwnd_ = nullptr;
+    CanvasSize size_{};
+    bool ready_ = false;
+
+    struct Impl;
+    Impl* impl_ = nullptr;
+};
+
+}  // namespace dshb
