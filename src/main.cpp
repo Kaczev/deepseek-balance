@@ -14,6 +14,7 @@
 #include "sampling.h"
 #include "single_instance.h"
 #include "state_machine.h"
+#include "wheel.h"
 
 #include <windows.h>
 #include <objbase.h>    // CoInitializeEx / COINIT_APARTMENTTHREADED
@@ -45,6 +46,7 @@ bool g_selftestB = false;        // --selftest-b：金额解析与状态机的�
 bool g_layoutProbe = false;      // --layout-probe：导出模式下打印布局数值
 int g_dpiOverride = 0;           // --dpi=N：覆盖画布缩放（0 = 用窗口真实 DPI）
 double g_uiScale = 1.0;          // --ui-scale=N：视觉缩放（1.0 = 按 DPI，设计意图）
+double g_rollTo = 0.0;           // --roll-to=N：滚动抓帧的目标金额（0 = 用默认 99.50）
 int g_rollFrames = 0;            // --roll=N：是否导出滚动瞬间（N 只用于日志，步数看 g_rollSteps）
 int g_rollSteps = 0;             // --roll=N：跳变之后推进多少帧（1/60 秒一步）
 bool g_rollLoop = false;         // --roll=loop：每 2 秒来回跳一次，用肉眼反复看滚动
@@ -218,6 +220,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_dpiOverride = _wtoi(argv[i] + 6);
         } else if (wcsncmp(argv[i], L"--ui-scale=", 11) == 0) {
             g_uiScale = _wtof(argv[i] + 11);
+        } else if (wcsncmp(argv[i], L"--roll-to=", 10) == 0) {
+            g_rollTo = _wtof(argv[i] + 10);       // 滚动抓帧的目标金额
         } else if (wcsncmp(argv[i], L"--roll=", 7) == 0) {
             g_rollFrames = 1;                     // 只要出现这个参数就进入滚动抓帧模式
             if (wcscmp(argv[i] + 7, L"loop") == 0) {
@@ -466,11 +470,14 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 return 0;
             }
 
-            // 现在把"充值跳变"塞进去，再从这一刻开始逐帧推进。
-            // 目标 99.50 是刻意选的：它和起点 20.00 都是 5 个字符，
-            // 格位对得上，所以逐位滚动能真正发生（位数不同的跳变不能逐位滚）。
+            // 现在把跳变塞进去，再从这一刻开始逐帧推进。
+            // 目标金额可用 --roll-to= 指定：默认 99.50（大跳变，看飞转），
+            // 指定成 20.01 之类就能看**微小变化**——那时应当只有最右一位挪 1/10 格，
+            // 其余几位纹丝不动。这是里程表与"整块换掉"最容易分辨的地方。
+            // 起点 19.90 与 20.01 都是 5 个字符，格位对得上。
+            const double rollTarget = (g_rollTo > 0.0) ? g_rollTo : 99.5;
             g_fake.Select(dshb::Scenario::Recharge);
-            g_fake.TriggerRecharge(99.5);
+            g_fake.TriggerRecharge(rollTarget);
             const dshb::Sample jump = g_fake.NextIfDue(0.0);
             if (jump.wallMs != 0) {
                 g_states.OnSample(jump, jump.wallMs);
@@ -550,6 +557,73 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             SelfTestLog(L"[check] %ls: %ls", cond ? L"PASS" : L"FAIL", what);
             if (!cond) ++failed;
         };
+
+        // 里程表诊断：打开它，函数会把自己**实际收到**的文本与金额写进 wheel-trace.log。
+        // ★ 上一步的结论是"金额比预期小 100 倍"，照着这个线索要做的第一件事
+        //   不是改算法，而是**看清调用方到底传了什么**。
+        dshb::g_wheelTrace = true;
+        {
+            const dshb::AppPaths& p = dshb::Paths();
+            dshb::g_wheelTraceDir = std::string(p.dataDir.begin(), p.dataDir.end());
+        }
+
+        // --- 里程表带子的算法（与渲染分离，所以这里能直接断言） ---
+        // ★ 判据的核心只有一条：**"落位行"上露出的数字必须等于文本自己的数字**。
+        //   这一条成立，画面上看到的就是余额本身；不成立的话，露出来的会是别的数字。
+        {
+            auto landingDigits = [](const std::string& text, double amount) {
+                std::string s;
+                for (const dshb::WheelDraw& d : dshb::ComputeWheel(text, amount)) {
+                    if (d.row == 0) s.push_back(static_cast<char>('0' + d.digit));
+                }
+                return s;
+            };
+            auto textDigits = [](const std::string& text) {
+                std::string s;
+                for (char c : text) {
+                    if (c >= '0' && c <= '9') s.push_back(c);
+                }
+                return s;
+            };
+
+            struct WheelCase {
+                const char* text;
+                double amount;
+            };
+            const WheelCase wc[] = {
+                {"34.56", 34.56}, {"99.50", 99.50}, {"00.00", 0.00},
+                {"09.07", 9.07},  {"12.34", 12.34}, {"0.03", 0.03},
+            };
+            for (const WheelCase& c : wc) {
+                const std::string got = landingDigits(c.text, c.amount);
+                const std::string want = textDigits(c.text);
+                if (got != want) {
+                    SelfTestLog(L"[check]   文本=%hs 金额=%.2f 实际=%hs 期望=%hs", c.text, c.amount,
+                                got.c_str(), want.c_str());
+                }
+                expect(got == want, L"里程表：落位行露出的数字等于文本本身");
+            }
+
+            // 每一位都必须有且只有一个"落位行"条目，否则那一位会空着
+            {
+                const auto w = dshb::ComputeWheel("34.56", 34.56);
+                int landing = 0;
+                for (const dshb::WheelDraw& d : w) {
+                    if (d.row == 0) ++landing;
+                }
+                expect(landing == 4, L"里程表：四个数字位各有一个落位条目");
+            }
+
+            // 小数点不参与滚动
+            {
+                const auto w = dshb::ComputeWheel("34.56", 34.56);
+                bool dotSkipped = true;
+                for (const dshb::WheelDraw& d : w) {
+                    if (d.slot == 2) dotSkipped = false;   // '3','4','.','5','6' 的第 2 位是小数点
+                }
+                expect(dotSkipped, L"里程表：小数点不产生滚动条目");
+            }
+        }
 
         // --- 金额解析（十进制，不是浮点） ---
         {

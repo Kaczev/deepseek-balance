@@ -145,21 +145,13 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     // 清零预估：C9 才实现。现在明确留空，不编一个假的。
     f.zeroTimeText.clear();
 
-    // 逐位滚动：把"变化的区间"和进度交给渲染层。
-    // 只有变化的那几位会滚动，高位不动——这是里程表的样子，也是省掉
-    // "整段数字都在动"那种廉价感的关键。
-    //
-    // ★ 长度不同的两段文本**不能逐位滚**：19.90 -> 100.00 是 5 位对 6 位，
-    //   格位对不上。第一版就在这里错了——按长度配对读到了错位的数据，
-    //   画面上一直显示旧值（实测就是"数字根本不动"）。长度不同时直接显示新值。
-    if (haveNumber && amount.rolling() &&
-        amount.rollOldText().size() == amount.rollNewText().size()) {
+    // 逐位里程表：把"这一帧的连续金额"交给渲染层。渲染层每位除以位权，
+    // 取小数部分作为带子偏移——**滚动没有自己的时长**，它就是数值本身。
+    if (haveNumber && amount.rolling()) {
         f.roll.active = true;
+        f.roll.amount = amount.value();
         f.roll.oldText = amount.rollOldText();
         f.roll.newText = amount.rollNewText();
-        f.roll.fraction = amount.rollFraction();
-        DiffSpan(f.roll.oldText, f.roll.newText, &f.roll.changeFrom, &f.roll.changeTo);
-        if (f.roll.changeTo < f.roll.changeFrom) f.roll.active = false;   // 没有实际变化
     }
     return f;
 }

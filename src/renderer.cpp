@@ -1,9 +1,10 @@
-// deepseek-balance v0.2 —— 渲染器实现
+// deepseek-balance v0.2 鈥斺€?娓叉煋鍣ㄥ疄鐜?
 //
-// 这一步只画"骨架可见的东西"：圆角面板 + 一个跟着时间走的方块。
-// 数字、曲线、颜色、心跳都是后面步骤的事（实施步骤 C/D/E）。
+// 杩欎竴姝ュ彧鐢?楠ㄦ灦鍙鐨勪笢瑗?锛氬渾瑙掗潰鏉?+ 涓€涓窡鐫€鏃堕棿璧扮殑鏂瑰潡銆?
+// 鏁板瓧銆佹洸绾裤€侀鑹层€佸績璺抽兘鏄悗闈㈡楠ょ殑浜嬶紙瀹炴柦姝ラ C/D/E锛夈€?
 
 #include "renderer.h"
+#include "wheel.h"
 
 #include <d2d1.h>
 #include <d2d1helper.h>
@@ -11,7 +12,7 @@
 #include <dcomp.h>
 #include <dwrite.h>
 #include <objbase.h>      // CoCreateInstance
-#include <wincodec.h>     // 离屏导帧用
+#include <wincodec.h>     // 绂诲睆瀵煎抚鐢?
 
 #include <cmath>   // std::fmod
 #include <cstring> // std::strcmp
@@ -21,15 +22,15 @@ namespace dshb {
 
 namespace {
 
-// 布局诊断开关（临时）。定义必须在使用它的 SetLayoutProbe 之前——C++ 里
-// 名字要先声明，这一条我在别处已经踩过一次，不再踩。
+// 甯冨眬璇婃柇寮€鍏筹紙涓存椂锛夈€傚畾涔夊繀椤诲湪浣跨敤瀹冪殑 SetLayoutProbe 涔嬪墠鈥斺€擟++ 閲?
+// 鍚嶅瓧瑕佸厛澹版槑锛岃繖涓€鏉℃垜鍦ㄥ埆澶勫凡缁忚俯杩囦竴娆★紝涓嶅啀韪┿€?
 bool g_layoutProbe = false;
 
-// ★★ 两条用血换来的规矩：
-//   1. **绝不在绘制路径里做文件 I/O**。试过两次，两次都崩（0xC0000409），
-//      连"导出模式下只画一帧所以安全"这个想法也是错的。
-//      正确做法是：绘制期间只往内存里记，画完由外面调用 DumpLayoutProbe 写出去。
-//   2. 诊断代码也是代码，它一样会把程序弄崩。所以它要被挡在正常运行之外。
+// 鈽呪槄 涓ゆ潯鐢ㄨ鎹㈡潵鐨勮鐭╋細
+//   1. **缁濅笉鍦ㄧ粯鍒惰矾寰勯噷鍋氭枃浠?I/O**銆傝瘯杩囦袱娆★紝涓ゆ閮藉穿锛?xC0000409锛夛紝
+//      杩?瀵煎嚭妯″紡涓嬪彧鐢讳竴甯ф墍浠ュ畨鍏?杩欎釜鎯虫硶涔熸槸閿欑殑銆?
+//      姝ｇ‘鍋氭硶鏄細缁樺埗鏈熼棿鍙線鍐呭瓨閲岃锛岀敾瀹岀敱澶栭潰璋冪敤 DumpLayoutProbe 鍐欏嚭鍘汇€?
+//   2. 璇婃柇浠ｇ爜涔熸槸浠ｇ爜锛屽畠涓€鏍蜂細鎶婄▼搴忓紕宕┿€傛墍浠ュ畠瑕佽鎸″湪姝ｅ父杩愯涔嬪銆?
 struct LayoutProbeData {
     bool enabled = false;
     bool filled = false;
@@ -61,8 +62,8 @@ void SetLayoutProbe(bool on) {
     g_probe.enabled = on;
 }
 
-// 画完之后由外面调用：把绘制期间记下的数值写出去。
-// **不在绘制路径里写文件**——那会把进程弄崩。
+// 鐢诲畬涔嬪悗鐢卞闈㈣皟鐢細鎶婄粯鍒舵湡闂磋涓嬬殑鏁板€煎啓鍑哄幓銆?
+// **涓嶅湪缁樺埗璺緞閲屽啓鏂囦欢**鈥斺€旈偅浼氭妸杩涚▼寮勫穿銆?
 void DumpLayoutProbe() {
     if (!g_probe.enabled || !g_probe.filled) return;
     wchar_t exe[MAX_PATH]{};
@@ -73,12 +74,12 @@ void DumpLayoutProbe() {
 
     FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"a, ccs=UTF-8") == 0 && f) {
-        fwprintf(f, L"[layout] 实体区中心 cx=%.2f 符号宽=%.2f 数字宽=%.2f 合并块左缘=%.2f\n",
+        fwprintf(f, L"[layout] 瀹炰綋鍖轰腑蹇?cx=%.2f 绗﹀彿瀹?%.2f 鏁板瓧瀹?%.2f 鍚堝苟鍧楀乏缂?%.2f\n",
                  g_probe.centerX, g_probe.symbolW, g_probe.digitsW, g_probe.left);
-        fwprintf(f, L"[layout] 数字顶=%.2f 标题框=%.2f,%.2f 右边界=%.2f\n", g_probe.numberTop,
+        fwprintf(f, L"[layout] 鏁板瓧椤?%.2f 鏍囬妗?%.2f,%.2f 鍙宠竟鐣?%.2f\n", g_probe.numberTop,
                  g_probe.boxLeft, g_probe.boxTop, g_probe.boxRight);
         const float blockCenter = g_probe.left + (g_probe.symbolW + g_probe.digitsW) * 0.5f;
-        fwprintf(f, L"[layout] 合并块中心=%.2f 与实体区中心之差=%.2f（目标：接近 0）\n",
+        fwprintf(f, L"[layout] 鍚堝苟鍧椾腑蹇?%.2f 涓庡疄浣撳尯涓績涔嬪樊=%.2f锛堢洰鏍囷細鎺ヨ繎 0锛塡n",
                  blockCenter, blockCenter - g_probe.centerX);
         fclose(f);
     }
@@ -88,36 +89,36 @@ namespace {
 
 constexpr float kPanelOpacity = 0.95f;
 
-// ★ 颜色纪律（A8c，已按实测纠正过一次）：
-//   **Direct2D 画刷要的是直通（straight）颜色**——预乘是 D2D 按目标 alpha 模式
-//   内部做的。曾经在这里手动预乘，结果预乘了两次：50% 纯红读出来是 64 而不是 128。
-//   症状不会报错，只会让半透明处整体偏暗。
-//   约定：代码里写设计色（直通 RGBA），交给 D2D；只有**离屏位图回读**和
-//   手工写位图时才需要自己预乘。
+// 鈽?棰滆壊绾緥锛圓8c锛屽凡鎸夊疄娴嬬籂姝ｈ繃涓€娆★級锛?
+//   **Direct2D 鐢诲埛瑕佺殑鏄洿閫氾紙straight锛夐鑹?*鈥斺€旈涔樻槸 D2D 鎸夌洰鏍?alpha 妯″紡
+//   鍐呴儴鍋氱殑銆傛浘缁忓湪杩欓噷鎵嬪姩棰勪箻锛岀粨鏋滈涔樹簡涓ゆ锛?0% 绾孩璇诲嚭鏉ユ槸 64 鑰屼笉鏄?128銆?
+//   鐥囩姸涓嶄細鎶ラ敊锛屽彧浼氳鍗婇€忔槑澶勬暣浣撳亸鏆椼€?
+//   绾﹀畾锛氫唬鐮侀噷鍐欒璁¤壊锛堢洿閫?RGBA锛夛紝浜ょ粰 D2D锛涘彧鏈?*绂诲睆浣嶅浘鍥炶**鍜?
+//   鎵嬪伐鍐欎綅鍥炬椂鎵嶉渶瑕佽嚜宸遍涔樸€?
 const D2D1_COLOR_F StraightRgba(float r, float g, float b, float a) {
     return D2D1::ColorF(r, g, b, a);
 }
 
-// 设计色（直通的 0-1 分量）。设计文档里的十六进制色号一律换算到这里。
+// 璁捐鑹诧紙鐩撮€氱殑 0-1 鍒嗛噺锛夈€傝璁℃枃妗ｉ噷鐨勫崄鍏繘鍒惰壊鍙蜂竴寰嬫崲绠楀埌杩欓噷銆?
 struct Rgba {
     float r, g, b, a;
 };
 
-// #6c89f6（充足档基准色）
+// #6c89f6锛堝厖瓒虫。鍩哄噯鑹诧級
 constexpr Rgba kBaseColor{108.0f / 255.0f, 137.0f / 255.0f, 246.0f / 255.0f, kPanelOpacity};
 constexpr Rgba kWhite{1.0f, 1.0f, 1.0f, 0.9f};
 
 // ---------------------------------------------------------------------------
-// 预乘自检用的画面（A8c）：一个 50% 不透明的纯红方块。
-// 它与正常画面走同一条 PaintScene，所以"导出的 PNG"和"屏幕"验的是同一个东西。
+// 棰勪箻鑷鐢ㄧ殑鐢婚潰锛圓8c锛夛細涓€涓?50% 涓嶉€忔槑鐨勭函绾㈡柟鍧椼€?
+// 瀹冧笌姝ｅ父鐢婚潰璧板悓涓€鏉?PaintScene锛屾墍浠?瀵煎嚭鐨?PNG"鍜?灞忓箷"楠岀殑鏄悓涓€涓笢瑗裤€?
 // ---------------------------------------------------------------------------
 enum class SceneMode { Normal, PremulProbe };
 SceneMode g_sceneMode = SceneMode::Normal;
 
-// 当前要画的正文。由 Renderer::SetWidgetFrame 填，绘制函数只读。
+// 褰撳墠瑕佺敾鐨勬鏂囥€傜敱 Renderer::SetWidgetFrame 濉紝缁樺埗鍑芥暟鍙銆?
 WidgetFrame g_widgetFrame{};
 
-// 调试浮层用的 DirectWrite 工厂与文本格式。懒创建：不带调试开关时一行都不建。
+// 璋冭瘯娴眰鐢ㄧ殑 DirectWrite 宸ュ巶涓庢枃鏈牸寮忋€傛噿鍒涘缓锛氫笉甯﹁皟璇曞紑鍏虫椂涓€琛岄兘涓嶅缓銆?
 IDWriteFactory* DebugWriteFactory() {
     static IDWriteFactory* factory = nullptr;
     if (!factory) {
@@ -136,7 +137,7 @@ IDWriteTextFormat* DebugTextFormat() {
         tried = true;
         IDWriteFactory* dw = DebugWriteFactory();
         if (dw) {
-            // 字号是 DIP，所以任何 DPI 下观感一致；行距给正常值，浮层信息不挤
+            // 瀛楀彿鏄?DIP锛屾墍浠ヤ换浣?DPI 涓嬭鎰熶竴鑷达紱琛岃窛缁欐甯稿€硷紝娴眰淇℃伅涓嶆尋
             if (FAILED(dw->CreateTextFormat(L"Microsoft YaHei UI", nullptr,
                                             DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
                                             DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"zh-cn", &fmt))) {
@@ -154,7 +155,7 @@ IDWriteTextFormat* DebugTextFormat() {
 void PaintPremulProbe(ID2D1RenderTarget* rt) {
     rt->Clear(D2D1::ColorF(0, 0.0f));
     ID2D1SolidColorBrush* red = nullptr;
-    // 直通颜色交给 D2D；不要在这里再乘 alpha
+    // 鐩撮€氶鑹蹭氦缁?D2D锛涗笉瑕佸湪杩欓噷鍐嶄箻 alpha
     if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1.0f, 0.0f, 0.0f, 0.5f), &red)) && red) {
         rt->FillRectangle(D2D1::RectF(40.0f, 40.0f, 100.0f, 100.0f), red);
         red->Release();
@@ -162,24 +163,24 @@ void PaintPremulProbe(ID2D1RenderTarget* rt) {
 }
 
 // ---------------------------------------------------------------------------
-// 画面内容：一处定义，屏幕与离屏导帧共用同一份代码。
-// 这样"导出的 PNG 是对的"才能推出"屏幕上的也是对的"。
-// 注意：本函数自己 BeginDraw / EndDraw，调用者不要再套一层（A0 的坑：
-// 嵌套会让 EndDraw 返回 D2DERR_WRONG_STATE 并且整帧被丢弃）。
+// 鐢婚潰鍐呭锛氫竴澶勫畾涔夛紝灞忓箷涓庣灞忓甯у叡鐢ㄥ悓涓€浠戒唬鐮併€?
+// 杩欐牱"瀵煎嚭鐨?PNG 鏄鐨?鎵嶈兘鎺ㄥ嚭"灞忓箷涓婄殑涔熸槸瀵圭殑"銆?
+// 娉ㄦ剰锛氭湰鍑芥暟鑷繁 BeginDraw / EndDraw锛岃皟鐢ㄨ€呬笉瑕佸啀濂椾竴灞傦紙A0 鐨勫潙锛?
+// 宓屽浼氳 EndDraw 杩斿洖 D2DERR_WRONG_STATE 骞朵笖鏁村抚琚涪寮冿級銆?
 // ---------------------------------------------------------------------------
-// 激活反馈：一次 1.2 秒的描边脉冲。用余弦做出的"起-落"曲线，
-// 首尾都归零，所以不会突然出现或突然消失（设计 §9.6 的连续性要求）。
+// 婵€娲诲弽棣堬細涓€娆?1.2 绉掔殑鎻忚竟鑴夊啿銆傜敤浣欏鸡鍋氬嚭鐨?璧?钀?鏇茬嚎锛?
+// 棣栧熬閮藉綊闆讹紝鎵€浠ヤ笉浼氱獊鐒跺嚭鐜版垨绐佺劧娑堝け锛堣璁?搂9.6 鐨勮繛缁€ц姹傦級銆?
 constexpr double kFlashSeconds = 1.2;
 
 double FlashPulse(double nowSeconds, double flashStart) {
     const double t = nowSeconds - flashStart;
     if (t < 0.0 || t > kFlashSeconds) return 0.0;
     const double phase = t / kFlashSeconds;              // 0..1
-    const double wave = 0.5 - 0.5 * cos(2.0 * 3.14159265 * phase);  // 0→1→0
+    const double wave = 0.5 - 0.5 * cos(2.0 * 3.14159265 * phase);  // 0鈫?鈫?
     return wave;
 }
 
-// 文本格式的取用口。字号都是 DIP，所以观感与 DPI 无关。
+// 鏂囨湰鏍煎紡鐨勫彇鐢ㄥ彛銆傚瓧鍙烽兘鏄?DIP锛屾墍浠ヨ鎰熶笌 DPI 鏃犲叧銆?
 enum class FontRole { Title, Number, Unit, Estimate, Debug };
 
 IDWriteTextFormat* TextFormatFor(FontRole role) {
@@ -196,7 +197,7 @@ IDWriteTextFormat* TextFormatFor(FontRole role) {
     Slot& slot = slots[idx];
     if (!slot.tried) {
         slot.tried = true;
-        // 中文正文用雅黑；数字用同一族的等宽数字（tnum）避免滚动时左右抖
+        // 涓枃姝ｆ枃鐢ㄩ泤榛戯紱鏁板瓧鐢ㄥ悓涓€鏃忕殑绛夊鏁板瓧锛坱num锛夐伩鍏嶆粴鍔ㄦ椂宸﹀彸鎶?
         const wchar_t* family = (role == FontRole::Debug) ? L"Consolas" : L"Microsoft YaHei UI";
         float size = 13.0f;
         DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
@@ -219,8 +220,8 @@ IDWriteTextFormat* TextFormatFor(FontRole role) {
     return slot.fmt;
 }
 
-// 量一段文字在给定格式下的宽度（DIP）。
-// 居中、布局余量判断都靠它——"差不多居中"靠眼睛是判不出来的。
+// 閲忎竴娈垫枃瀛楀湪缁欏畾鏍煎紡涓嬬殑瀹藉害锛圖IP锛夈€?
+// 灞呬腑銆佸竷灞€浣欓噺鍒ゆ柇閮介潬瀹冣€斺€?宸笉澶氬眳涓?闈犵溂鐫涙槸鍒や笉鍑烘潵鐨勩€?
 float MeasureTextWidth(const std::wstring& text, IDWriteTextFormat* fmt) {
     if (text.empty() || !fmt) return 0.0f;
     IDWriteFactory* dw = DebugWriteFactory();
@@ -238,23 +239,60 @@ float MeasureTextWidth(const std::wstring& text, IDWriteTextFormat* fmt) {
     return width;
 }
 
-// 量单个字符的宽度（DIP）。逐位滚动要把每一位画在各自的格子里，
-// 所以需要每个字符单独的位置——整体量宽度的方法在这里不够用。
+// 閲忎竴涓叉枃瀛楅噷姣忎釜瀛楃鐨勫師鐐逛綅缃紙DIP锛岀浉瀵规帓鐗堟宸︿笂瑙掞級銆?
+// 鈽?涓轰粈涔堝繀椤婚噺鑰屼笉鏄畻锛欴irectWrite 浼氭妸瀛楀舰鏀惧湪琛屾閲岀殑鏌愪釜鍩虹嚎浣嶇疆锛?
+//   鑰岃繖涓亸绉诲彇鍐充簬瀛椾綋搴﹂噺锛岀寽涓嶅嚭鏉ャ€備箣鍓嶅嚑鐗堝氨鏄潬鐚滃亸绉伙紝浜庢槸鏁板瓧
+//   鐢绘銆佽瑁佸埌鍒殑鏁板瓧锛堢敾闈笂鍑虹幇 01.0 杩欑鍊硷級銆傝繖閲岀洿鎺ラ棶鎺掔増寮曟搸銆?
+void MeasureCharOrigins(const std::wstring& text, IDWriteTextFormat* fmt,
+                        std::vector<float>* xs, float* lineHeight) {
+    xs->clear();
+    if (text.empty() || !fmt) return;
+    IDWriteFactory* dw = DebugWriteFactory();
+    if (!dw) return;
+    IDWriteTextLayout* layout = nullptr;
+    if (FAILED(dw->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), fmt, 4096.0f,
+                                    256.0f, &layout)) ||
+        !layout) {
+        return;
+    }
+
+    DWRITE_TEXT_METRICS m{};
+    if (SUCCEEDED(layout->GetMetrics(&m)) && lineHeight) *lineHeight = m.height;
+
+    // 閫愬瓧绗﹂棶瀹冪殑鐐逛綅缃€傜皣鍙兘鏄瀛楃锛屾墍浠ユ寜绨囨帹杩涖€?
+    UINT32 pos = 0;
+    while (pos < text.size()) {
+        DWRITE_HIT_TEST_METRICS h{};
+        FLOAT px = 0.0f, py = 0.0f;
+        if (FAILED(layout->HitTestTextPosition(pos, FALSE, &px, &py, &h))) break;
+        xs->push_back(px);
+        UINT32 advance = (h.length > 0) ? h.length : 1;
+        // 琛ラ綈涓棿璺宠繃鐨勫瓧绗︼紙淇濊瘉 xs 涓?text 閫愬瓧绗﹀榻愶級
+        for (UINT32 k = 1; k < advance && (pos + k) < text.size(); ++k) {
+            xs->push_back(px);
+        }
+        pos += advance;
+    }
+    layout->Release();
+}
+
+// 閲忓崟涓瓧绗︾殑瀹藉害锛圖IP锛夈€傞€愪綅婊氬姩瑕佹妸姣忎竴浣嶇敾鍦ㄥ悇鑷殑鏍煎瓙閲岋紝
+// 鎵€浠ラ渶瑕佹瘡涓瓧绗﹀崟鐙殑浣嶇疆鈥斺€旀暣浣撻噺瀹藉害鐨勬柟娉曞湪杩欓噷涓嶅鐢ㄣ€?
 float MeasureCharWidth(wchar_t ch, IDWriteTextFormat* fmt) {
     if (!fmt) return 0.0f;
     const wchar_t s[2] = {ch, 0};
     return MeasureTextWidth(std::wstring(s), fmt);
 }
 
-// 平滑缓动：逐位滚动的观感全在这里。线性会显得机械发闷，
-// 这条曲线两端慢、中间快，像齿轮拨过一格。
+// 骞虫粦缂撳姩锛氶€愪綅婊氬姩鐨勮鎰熷叏鍦ㄨ繖閲屻€傜嚎鎬т細鏄惧緱鏈烘鍙戦椃锛?
+// 杩欐潯鏇茬嚎涓ょ鎱€佷腑闂村揩锛屽儚榻胯疆鎷ㄨ繃涓€鏍笺€?
 double Smoothstep(double x) {
     if (x <= 0.0) return 0.0;
     if (x >= 1.0) return 1.0;
     return x * x * (3.0 - 2.0 * x);
 }
 
-// 在一行里画一段文字，横向居中对齐到 centerX（画布坐标）
+// 鍦ㄤ竴琛岄噷鐢讳竴娈垫枃瀛楋紝妯悜灞呬腑瀵归綈鍒?centerX锛堢敾甯冨潗鏍囷級
 void DrawCentered(ID2D1RenderTarget* rt, const std::wstring& text, IDWriteTextFormat* fmt,
                   float centerX, float topY, const D2D1_COLOR_F& color, float scale) {
     if (text.empty() || !fmt) return;
@@ -278,17 +316,17 @@ void DrawCentered(ID2D1RenderTarget* rt, const std::wstring& text, IDWriteTextFo
     (void)scale;
 }
 
-// 正文（C 阶段）：标题兼状态行、余额数字、币种符号、清零预估。
+// 姝ｆ枃锛圕 闃舵锛夛細鏍囬鍏肩姸鎬佽銆佷綑棰濇暟瀛椼€佸竵绉嶇鍙枫€佹竻闆堕浼般€?
 //
-// 排布理由（设计 §9.2，符号位置经所有者指定）：
-//   数字是主角，所以它最大；标题小、放左上；清零预估放底部。
-//   币种符号**放后缀**（100.00¥）——所有者明确指定，不改。
-//   曲线是**氛围**，与数字叠加在同一个区域（D 阶段），不是"先在曲线上方再放数字"。
+// 鎺掑竷鐞嗙敱锛堣璁?搂9.2锛岀鍙蜂綅缃粡鎵€鏈夎€呮寚瀹氾級锛?
+//   鏁板瓧鏄富瑙掞紝鎵€浠ュ畠鏈€澶э紱鏍囬灏忋€佹斁宸︿笂锛涙竻闆堕浼版斁搴曢儴銆?
+//   甯佺绗﹀彿**鏀惧悗缂€**锛?00.00楼锛夆€斺€旀墍鏈夎€呮槑纭寚瀹氾紝涓嶆敼銆?
+//   鏇茬嚎鏄?*姘涘洿**锛屼笌鏁板瓧鍙犲姞鍦ㄥ悓涓€涓尯鍩燂紙D 闃舵锛夛紝涓嶆槸"鍏堝湪鏇茬嚎涓婃柟鍐嶆斁鏁板瓧"銆?
 void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const WidgetFrame& f) {
     if (g_sceneMode != SceneMode::Normal) return;
 
     const float s = canvas.scale;
-    const float cx = (kMarginDip + kEntityWidthDip * 0.5f) * s;   // 实体区横向中心
+    const float cx = (kMarginDip + kEntityWidthDip * 0.5f) * s;   // 瀹炰綋鍖烘í鍚戜腑蹇?
     const float top = kMarginDip * s;
 
     IDWriteTextFormat* titleFmt = TextFormatFor(FontRole::Title);
@@ -296,7 +334,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
     IDWriteTextFormat* unitFmt = TextFormatFor(FontRole::Unit);
     IDWriteTextFormat* estFmt = TextFormatFor(FontRole::Estimate);
 
-    // 标题兼状态行：左上角。状态变了文字就换，不只靠颜色编码。
+    // 鏍囬鍏肩姸鎬佽锛氬乏涓婅銆傜姸鎬佸彉浜嗘枃瀛楀氨鎹紝涓嶅彧闈犻鑹茬紪鐮併€?
     if (f.statusText && titleFmt) {
         ID2D1SolidColorBrush* b = nullptr;
         if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 0.85f), &b)) && b) {
@@ -313,16 +351,20 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
         }
     }
 
-    // 余额数字：居中。数字与符号一起量宽度，保证"整体"居中而不是"数字"居中。
+    // 浣欓鏁板瓧锛氬眳涓€傛暟瀛椾笌绗﹀彿涓€璧烽噺瀹藉害锛屼繚璇?鏁翠綋"灞呬腑鑰屼笉鏄?鏁板瓧"灞呬腑銆?
     {
         const std::wstring digits(f.amountText.begin(), f.amountText.end());
         const std::wstring symbol = f.currencySymbol ? f.currencySymbol : L"";
-
-        // 逐位滚动时，格子按**目标文本**定格。
-        // ★ 第一版这里用的是旧文本，于是滚动期间整块数字还在画旧值，
-        //   看起来就是"数字根本没变"——渲染层必须画这一帧真正的目标文本，
-        //   旧值只用来做"往上滑出去"的那一份。
         const std::wstring& measureText = digits;
+
+        // 璇婃柇锛氭覆鏌撳眰瀹為檯鎷垮埌鐨勬枃鏈笌婊氬姩閲忥紙鍙湪 --layout-probe 鏃惰褰曪級
+        {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "text=%s rollActive=%d rollAmount=%.3f old=%s new=%s",
+                          f.amountText.c_str(), f.roll.active ? 1 : 0, f.roll.amount,
+                          f.roll.oldText.c_str(), f.roll.newText.c_str());
+            LayoutProbe(buf, 0, 0, 0, 0);
+        }
 
         const float digitsW = MeasureTextWidth(measureText, numFmt);
         const float symbolW = symbol.empty() ? 0.0f : MeasureTextWidth(symbol, unitFmt);
@@ -332,95 +374,115 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
         const float entityMidY = (kMarginDip + kEntityHeightDip * 0.5f) * s;
         const float numberTop = entityMidY - 28.0f * s;
 
-        // 诊断：把输入与结果都记下来（只在 --layout-probe 时写文件）
+        // 璇婃柇锛氭妸杈撳叆涓庣粨鏋滈兘璁颁笅鏉ワ紙鍙湪 --layout-probe 鏃跺啓鏂囦欢锛?
         LayoutProbe("number", cx, symbolW, digitsW, left);
         LayoutProbe("boxes", (kMarginDip + 12.0f) * s, (kMarginDip + 8.0f) * s,
                     numberTop, (kMarginDip + kEntityWidthDip) * s);
 
         ID2D1SolidColorBrush* b = nullptr;
         if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 1.0f), &b)) && b) {
-            // 每一位一个格子。逐位推进 x，所以每位能独立做竖直偏移。
-            const std::wstring& target = measureText;
-            float x = left;
-            for (size_t i = 0; i < target.size(); ++i) {
-                const float w = MeasureCharWidth(target[i], numFmt);
-
-                const bool inSpan = f.roll.active &&
-                                    static_cast<int>(i) >= f.roll.changeFrom &&
-                                    static_cast<int>(i) <= f.roll.changeTo;
-                const bool isDigit = target[i] >= L'0' && target[i] <= L'9';
-
-                if (inSpan && isDigit) {
-                    // ★ 逐位滚动：旧数字往上滑出去、新数字从下面滑进来。
-                    //   关键在**裁剪**：不加裁剪，两行数字会同时可见，
-                    //   看起来像叠了两个数字，而不像在格子里滚（实测就是这个问题）。
-                    //   所以每一位都要压一个和它等高的裁剪区，只露出自己的那一格。
-                    const double e = Smoothstep(f.roll.fraction);
-                    const double dy = 40.0 * s;          // 一行的位移
-                    const float oldY = static_cast<float>(numberTop - e * dy);
-                    const float newY = static_cast<float>(numberTop + (1.0 - e) * dy);
-
-                    // ★ 这是"里程表"：旧数字与新数字是**同一条带子上的两行**，
-                    //   通过一个**只有一行高的窗口**看过去，所以任一时刻只看得见一行。
-                    //   窗口 = 字形实际所在的带子（不是排版行高，也不是整段行程）：
-                    //     · 做成整段行程 -> 两行同时可见，像叠了两个数字（错在这）
-                    //     · 做成排版行高 -> 看不出哪一行是主行，且上沿会把字切掉
-                    //   带子的上下沿由字形实际范围定，这里按 40 DIP 字号的实际
-                    //   字形高（约 29 DIP）加一点余量取 34 DIP，居中于 numberTop 起算的行。
-                    const float bandTop = numberTop + static_cast<float>(9.0 * s);
-                    const float bandBottom = bandTop + static_cast<float>(34.0 * s);
-                    rt->PushAxisAlignedClip(
-                        D2D1::RectF(x, bandTop, x + w, bandBottom),
-                        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-
-                    const wchar_t oldCh = (i < f.roll.oldText.size())
-                                              ? static_cast<wchar_t>(f.roll.oldText[i])
-                                              : target[i];
-                    const wchar_t newCh = target[i];
-
-                    // 旧的那位（往上走）
-                    if (oldCh != newCh) {
-                        IDWriteTextLayout* lo = nullptr;
-                        const wchar_t buf[2] = {oldCh, 0};
-                        if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
-                                buf, 1, numFmt, 256.0f, 128.0f, &lo)) &&
-                            lo) {
-                            rt->DrawTextLayout(D2D1::Point2F(x, oldY), lo, b,
-                                               D2D1_DRAW_TEXT_OPTIONS_NONE);
-                            lo->Release();
+            // 鈽呪槄 閫愪綅閲岀▼琛紙鎸夋墍鏈夎€呯粰鍑虹殑妯″瀷閲嶅仛锛?
+            //
+            //   姣忎竴浣嶆槸涓€涓?**0..9 鐨勭珫甯?*锛屽甫瀛愮殑浣嶇疆**鐢辫浣嶇殑杩炵画鍊肩洿鎺ュ喅瀹?*锛?
+            //     璇ヤ綅杩炵画鍊?wheelValue = 閲戦 / 璇ヤ綅浣嶆潈
+            //     绗?d 涓暟瀛楃敾鍦?(d - wheelValue) 琛屽锛岃楂?= 涓€涓瓧鍙风殑琛岀▼
+            //   绐楀彛鍙湶涓€琛岋紝浜庢槸浠讳竴鏃跺埢鍙湅寰楄涓€涓暟瀛楋紱甯﹀瓙鍦ㄧ獥鍙ｉ噷杩炵画婊戝姩銆?
+            //
+            //   杩欐牱鎵嶅锛?
+            //     路 浣欓鍙姩 0.01 -> 鍙湁鏈€鍙抽偅浣嶆尓 1/10 鏍硷紝鍏朵綑绾逛笣涓嶅姩
+            //     路 浣欓澶ц烦    -> 鍚勪綅椋炲揩杞繃鍘伙紝鐒跺悗钀藉畾
+            //
+            //   鈽?涔嬪墠閿欏湪鍝細缁欐瘡涓€浣嶇敾"鏃ф暟瀛楀線涓娿€佹柊鏁板瓧寰€涓?鈥斺€旈偅鏄?*涓ゆ牸鐨?
+            //     鍒囨崲鍔ㄧ敾**锛屽甫瀛愬彧鏈変袱鏍硷紝鏁翠綋鐪嬭捣鏉ュ氨鏄?鏁村潡鎹㈡帀"锛屼笉鏄粴鍔ㄣ€?
+            //   鈽?涔熶笉鐢ㄤ竴鏉?"0\n1\n...\n9" 鐨勫琛屾帓鐗堬細DirectWrite 鐨勮嚜鍔ㄨ璺濅笉鎸?
+            //     鎴戜滑瑕佺殑琛岄珮璧帮紙瀹炴祴鍗佽琚帇鍒扮害 17 鍍忕礌涓€琛岋紝鍗佷綅閮介湶鍚屼竴涓暟瀛楋級銆?
+            //     鍗佷釜鏁板瓧鍚勮嚜瀹氫綅锛屼綅缃畬鍏ㄥ彲鎺с€?
+            static IDWriteTextLayout* digitLayouts[10] = {};
+            static bool digitTried = false;
+            if (!digitTried) {
+                digitTried = true;
+                IDWriteFactory* dw = DebugWriteFactory();
+                if (dw && numFmt) {
+                    for (int d = 0; d < 10; ++d) {
+                        const wchar_t buf[2] = {static_cast<wchar_t>(L'0' + d), 0};
+                        if (FAILED(dw->CreateTextLayout(buf, 1, numFmt, 256.0f, 128.0f,
+                                                        &digitLayouts[d]))) {
+                            digitLayouts[d] = nullptr;
                         }
                     }
-                    // 新的那位（从下面进来）
-                    {
-                        IDWriteTextLayout* ln = nullptr;
-                        const wchar_t buf[2] = {newCh, 0};
-                        if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
-                                buf, 1, numFmt, 256.0f, 128.0f, &ln)) &&
-                            ln) {
-                            rt->DrawTextLayout(D2D1::Point2F(x, newY), ln, b,
-                                               D2D1_DRAW_TEXT_OPTIONS_NONE);
-                            ln->Release();
-                        }
+                }
+            }
+
+            constexpr double kRowDip = 40.0;   // 涓€涓暟瀛楀崰鐨勯珮搴?= 瀛楀彿
+            const double rowPx = kRowDip * s;
+
+            // 鐢?*鏁翠覆鏁板瓧鑷繁鐨勬帓鐗?*閲忓嚭閫愬瓧绗︾殑鍘熺偣涓庤楂樸€?
+            // 杩欐牱姣忎竴浣嶇殑鏍煎瓙浣嶇疆銆佷互鍙?鏁板瓧鍦ㄨ閲屼粠鍝紑濮?锛岄兘鏄棶鎺掔増寮曟搸寰楁潵鐨勶紝
+            // 涓嶅啀闈犵寽鈥斺€斾箣鍓嶅嚑鐗堝氨鏄寽鍋忕Щ锛岀粨鏋滄暟瀛楃敾鍒板埆鐨勬牸瀛愰噷銆?
+            std::vector<float> charXs;
+            float lineH = 0.0f;
+            MeasureCharOrigins(measureText, numFmt, &charXs, &lineH);
+
+            const std::wstring& target = measureText;
+            for (size_t i = 0; i < target.size(); ++i) {
+                const bool isDigit = target[i] >= L'0' && target[i] <= L'9';
+                const float chX = (i < charXs.size()) ? (left + charXs[i]) : left;
+                const float w = MeasureCharWidth(target[i], numFmt);
+
+                if (isDigit && digitLayouts[0] && f.roll.active) {
+                    // 鈽?鐢ㄥ崟鐙祴杩囩殑绾嚱鏁扮畻甯﹀瓙锛屾覆鏌撳眰涓嶅啀鑷繁绠椾綅鏉冦€?
+                    //   涓婁竴鐗堣繖閲屾槸鍐呰仈鐨勪竴濂楁暟瀛︼紝杩為敊鍥涙閮介潬鐪嬪浘鐚滃師鍥狅紱
+                    //   鎶藉嚭鏉ヤ箣鍚庣敱 --selftest-b 鐩存帴鏂█"钀戒綅琛岄湶鍑虹殑鏁板瓧 = 鏂囨湰鏈韩"銆?
+                    const std::vector<dshb::WheelDraw> wheels =
+                        dshb::ComputeWheel(f.amountText, f.roll.amount);
+
+                    // 瑁佸壀绐楀彛锛氫互"钀戒綅琛?涓哄噯锛屼笂涓嬪悇鍗婅锛岀獥鍙ｉ噷姝ｅソ涓€涓暟瀛?
+                    const float bandTop = numberTop + static_cast<float>(rowPx) -
+                                          static_cast<float>(0.5 * rowPx);
+                    const float bandBottom = bandTop + static_cast<float>(rowPx);
+                    rt->PushAxisAlignedClip(D2D1::RectF(chX, bandTop, chX + w, bandBottom),
+                                            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+                    // 鏁板瓧鐨?钀戒綅琛?鏄?numberTop 鍐嶅線涓嬩竴鏁磋锛堟帓鐗堟椤剁鍒板瓧褰箣闂?
+                    // 杩樻湁涓€娈佃鍐呭墠瀵硷紝姝ｅソ涓€琛屸€斺€攌RowDip 鍙栧瓧鍙峰氨鏄繖涓師鍥狅級銆?
+                    // 鍐嶅姞涓?璇ヤ綅鍦ㄤ袱琛屼箣闂寸殑浣嶇疆"frac锛屽甫瀛愭墠鏄繛缁粦鍔ㄧ殑銆?
+                    // 该位的"连续值"必须问 wheel 模块要，**不要在这里再算一遍位权**。
+                    // ★ 第一版这里内联了一套自己的位权算法（"右边还有几个数字字符"），
+                    //   和 ComputeWheel 里那套含义不一致——两边不一致的直接后果是
+                    //   带子被整体挪偏一行，而画面上表现为"数字根本不是余额"。
+                    //   位权只允许在 wheel.cpp 里实现一次。
+                    double wheelValue = 0.0;
+                    if (!dshb::WheelValueAt(f.amountText, static_cast<int>(i), f.roll.amount,
+                                            &wheelValue)) {
+                        continue;
+                    }
+                    const double frac = wheelValue - std::floor(wheelValue);
+                    for (const dshb::WheelDraw& wd : wheels) {
+                        if (wd.slot != static_cast<int>(i)) continue;
+                        if (!digitLayouts[wd.digit]) continue;
+                        const float y = static_cast<float>(
+                            numberTop + rowPx * (1.0 - frac + wd.row));
+                        rt->DrawTextLayout(D2D1::Point2F(chX, y), digitLayouts[wd.digit], b,
+                                           D2D1_DRAW_TEXT_OPTIONS_NONE);
                     }
                     rt->PopAxisAlignedClip();
                 } else {
-                    // 小数点、逗号、以及没变的那几位：原地画
+                    // 灏忔暟鐐广€侀€楀彿銆佷互鍙婇潤姝㈢殑浣嶏細鎸夐噺鍑烘潵鐨勫師鐐瑰師鍦扮敾
                     IDWriteTextLayout* l = nullptr;
                     const wchar_t buf[2] = {target[i], 0};
                     if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
                             buf, 1, numFmt, 256.0f, 128.0f, &l)) &&
                         l) {
-                        rt->DrawTextLayout(D2D1::Point2F(x, numberTop), l, b,
+                        rt->DrawTextLayout(D2D1::Point2F(chX, numberTop), l, b,
                                            D2D1_DRAW_TEXT_OPTIONS_NONE);
                         l->Release();
                     }
                 }
-                x += w;
             }
             b->Release();
         }
 
-        // 符号在后（所有者指定）。符号字号小，往下压一点让基线大致对齐。
+        // 绗﹀彿鍦ㄥ悗锛堟墍鏈夎€呮寚瀹氾級銆傜鍙峰瓧鍙峰皬锛屽線涓嬪帇涓€鐐硅鍩虹嚎澶ц嚧瀵归綈銆?
         if (!symbol.empty()) {
             ID2D1SolidColorBrush* sb = nullptr;
             if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 0.9f), &sb)) && sb) {
@@ -438,7 +500,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
         }
     }
 
-    // 清零预估：底部居中小字。C9 之前这里是空的——**不编假数据**。
+    // 娓呴浂棰勪及锛氬簳閮ㄥ眳涓皬瀛椼€侰9 涔嬪墠杩欓噷鏄┖鐨勨€斺€?*涓嶇紪鍋囨暟鎹?*銆?
     if (!f.zeroTimeText.empty() && estFmt) {
         const std::wstring t(f.zeroTimeText.begin(), f.zeroTimeText.end());
         ID2D1SolidColorBrush* b = nullptr;
@@ -463,7 +525,7 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
     if (g_sceneMode == SceneMode::PremulProbe) {
         PaintPremulProbe(rt);
         return;
-    }    rt->Clear(D2D1::ColorF(0, 0.0f));   // 画布整体透明，外扩余量必须完全透
+    }    rt->Clear(D2D1::ColorF(0, 0.0f));   // 鐢诲竷鏁翠綋閫忔槑锛屽鎵╀綑閲忓繀椤诲畬鍏ㄩ€?
 
     const float s = canvas.scale;
     const float cx = kMarginDip * s;
@@ -482,12 +544,12 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
         brush->Release();
     }
 
-    // 这里原来有一个"跟着时间走的白色方块"，用途只是证明帧循环在跑。
-    // 数字上屏之后它就变成噪声了——而且它压在数字上，还和"曲线是氛围、
-    // 与数字叠加"的设计冲突。所以删掉：帧循环是否在跑，调试浮层里的
-    // 刷新率数字已经能回答。这个位置留给 D 阶段的曲线。
+    // 杩欓噷鍘熸潵鏈変竴涓?璺熺潃鏃堕棿璧扮殑鐧借壊鏂瑰潡"锛岀敤閫斿彧鏄瘉鏄庡抚寰幆鍦ㄨ窇銆?
+    // 鏁板瓧涓婂睆涔嬪悗瀹冨氨鍙樻垚鍣０浜嗏€斺€旇€屼笖瀹冨帇鍦ㄦ暟瀛椾笂锛岃繕鍜?鏇茬嚎鏄皼鍥淬€?
+    // 涓庢暟瀛楀彔鍔?鐨勮璁″啿绐併€傛墍浠ュ垹鎺夛細甯у惊鐜槸鍚﹀湪璺戯紝璋冭瘯娴眰閲岀殑
+    // 鍒锋柊鐜囨暟瀛楀凡缁忚兘鍥炵瓟銆傝繖涓綅缃暀缁?D 闃舵鐨勬洸绾裤€?
 
-    // 激活反馈（A11）：一圈由粗到细、再消失的描边。透明度跟 flashAmount 走。
+    // 婵€娲诲弽棣堬紙A11锛夛細涓€鍦堢敱绮楀埌缁嗐€佸啀娑堝け鐨勬弿杈广€傞€忔槑搴﹁窡 flashAmount 璧般€?
     if (flashAmount > 0.001) {
         ID2D1SolidColorBrush* ring = nullptr;
         const float a = static_cast<float>(flashAmount) * 0.9f;
@@ -501,11 +563,11 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
         }
     }
 
-    // 正文（C 阶段）：标题、数字、符号、清零预估
+    // 姝ｆ枃锛圕 闃舵锛夛細鏍囬銆佹暟瀛椼€佺鍙枫€佹竻闆堕浼?
     PaintWidgetText(rt, canvas, g_widgetFrame);
 
-    // 调试浮层（B6）：只在带调试开关时有内容。画在画布左上角，
-    // 覆盖在余量区上——它是眼睛，不是产品界面。
+    // 璋冭瘯娴眰锛圔6锛夛細鍙湪甯﹁皟璇曞紑鍏虫椂鏈夊唴瀹广€傜敾鍦ㄧ敾甯冨乏涓婅锛?
+    // 瑕嗙洊鍦ㄤ綑閲忓尯涓娾€斺€斿畠鏄溂鐫涳紝涓嶆槸浜у搧鐣岄潰銆?
     if (!debugText.empty()) {
         IDWriteFactory* dw = DebugWriteFactory();
         IDWriteTextFormat* fmt = DebugTextFormat();
@@ -513,9 +575,9 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
             ID2D1SolidColorBrush* textBrush = nullptr;
             if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1.0f, 0.94f, 0.6f, 0.95f),
                                                     &textBrush)) && textBrush) {
-                // ★ 走"先排版、再画"这条正路。
-                //   不要想着在 IDWriteFactory 上找 DrawText / DrawTextW：那个成员不存在，
-                //   而 dwrite.h 的名字映射又会让错误信息指向带后缀的名字，很容易查错方向。
+                // 鈽?璧?鍏堟帓鐗堛€佸啀鐢?杩欐潯姝ｈ矾銆?
+                //   涓嶈鎯崇潃鍦?IDWriteFactory 涓婃壘 DrawText / DrawTextW锛氶偅涓垚鍛樹笉瀛樺湪锛?
+                //   鑰?dwrite.h 鐨勫悕瀛楁槧灏勫張浼氳閿欒淇℃伅鎸囧悜甯﹀悗缂€鐨勫悕瀛楋紝寰堝鏄撴煡閿欐柟鍚戙€?
                 IDWriteTextLayout* layout = nullptr;
                 if (SUCCEEDED(dw->CreateTextLayout(
                         debugText.c_str(), static_cast<UINT32>(debugText.size()), fmt,
@@ -571,12 +633,12 @@ struct Renderer::Impl {
 Renderer::~Renderer() { Destroy(); }
 
 CanvasSize Renderer::SizeForWindow(HWND hwnd) {
-    // ★ 缩放固定为 1.0：**一个设计像素 = 一个屏幕像素**（所有者定下的单位）。
-    //   这里早先是 dpi/96，于是 200% 缩放的屏上得到 630×258，所有者判定偏大。
-    //   设计稿的 315×129 指的是屏幕像素，所以不乘 DPI。
+    // 鈽?缂╂斁鍥哄畾涓?1.0锛?*涓€涓璁″儚绱?= 涓€涓睆骞曞儚绱?*锛堟墍鏈夎€呭畾涓嬬殑鍗曚綅锛夈€?
+    //   杩欓噷鏃╁厛鏄?dpi/96锛屼簬鏄?200% 缂╂斁鐨勫睆涓婂緱鍒?630脳258锛屾墍鏈夎€呭垽瀹氬亸澶с€?
+    //   璁捐绋跨殑 315脳129 鎸囩殑鏄睆骞曞儚绱狅紝鎵€浠ヤ笉涔?DPI銆?
     //
-    //   为什么不用"进程不声明 DPI 感知"来达到同样效果：那样窗口会被系统位图拉伸，
-    //   文字会糊。保持 Per-Monitor V2 + 缩放 1.0，文字仍是矢量清晰的。
+    //   涓轰粈涔堜笉鐢?杩涚▼涓嶅０鏄?DPI 鎰熺煡"鏉ヨ揪鍒板悓鏍锋晥鏋滐細閭ｆ牱绐楀彛浼氳绯荤粺浣嶅浘鎷変几锛?
+    //   鏂囧瓧浼氱硦銆備繚鎸?Per-Monitor V2 + 缂╂斁 1.0锛屾枃瀛椾粛鏄煝閲忔竻鏅扮殑銆?
     (void)hwnd;
     CanvasSize s;
     s.scale = 1.0f;
@@ -592,7 +654,7 @@ bool Renderer::Create(HWND hwnd, const CanvasSize& size) {
     impl_ = new Impl();
     Impl& d = *impl_;
 
-    // ---- D3D11 设备 ----
+    // ---- D3D11 璁惧 ----
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1};
     D3D_FEATURE_LEVEL got{};
     if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
@@ -602,7 +664,7 @@ bool Renderer::Create(HWND hwnd, const CanvasSize& size) {
     }
     if (FAILED(d.device->QueryInterface(IID_PPV_ARGS(&d.dxgiDevice)))) return false;
 
-    // ---- 翻转模型交换链 + 预乘 alpha（每像素透明的关键）----
+    // ---- 缈昏浆妯″瀷浜ゆ崲閾?+ 棰勪箻 alpha锛堟瘡鍍忕礌閫忔槑鐨勫叧閿級----
     IDXGIAdapter* adapter = nullptr;
     IDXGIFactory2* factory = nullptr;
     bool ok = false;
@@ -630,7 +692,7 @@ bool Renderer::Create(HWND hwnd, const CanvasSize& size) {
     if (adapter) adapter->Release();
     if (!ok) return false;
 
-    // ---- D2D 设备上下文绑到后备缓冲 ----
+    // ---- D2D 璁惧涓婁笅鏂囩粦鍒板悗澶囩紦鍐?----
     if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1),
                                  nullptr, reinterpret_cast<void**>(&d.d2dFactory)))) {
         return false;
@@ -648,7 +710,7 @@ bool Renderer::Create(HWND hwnd, const CanvasSize& size) {
     if (FAILED(hrBitmap)) return false;
     d.dc->SetTarget(d.target);
 
-    // ---- DirectComposition：把交换链挂到窗口上 ----
+    // ---- DirectComposition锛氭妸浜ゆ崲閾炬寕鍒扮獥鍙ｄ笂 ----
     if (FAILED(DCompositionCreateDevice(d.dxgiDevice, __uuidof(IDCompositionDevice),
                                         reinterpret_cast<void**>(&d.compDevice)))) {
         return false;
@@ -659,7 +721,7 @@ bool Renderer::Create(HWND hwnd, const CanvasSize& size) {
     if (FAILED(d.compTarget->SetRoot(d.compVisual))) return false;
     if (FAILED(d.compDevice->Commit())) return false;
 
-    // 区域必须跟着画布走：DPI 变更或重建之后都要重设，否则可点区域会和画面对不上
+    // 鍖哄煙蹇呴』璺熺潃鐢诲竷璧帮細DPI 鍙樻洿鎴栭噸寤轰箣鍚庨兘瑕侀噸璁撅紝鍚﹀垯鍙偣鍖哄煙浼氬拰鐢婚潰瀵逛笉涓?
     ApplyInputRegion(false);
 
     ready_ = true;
@@ -670,8 +732,8 @@ bool Renderer::Resize(HWND hwnd) {
     if (!impl_) return false;
     const CanvasSize want = SizeForWindow(hwnd);
     if (want.widthPx == size_.widthPx && want.heightPx == size_.heightPx) return true;
-    // 交换链尺寸变了就得整块重建：翻转模型不允许对后备缓冲直接 ResizeBuffers 后再绑 D2D 目标，
-    // 重建比就地改更省事，也更不容易留下悬空的目标位图。
+    // 浜ゆ崲閾惧昂瀵稿彉浜嗗氨寰楁暣鍧楅噸寤猴細缈昏浆妯″瀷涓嶅厑璁稿鍚庡缂撳啿鐩存帴 ResizeBuffers 鍚庡啀缁?D2D 鐩爣锛?
+    // 閲嶅缓姣斿氨鍦版敼鏇寸渷浜嬶紝涔熸洿涓嶅鏄撶暀涓嬫偓绌虹殑鐩爣浣嶅浘銆?
     return Create(hwnd, want);
 }
 
@@ -699,10 +761,10 @@ double Renderer::ActivationFlash(double nowSeconds) const {
 
 bool Renderer::ApplyInputRegion(bool particlesSpillout) {    if (!impl_ || !hwnd_) return false;
     if (spillout_ == particlesSpillout && spillout_ == true) {
-        // 已经扩到全画布，不用重复设置
+        // 宸茬粡鎵╁埌鍏ㄧ敾甯冿紝涓嶇敤閲嶅璁剧疆
     }
 
-    // 区域坐标是窗口坐标（无边框窗口的窗口矩形 == 客户区）
+    // 鍖哄煙鍧愭爣鏄獥鍙ｅ潗鏍囷紙鏃犺竟妗嗙獥鍙ｇ殑绐楀彛鐭╁舰 == 瀹㈡埛鍖猴級
     int left = 0, top = 0, right = size_.widthPx, bottom = size_.heightPx;
     if (!particlesSpillout) {
         const int m = static_cast<int>(kMarginDip * size_.scale + 0.5f);
@@ -720,7 +782,7 @@ bool Renderer::ApplyInputRegion(bool particlesSpillout) {    if (!impl_ || !hwnd
         : CreateRoundRectRgn(left, top, right + 1, bottom + 1, radius * 2, radius * 2);
     if (!region) return false;
 
-    // SetWindowRgn 成功后区域归系统所有，不能再 DeleteObject
+    // SetWindowRgn 鎴愬姛鍚庡尯鍩熷綊绯荤粺鎵€鏈夛紝涓嶈兘鍐?DeleteObject
     if (SetWindowRgn(hwnd_, region, TRUE) == 0) {
         DeleteObject(region);
         return false;
@@ -733,14 +795,14 @@ HRESULT Renderer::RenderFrame(double elapsedSeconds) {
     if (!ready_ || !impl_) return E_FAIL;
     Impl& d = *impl_;
 
-    // 注意：EndDraw 是唯一会报错的一步；BeginDraw 返回 void。
-    // 这里自己 BeginDraw/EndDraw，画内容的函数不要再各调一次（A0 的坑）。
+    // 娉ㄦ剰锛欵ndDraw 鏄敮涓€浼氭姤閿欑殑涓€姝ワ紱BeginDraw 杩斿洖 void銆?
+    // 杩欓噷鑷繁 BeginDraw/EndDraw锛岀敾鍐呭鐨勫嚱鏁颁笉瑕佸啀鍚勮皟涓€娆★紙A0 鐨勫潙锛夈€?
     d.dc->BeginDraw();
     PaintScene(d.dc, size_, elapsedSeconds, ActivationFlash(elapsedSeconds), debugText_);
     const HRESULT hrEnd = d.dc->EndDraw();
     if (FAILED(hrEnd)) {
-        // A0 的教训：这里失败时 Present 仍会返回 S_OK，画面上却什么都没有，
-        // 所以必须在 EndDraw 这一层就能看见失败。
+        // A0 鐨勬暀璁細杩欓噷澶辫触鏃?Present 浠嶄細杩斿洖 S_OK锛岀敾闈笂鍗翠粈涔堥兘娌℃湁锛?
+        // 鎵€浠ュ繀椤诲湪 EndDraw 杩欎竴灞傚氨鑳界湅瑙佸け璐ャ€?
         return hrEnd;
     }
     return d.swapchain->Present(1, 0);
@@ -772,7 +834,7 @@ bool Renderer::ExportFrame(const wchar_t* path, double elapsedSeconds) {
             0, 0, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_FEATURE_LEVEL_DEFAULT);
         if (FAILED(d.d2dFactory->CreateWicBitmapRenderTarget(bitmap, props, &rt)) || !rt) break;
 
-        // 同一份绘制代码，只是画到离屏位图上：屏幕上的错在这里也会错
+        // 鍚屼竴浠界粯鍒朵唬鐮侊紝鍙槸鐢诲埌绂诲睆浣嶅浘涓婏細灞忓箷涓婄殑閿欏湪杩欓噷涔熶細閿?
         rt->BeginDraw();
         PaintScene(rt, size_, elapsedSeconds, 0.0, debugText_);
         if (FAILED(rt->EndDraw())) break;
@@ -791,9 +853,9 @@ bool Renderer::ExportFrame(const wchar_t* path, double elapsedSeconds) {
             if (FAILED(frame->Initialize(bag))) break;
             if (FAILED(frame->SetSize(static_cast<UINT>(size_.widthPx),
                                       static_cast<UINT>(size_.heightPx)))) break;
-            // ★ 源位图是**预乘** alpha，必须如实声明为 PBGRA，让 WIC 去做预乘→直通的转换。
-            //   声明成 32bppBGRA（直通）会把预乘数据当直通读，导出的 PNG 整体偏暗——
-            //   而 PNG 是后面所有像素级验收的依据，错了会一路骗下去。
+            // 鈽?婧愪綅鍥炬槸**棰勪箻** alpha锛屽繀椤诲瀹炲０鏄庝负 PBGRA锛岃 WIC 鍘诲仛棰勪箻鈫掔洿閫氱殑杞崲銆?
+            //   澹版槑鎴?32bppBGRA锛堢洿閫氾級浼氭妸棰勪箻鏁版嵁褰撶洿閫氳锛屽鍑虹殑 PNG 鏁翠綋鍋忔殫鈥斺€?
+            //   鑰?PNG 鏄悗闈㈡墍鏈夊儚绱犵骇楠屾敹鐨勪緷鎹紝閿欎簡浼氫竴璺獥涓嬪幓銆?
             WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppPBGRA;
             if (FAILED(frame->SetPixelFormat(&fmt))) break;
             if (FAILED(frame->WriteSource(bitmap, nullptr))) break;
@@ -819,7 +881,7 @@ bool Renderer::PremulProbe(uint8_t* outBgra, int* outX, int* outY) {
     if (!impl_ || !outBgra) return false;
     Impl& d = *impl_;
 
-    // 让导出与屏幕都渲染同一个探针画面：否则"从 PNG 里量"量的是别的东西（踩过）
+    // 璁╁鍑轰笌灞忓箷閮芥覆鏌撳悓涓€涓帰閽堢敾闈細鍚﹀垯"浠?PNG 閲岄噺"閲忕殑鏄埆鐨勪笢瑗匡紙韪╄繃锛?
     g_sceneMode = SceneMode::PremulProbe;
 
     IWICImagingFactory* wic = nullptr;
