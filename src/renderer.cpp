@@ -9,10 +9,12 @@
 #include <d2d1helper.h>
 #include <d3d11.h>
 #include <dcomp.h>
+#include <dwrite.h>
 #include <objbase.h>      // CoCreateInstance
 #include <wincodec.h>     // 离屏导帧用
 
 #include <cmath>   // std::fmod
+#include <string>
 
 namespace dshb {
 
@@ -46,6 +48,40 @@ constexpr Rgba kWhite{1.0f, 1.0f, 1.0f, 0.9f};
 enum class SceneMode { Normal, PremulProbe };
 SceneMode g_sceneMode = SceneMode::Normal;
 
+// 调试浮层用的 DirectWrite 工厂与文本格式。懒创建：不带调试开关时一行都不建。
+IDWriteFactory* DebugWriteFactory() {
+    static IDWriteFactory* factory = nullptr;
+    if (!factory) {
+        if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                       reinterpret_cast<IUnknown**>(&factory)))) {
+            factory = nullptr;
+        }
+    }
+    return factory;
+}
+
+IDWriteTextFormat* DebugTextFormat() {
+    static IDWriteTextFormat* fmt = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        IDWriteFactory* dw = DebugWriteFactory();
+        if (dw) {
+            // 字号是 DIP，所以任何 DPI 下观感一致；行距给正常值，浮层信息不挤
+            if (FAILED(dw->CreateTextFormat(L"Microsoft YaHei UI", nullptr,
+                                            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                            DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"zh-cn", &fmt))) {
+                fmt = nullptr;
+            } else {
+                fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+                fmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            }
+        }
+    }
+    return fmt;
+}
+
 void PaintPremulProbe(ID2D1RenderTarget* rt) {
     rt->Clear(D2D1::ColorF(0, 0.0f));
     ID2D1SolidColorBrush* red = nullptr;
@@ -75,7 +111,7 @@ double FlashPulse(double nowSeconds, double flashStart) {
 }
 
 void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedSeconds,
-                double flashAmount) {
+                double flashAmount, const std::wstring& debugText) {
     if (g_sceneMode == SceneMode::PremulProbe) {
         PaintPremulProbe(rt);
         return;
@@ -121,6 +157,33 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
                 radius * 0.65f, radius * 0.65f);
             rt->DrawRoundedRectangle(rr2, ring, 3.0f * s);
             ring->Release();
+        }
+    }
+
+    // 调试浮层（B6）：只在带调试开关时有内容。画在画布左上角，
+    // 覆盖在余量区上——它是眼睛，不是产品界面。
+    if (!debugText.empty()) {
+        IDWriteFactory* dw = DebugWriteFactory();
+        IDWriteTextFormat* fmt = DebugTextFormat();
+        if (dw && fmt) {
+            ID2D1SolidColorBrush* textBrush = nullptr;
+            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1.0f, 0.94f, 0.6f, 0.95f),
+                                                    &textBrush)) && textBrush) {
+                // ★ 走"先排版、再画"这条正路。
+                //   不要想着在 IDWriteFactory 上找 DrawText / DrawTextW：那个成员不存在，
+                //   而 dwrite.h 的名字映射又会让错误信息指向带后缀的名字，很容易查错方向。
+                IDWriteTextLayout* layout = nullptr;
+                if (SUCCEEDED(dw->CreateTextLayout(
+                        debugText.c_str(), static_cast<UINT32>(debugText.size()), fmt,
+                        static_cast<float>(canvas.widthPx), static_cast<float>(canvas.heightPx),
+                        &layout)) &&
+                    layout) {
+                    rt->DrawTextLayout(D2D1::Point2F(8.0f * s, 6.0f * s), layout, textBrush,
+                                       D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    layout->Release();
+                }
+                textBrush->Release();
+            }
         }
     }
 }
@@ -321,7 +384,7 @@ HRESULT Renderer::RenderFrame(double elapsedSeconds) {
     // 注意：EndDraw 是唯一会报错的一步；BeginDraw 返回 void。
     // 这里自己 BeginDraw/EndDraw，画内容的函数不要再各调一次（A0 的坑）。
     d.dc->BeginDraw();
-    PaintScene(d.dc, size_, elapsedSeconds, ActivationFlash(elapsedSeconds));
+    PaintScene(d.dc, size_, elapsedSeconds, ActivationFlash(elapsedSeconds), debugText_);
     const HRESULT hrEnd = d.dc->EndDraw();
     if (FAILED(hrEnd)) {
         // A0 的教训：这里失败时 Present 仍会返回 S_OK，画面上却什么都没有，
@@ -359,7 +422,7 @@ bool Renderer::ExportFrame(const wchar_t* path, double elapsedSeconds) {
 
         // 同一份绘制代码，只是画到离屏位图上：屏幕上的错在这里也会错
         rt->BeginDraw();
-        PaintScene(rt, size_, elapsedSeconds, 0.0);
+        PaintScene(rt, size_, elapsedSeconds, 0.0, debugText_);
         if (FAILED(rt->EndDraw())) break;
 
         IWICBitmapEncoder* encoder = nullptr;

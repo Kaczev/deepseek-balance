@@ -12,14 +12,17 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     add_compile_options(/utf-8 /W4 /permissive-)
 else()
-    message(FATAL_ERROR "build with MSVC toolchain via vcvars64.bat; see bu-rukku file 0.4")
+    message(FATAL_ERROR "build with MSVC via vcvars64.bat; see bu-rukku steps doc section 0.4")
 endif()
 
 add_executable(dshb
     src/main.cpp
     src/renderer.cpp
     src/paths.cpp
-    src/single_instance.cpp)
+    src/single_instance.cpp
+    src/amount.cpp
+    src/sampling.cpp
+    src/state_machine.cpp)
 
 set_target_properties(dshb PROPERTIES WIN32_EXECUTABLE TRUE)
 

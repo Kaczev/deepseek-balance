@@ -11,6 +11,8 @@
 
 #include <windows.h>
 
+#include <string>
+
 #include <cstdint>
 
 namespace dshb {
@@ -67,6 +69,13 @@ public:
     void BeginActivationFlash(double nowSeconds);
     double ActivationFlash(double nowSeconds) const;
 
+    // ★ 调试浮层（B6 的可见部分）：只在带调试开关时才有内容。
+    //   它是眼睛，不是产品界面——正文的中文文案属于 C 阶段。
+    //   文本统一用宽字符：DirectWrite 直接吃 wchar_t，省掉一次运行时编码转换
+    //   （那类"图省事"的转换最容易在中文上出错）。
+    void SetDebugText(std::wstring text) { debugText_ = std::move(text); }
+    const std::wstring& debugText() const { return debugText_; }
+
     const CanvasSize& size() const { return size_; }
     bool ready() const { return ready_; }
 
@@ -76,7 +85,7 @@ private:
     bool ready_ = false;
     bool spillout_ = false;
     double flashStart_ = -1000.0;   // 负值表示"没在闪"
-
+    std::wstring debugText_;
     struct Impl;
     Impl* impl_ = nullptr;
 };

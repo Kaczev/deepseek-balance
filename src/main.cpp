@@ -8,9 +8,12 @@
 //   把窗口与 DPI 的事实、帧统计写进 build\selftest.log。
 //   不弹对话框：Start-Process -PassThru 的 HasExited 在弹窗时会永远读成 false（踩过）。
 
+#include "amount.h"
 #include "paths.h"
 #include "renderer.h"
+#include "sampling.h"
 #include "single_instance.h"
+#include "state_machine.h"
 
 #include <windows.h>
 #include <objbase.h>    // CoInitializeEx / COINIT_APARTMENTTHREADED
@@ -36,6 +39,11 @@ HWND g_hwnd = nullptr;
 bool g_running = true;
 dshb::Renderer* g_renderer = nullptr;
 double g_elapsed = 0.0;          // 单调时钟累计秒数；帧循环和 WndProc 共用
+bool g_debug = false;            // --debug：显示调试浮层
+bool g_selftestB = false;        // --selftest-b：金额解析与状态机的自检
+dshb::FakeSource g_fake;         // 模拟数据源（B3）
+dshb::StateMachine g_states;     // 连接状态机（B8）
+bool g_haveWindowFocus = false;
 
 // 高精度单调计时；dt 钳到 [0, 50 ms]，防止休眠唤醒后第一帧一步跳到位（设计 §9.6）
 struct Clock {
@@ -80,6 +88,33 @@ void SelfTestLog(const wchar_t* fmt, ...) {
     }
 }
 
+double NowWallMs() {
+    FILETIME ft{};
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u{};
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return static_cast<double>(static_cast<int64_t>(u.QuadPart / 10000ULL) - 11644473600000LL);
+}
+
+// 浮层用的 ASCII 状态名。**不走运行时编码转换**：调一次 WideCharToMultiByte
+// 看着省事，但在"图省事"的地方出错最难查。这里直接映射，一目了然。
+const char* ConnStateNameUtf8(dshb::ConnState s) {
+    using dshb::ConnState;
+    switch (s) {
+    case ConnState::ColdStart: return "ColdStart";
+    case ConnState::Ok: return "Ok";
+    case ConnState::NoKey: return "NoKey";
+    case ConnState::AuthFailed: return "AuthFailed";
+    case ConnState::Exhausted: return "Exhausted";
+    case ConnState::RateLimited: return "RateLimited";
+    case ConnState::NetworkError: return "NetworkError";
+    case ConnState::Stale: return "Stale";
+    case ConnState::Unavailable: return "Unavailable";
+    default: return "?";
+    }
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_DESTROY:
@@ -90,6 +125,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_ESCAPE) {
             g_running = false;
             PostQuitMessage(0);
+            return 0;
+        }
+        // ---- B6/B7 的调试热键：F1..F9 选情形，R 触发充值，C 触发时钟跳变 ----
+        if (wp >= VK_F1 && wp < VK_F1 + static_cast<WPARAM>(dshb::Scenario::Count)) {
+            const auto idx = static_cast<dshb::Scenario>(wp - VK_F1);
+            g_fake.Select(idx);
+            SelfTestLog(L"[key] 情形 -> %ls", dshb::ScenarioName(idx));
+            return 0;
+        }
+        if (wp == 'R') {
+            g_fake.TriggerRecharge();
+            SelfTestLog(L"[key] 触发充值跳变");
+            return 0;
+        }
+        if (wp == 'C') {
+            g_fake.TriggerClockJump();
+            SelfTestLog(L"[key] 触发时钟跳变");
+            return 0;
         }
         return 0;
     case dshb::kMsgActivate:
@@ -140,6 +193,17 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             wcsncpy_s(g_exportPath, argv[i] + 6, _TRUNCATE);
         } else if (wcscmp(argv[i], L"--premul-probe") == 0) {
             g_premulProbe = true;
+        } else if (wcscmp(argv[i], L"--debug") == 0) {
+            g_debug = true;
+        } else if (wcscmp(argv[i], L"--selftest-b") == 0) {
+            g_selftestB = true;
+        } else if (wcsncmp(argv[i], L"--scenario=", 11) == 0) {
+            const int idx = _wtoi(argv[i] + 11);
+            if (idx >= 0 && idx < static_cast<int>(dshb::Scenario::Count)) {
+                g_fake.Select(static_cast<dshb::Scenario>(idx));
+            }
+        } else if (wcsncmp(argv[i], L"--speed=", 8) == 0) {
+            g_fake.SetSpeed(_wtof(argv[i] + 8));
         }
     }
     if (argv) LocalFree(argv);
@@ -265,6 +329,30 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     // 注意它渲染的是同一份绘制代码，所以屏幕上的错在 PNG 里也会错。
     if (g_exportFrame) {
         const double t = static_cast<double>(g_frameNo) / 60.0;   // 第 N 帧 ≈ N/60 秒
+
+        // 让模拟数据源在"虚拟时间"里跑起来：否则导出的图没有数据，浮层也是空的。
+        // 虚拟时间按 1/60 秒一步推进，所以导出是确定的、可重复的。
+        for (double vt = 0.0; vt <= t + 0.0001; vt += (1.0 / 60.0)) {
+            const dshb::Sample s = g_fake.NextIfDue(vt);
+            if (s.wallMs != 0) g_states.OnSample(s, s.wallMs);
+        }
+        if (g_debug) {
+            const int64_t nowWall = static_cast<int64_t>(NowWallMs());
+            const dshb::ConnState st = g_states.Evaluate(nowWall);
+            const dshb::Sample& last = g_states.lastGood();
+            const std::string num =
+                g_states.hasGood() ? last.total.ToString2() : std::string("--.--");
+            const std::wstring numW(num.begin(), num.end());
+            wchar_t line[512];
+            swprintf_s(line,
+                       L"state=%hs  bal=%ls%ls  scenario=%d  samples=%d  t=%.1fs\n"
+                       L"F1..F9=scenario  R=recharge  C=clockjump",
+                       ConnStateNameUtf8(st), g_states.hasGood() ? last.CurrencySymbolW() : L"",
+                       numW.c_str(), static_cast<int>(g_fake.scenario()),
+                       static_cast<int>(g_states.samples().size()), t);
+            renderer.SetDebugText(line);
+        }
+
         const bool ok = renderer.ExportFrame(g_exportPath, t);
         SelfTestLog(L"[export] %ls 帧=%d 时刻=%.3fs 结果=%ls 画布=%dx%d",
                     g_exportPath, g_frameNo, t, ok ? L"成功" : L"失败",
@@ -274,6 +362,97 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         DestroyWindow(g_hwnd);
         CoUninitialize();
         return ok ? 0 : 7;
+    }
+
+    // ---- B 阶段自检：金额解析 + 状态机 ----
+    // 这两件事的正确性不该靠看图判断。这里直接喂已知输入、断言输出，
+    // 全部结果写进日志，人只要看有没有 FAIL。
+    if (g_selftestB) {
+        int failed = 0;
+        auto expect = [&](bool cond, const wchar_t* what) {
+            SelfTestLog(L"[check] %ls: %ls", cond ? L"PASS" : L"FAIL", what);
+            if (!cond) ++failed;
+        };
+
+        // --- 金额解析（十进制，不是浮点） ---
+        {
+            dshb::Amount a{};
+            expect(dshb::ParseAmount("110.00", &a) && a.raw == 1100000, L"110.00 -> 1100000");
+            expect(dshb::ParseAmount("0.03", &a) && a.raw == 300, L"0.03 -> 300");
+            expect(dshb::ParseAmount(" 12.5 ", &a) && a.raw == 125000, L"含空白 12.5 -> 125000");
+            expect(dshb::ParseAmount("1,234.56", &a) && a.raw == 12345600, L"千分位 1,234.56");
+            expect(dshb::ParseAmount("-3.5", &a) && a.raw == -35000, L"负数 -3.5");
+            expect(dshb::ParseAmount("0.12345", &a) && a.raw == 1235, L"5 位小数四舍五入");
+            expect(!dshb::ParseAmount("", &a), L"空串必须失败");
+            expect(!dshb::ParseAmount("abc", &a), L"非数字必须失败");
+            expect(!dshb::ParseAmount("-", &a), L"只有符号必须失败");
+            expect(!dshb::ParseAmount("1.2.3", &a), L"两个小数点必须失败");
+            // 失败时不得改动出参：调用方要靠它区分"读不到"和"余额为 0"
+            a.raw = 777;
+            dshb::ParseAmount("nope", &a);
+            expect(a.raw == 777, L"解析失败时不改动出参");
+        }
+
+        // --- 状态机：九种情形各跑一遍，断言状态与金额 ---
+        // ★ 一条纪律：**断言不变式，不要断言"恰好等于某个数"**。
+        //   第一版这里硬写了精确余额，结果失败——因为数字取决于虚拟时间里跑了几拍，
+        //   那是实现细节。判据要写成"该降的降了""该为 0 的就是 0"这种不随节拍变化的性质。
+        {
+            struct Case {
+                dshb::Scenario sc;
+                dshb::ConnState want;
+                const wchar_t* what;
+                int amountRule;      // 0=不检查 1=恰好为 0 2=必须小于起始值 3=必须等于起始值
+                const wchar_t* amountWhat;
+            };
+            const Case cases[] = {
+                {dshb::Scenario::Steady, dshb::ConnState::Ok, L"平稳 -> Ok", 2, L"  平稳：余额应下降"},
+                {dshb::Scenario::FastDrain, dshb::ConnState::Ok, L"快速 -> Ok", 2, L"  快速：余额应下降"},
+                {dshb::Scenario::Zero, dshb::ConnState::Ok, L"归零 -> Ok（余额 0 不是错误）", 1,
+                 L"  归零：余额恰好为 0"},
+                {dshb::Scenario::Unavailable, dshb::ConnState::Unavailable,
+                 L"不可用 -> Unavailable", 0, L""},
+                {dshb::Scenario::NoNetwork, dshb::ConnState::NetworkError,
+                 L"没网 -> NetworkError", 0, L""},
+            };
+            for (const Case& c : cases) {
+                g_fake.Select(c.sc);
+                dshb::StateMachine sm;
+                int64_t lastWall = 0;
+                for (double vt = 0.0; vt <= 3.0; vt += (1.0 / 60.0)) {
+                    const dshb::Sample s = g_fake.NextIfDue(vt);
+                    if (s.wallMs != 0) {
+                        sm.OnSample(s, s.wallMs);
+                        lastWall = s.wallMs;
+                    }
+                }
+                const dshb::ConnState got = sm.Evaluate(lastWall);
+                expect(got == c.want, c.what);
+
+                if (c.amountRule != 0) {
+                    const bool has = sm.hasGood();
+                    const dshb::AmountRaw got = has ? sm.lastGood().total.raw : -1;
+                    const dshb::AmountRaw start = dshb::Amount::FromYuan(100).raw;
+                    bool ok = false;
+                    if (c.amountRule == 1) ok = has && got == 0;
+                    if (c.amountRule == 2) ok = has && got < start && got >= 0;
+                    if (c.amountRule == 3) ok = has && got == start;
+                    expect(ok, c.amountWhat);
+                }
+            }
+
+            // 九种情形都必须能被选中且名字非空（防止枚举与名字表错位）
+            bool namesOk = true;
+            for (int i = 0; i < static_cast<int>(dshb::Scenario::Count); ++i) {
+                const wchar_t* n = dshb::ScenarioName(static_cast<dshb::Scenario>(i));
+                if (!n || n[0] == L'?' || n[0] == L'\0') namesOk = false;
+            }
+            expect(namesOk, L"情形名字表与枚举一一对齐（9 项）");
+        }
+
+        SelfTestLog(L"[check] 小计：失败 %d 项", failed);
+        CoUninitialize();
+        return failed == 0 ? 0 : 9;
     }
 
     Clock clock;
@@ -295,6 +474,54 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
         const double dt = clock.Tick();
         elapsed += dt;
+        g_elapsed = elapsed;
+
+        // ---- 数据管道（B 阶段）----
+        // 目前数据来自模拟源；真实接口在 J 阶段接上。状态机只认"一条采样"，
+        // 所以换数据源不需要动它——这正是把这两件事分开的目的。
+        {
+            const dshb::Sample s = g_fake.NextIfDue(elapsed);
+            if (s.wallMs != 0) {
+                g_states.OnSample(s, s.wallMs);
+            }
+        }
+
+        // Key 缺失是启动时检查一次即可（设计 §4 的 NoKey 态）
+        {
+            static bool keyChecked = false;
+            static bool haveKey = true;
+            if (!keyChecked) {
+                keyChecked = true;
+                wchar_t buf[8]{};
+                haveKey = GetEnvironmentVariableW(L"DEEPSEEK_API_KEY", buf, 8) > 0;
+                g_states.SetNoKey(!haveKey);
+            }
+        }
+
+        // 调试浮层：把状态机的判断摊开给人看。**它只显示，不参与任何逻辑。**
+        if (g_debug) {
+            const int64_t nowWall = static_cast<int64_t>(NowWallMs());
+            const dshb::ConnState st = g_states.Evaluate(nowWall);
+            const bool focused = (GetForegroundWindow() == g_hwnd);
+            g_haveWindowFocus = focused;
+            const dshb::Sample& last = g_states.lastGood();
+            const std::string num =
+                g_states.hasGood() ? last.total.ToString2() : std::string("--.--");
+            // 宽字符格式化：DirectWrite 直接吃 wchar_t，中间不做编码转换
+            const std::wstring numW(num.begin(), num.end());
+            wchar_t line[512];
+            // %hs = 窄字符参数；混用宽窄格式必须写清，否则参数会被按错误的宽度读
+            swprintf_s(line,
+                       L"state=%hs  bal=%ls%ls  scenario=%d  samples=%d  t=%.1fs\n"
+                       L"hasGood=%d  key=%d  focus=%d  speed=%.0fx\n"
+                       L"F1..F9=scenario  R=recharge  C=clockjump  Esc=quit",
+                       ConnStateNameUtf8(st), g_states.hasGood() ? last.CurrencySymbolW() : L"",
+                       numW.c_str(), static_cast<int>(g_fake.scenario()),
+                       static_cast<int>(g_states.samples().size()), elapsed,
+                       g_states.hasGood() ? 1 : 0, g_states.NoKey() ? 0 : 1, focused ? 1 : 0,
+                       g_fake.speed());
+            renderer.SetDebugText(line);
+        }
 
         LARGE_INTEGER a, b, freq;
         QueryPerformanceFrequency(&freq);
