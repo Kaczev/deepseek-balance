@@ -215,6 +215,11 @@ static float g_numberFontSizeDip = 0.0f;
 static float g_numberX = 0.0f;
 static bool g_numberXValid = false;
 
+// 币种符号的矩形（像素），每帧刷新；点击命中测试要用
+static float g_symbolL = 0.0f, g_symbolT = 0.0f, g_symbolR = 0.0f, g_symbolB = 0.0f;
+static bool g_symbolValid = false;
+static float g_blockShift = 0.0f;   // 整块数字当帧的横向位移（符号要跟着它走）
+
 // FONT SIZES (DIP) for the balance number, indexed by how many digits it shows
 enum class FontRole { Title, Number, NumberFlex, Unit, Estimate, Debug };
 
@@ -464,6 +469,8 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             const float targetX = cx - (inkW + gap + symbolW) * 0.5f - inkInsetDip * s;
             // ★ 横向缓动：列数一变，目标位置会跳半个字宽；让实际位置追上去，
             //   于是数字是"滑"过去而不是"瞬移"。风格与滚动一致：每帧把残差乘上 rate。
+            g_symbolValid = false;   // 每帧先作废；真的画了符号才置回 true
+            g_blockShift = g_numberX - targetX;   // 符号与数字一起滑
             if (!g_numberXValid) { g_numberX = targetX; g_numberXValid = true; }
             else {
                 g_numberX = targetX + (g_numberX - targetX) * kNumberShiftRate;
@@ -609,7 +616,14 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                         symbol.c_str(), static_cast<UINT32>(symbol.size()), unitFmt, 256.0f, 64.0f,
                         &layout)) &&
                     layout) {
-                    rt->DrawTextLayout(D2D1::Point2F(left + digitsW + gap, numberTop + 14.0f * s),
+                    const float symbolX = left + digitsW + gap + g_blockShift;
+                    const float symbolY = numberTop + 14.0f * s;
+                    g_symbolL = symbolX;
+                    g_symbolT = symbolY;
+                    g_symbolR = symbolX + (symbolW > 0.0f ? symbolW : 24.0f * s);
+                    g_symbolB = symbolY + 40.0f * s;   // 命中框给点余量，不必精确到行距
+                    g_symbolValid = true;
+                    rt->DrawTextLayout(D2D1::Point2F(symbolX, symbolY),
                                        layout, sb, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     layout->Release();
                 }
@@ -927,6 +941,13 @@ HRESULT Renderer::RenderFrame(double elapsedSeconds) {
         return hrEnd;
     }
     return d.swapchain->Present(1, 0);
+}
+
+SymbolRect CurrencySymbolRect() {
+    SymbolRect r{};
+    r.l = g_symbolL; r.t = g_symbolT; r.r = g_symbolR; r.b = g_symbolB;
+    r.valid = g_symbolValid;
+    return r;
 }
 
 bool Renderer::ExportFrame(const wchar_t* path, double elapsedSeconds) {

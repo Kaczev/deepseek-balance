@@ -50,6 +50,17 @@ Sample MakeSample(const api::BalanceResult& r) {
         ParseAmount(e.grantedBalance, &s.granted);
         ParseAmount(e.toppedUpBalance, &s.toppedUp);
     }
+    // 全部条目都带上：点击币种符号时要在它们之间切换（所以不能只留优先的那条）
+    for (const api::BalanceEntry& e : r.entries) {
+        CurrencyAmount ca{};
+        ca.currency = e.currency;
+        Amount a{};
+        if (ParseAmount(e.totalBalance, &a)) {
+            ca.total = a;
+            ca.ok = true;
+        }
+        s.entries.push_back(ca);
+    }
     s.note = r.detail;
     return s;
 }

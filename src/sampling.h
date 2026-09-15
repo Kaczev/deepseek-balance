@@ -16,6 +16,14 @@ namespace dshb {
 // ---------------------------------------------------------------------------
 // 一条采样
 // ---------------------------------------------------------------------------
+// 一个币种条目（响应的 balance_infos 里的一项）。
+// ★ 切换币种要用到**全部**条目，所以 Sample 不能只带"被选中的那一条"。
+struct CurrencyAmount {
+    std::string currency;
+    Amount total{};
+    bool ok = false;
+};
+
 struct Sample {
     // 墙钟（Unix 毫秒）。用于显示和落盘。
     int64_t wallMs = 0;
@@ -34,6 +42,8 @@ struct Sample {
     bool amountsOk = false;
 
     std::string currency;        // "CNY" / "USD" / "" 未知
+    // 响应里的全部币种条目（切换币种用）。空 = 只有 currency/total 这一条。
+    std::vector<CurrencyAmount> entries;
     bool isAvailable = false;
     int httpStatus = 0;          // 0 = 还没发出去（本地错误）
     bool transportOk = false;    // 请求本身是否成功到达并拿到响应

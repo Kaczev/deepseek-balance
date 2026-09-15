@@ -34,6 +34,14 @@ struct CanvasSize {
     float scale = 1.0f;
 };
 
+// 币种符号在屏幕上的矩形（**像素**坐标）。点击命中测试要用。
+// 每帧由渲染层写入；还没画过符号时 valid=false。
+struct SymbolRect {
+    float l = 0.0f, t = 0.0f, r = 0.0f, b = 0.0f;
+    bool valid = false;
+};
+SymbolRect CurrencySymbolRect();
+
 class Renderer {
 public:
     ~Renderer();

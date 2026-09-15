@@ -97,6 +97,17 @@ public:
     // 连续失败到达阈值后调用：显示回到"没有值"（即 --.--）。
     // 下次成功样本会经 OnSample 自动恢复。
     void MarkUnreadable();
+
+    // ---- 币种切换（点击币种符号）----
+    // 按**名字**记住选中的币种，不记数组下标：接口不保证数组顺序（设计 §2.2）。
+    void SelectCurrency(const std::string& code);
+    const std::string& selectedCurrency() const { return selectedCurrency_; }
+    // 当前**实际显示**的币种（选了哪个就显示哪个；没选则是接口的优先条目）
+    const std::string& shownCurrency() const { return currencyShown_; }
+    // 当前样本里可选的币种清单（顺序按接口给的）。少于 2 个时切换没有意义。
+    std::vector<std::string> availableCurrencies() const { return availableCurrencies_; }
+    // 下一个币种（在当前清单里循环）。清单不足 2 个时返回空串。
+    std::string NextCurrency() const;
     double value() const { return value_; }
     double target() const { return target_; }
 
@@ -125,6 +136,9 @@ private:
     bool zeroPending_ = false;
     bool zeroConfirmed_ = false;
     double latest_ = 0.0;
+    std::string selectedCurrency_;                 // 空 = 用接口给的优先条目
+    std::vector<std::string> availableCurrencies_;  // 最近一次样本里的币种清单
+    std::string currencyShown_;                     // 当前显示的币种
 
     // 这一段的起点值，用于自检报告"走了多少比例"
     double rollFromValue_ = 0.0;

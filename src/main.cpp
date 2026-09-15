@@ -76,6 +76,14 @@ bool g_apiPlainHttp = false;
 int g_apiTimeoutMs = 5000;
 int g_apiIntervalMs = 10000;
 dshb::BalanceSource g_apiSource;
+
+// ---- 币种点击（只认单击；拖动与长按都不算）----
+int g_pressX = 0, g_pressY = 0;
+unsigned long long g_pressTick = 0;
+bool g_pressValid = false;
+bool g_currenciesGiven = false;   // --currencies=：合成一条多币种样本（验证切换用）
+std::string g_currenciesSpec;   // 形如 "CNY:19.20,USD:2.70"
+bool g_clickTest = false;         // --click-test：注入三次手势
 double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
 double g_displayAmount = 0.0;   // 已弃用（所有者改为 --last）
 double g_lastAmount = -1.0;   // --last=L（-1 = 未给）
@@ -164,8 +172,54 @@ const char* ConnStateNameUtf8(dshb::ConnState s) {
     }
 }
 
+// 左键"抬起"时的判定。**只认单击**：
+//   移动超过 4px  -> 算拖动，不切换
+//   按住超过 600ms -> 算长按，不切换
+// 命中测试用渲染层每帧发布的符号矩形（像素坐标）。
+static void FinishLeftGesture(int x, int y) {
+    if (!g_pressValid) return;
+    g_pressValid = false;
+    const int dx = x - g_pressX;
+    const int dy = y - g_pressY;
+    const int dist2 = dx * dx + dy * dy;
+    const int held = static_cast<int>(GetTickCount64() - g_pressTick);
+    if (dist2 > 16) {
+        SelfTestLog(L"[click] 移动 %dpx：算拖动，不切换", static_cast<int>(std::sqrt(static_cast<double>(dist2))));
+        return;
+    }
+    if (held > 600) {
+        SelfTestLog(L"[click] 按住 %dms：算长按，不切换", held);
+        return;
+    }
+    const dshb::SymbolRect sr = dshb::CurrencySymbolRect();
+    if (!sr.valid) return;
+    const float pad = 6.0f;
+    const bool inside = (x >= sr.l - pad && x <= sr.r + pad && y >= sr.t - pad && y <= sr.b + pad);
+    SelfTestLog(L"[click] 点(%d,%d) 符号矩形[%d,%d..%d,%d] 命中=%ls", x, y, static_cast<int>(sr.l),
+                static_cast<int>(sr.t), static_cast<int>(sr.r), static_cast<int>(sr.b),
+                inside ? L"是" : L"否");
+    if (!inside) return;
+    const std::string next = g_display.NextCurrency();
+    if (next.empty()) {
+        SelfTestLog(L"[click] 当前只有一个币种：忽略");
+        return;
+    }
+    g_display.SelectCurrency(next);
+    SelfTestLog(L"[click] 币种切换 -> %hs", next.c_str());
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_LBUTTONDOWN:
+        g_pressX = static_cast<int>(static_cast<short>(LOWORD(lp)));
+        g_pressY = static_cast<int>(static_cast<short>(HIWORD(lp)));
+        g_pressTick = GetTickCount64();
+        g_pressValid = true;
+        return 0;
+    case WM_LBUTTONUP:
+        FinishLeftGesture(static_cast<int>(static_cast<short>(LOWORD(lp))),
+                          static_cast<int>(static_cast<short>(HIWORD(lp))));
+        return 0;
     case WM_DESTROY:
         RemoveEscHook();
         g_running = false;
@@ -334,6 +388,29 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_selftestB = true;
         } else if (wcscmp(argv[i], L"--layout-probe") == 0) {
             g_layoutProbe = true;
+        } else if (wcscmp(argv[i], L"--click-test") == 0) {
+            g_clickTest = true;
+        } else if (wcsncmp(argv[i], L"--currencies=", 13) == 0) {
+            // 合成一条带**全部币种条目**的样本：形如 CNY:19.20,USD:2.70。
+            // 用途：真实账户只有 CNY，切换功能没有真数据可测，所以给一个测试夹具。
+            g_currenciesGiven = true;
+            const wchar_t* v = argv[i] + 13;
+            char narrow[512]{};
+            WideCharToMultiByte(CP_UTF8, 0, v, -1, narrow, sizeof(narrow), nullptr, nullptr);
+            std::string spec(narrow);
+            std::string cur;
+            size_t pos = 0;
+            while (pos <= spec.size()) {
+                const size_t comma = spec.find(',', pos);
+                const std::string item = spec.substr(pos, (comma == std::string::npos) ? std::string::npos : comma - pos);
+                const size_t colon = item.find(':');
+                if (colon != std::string::npos) {
+                    cur += item.substr(0, colon) + "=" + item.substr(colon + 1) + " ";
+                }
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+            g_currenciesSpec = cur;
         } else if (wcscmp(argv[i], L"--api=off") == 0) {
             g_apiOff = true;
         } else if (wcscmp(argv[i], L"--api-once") == 0) {
@@ -445,6 +522,42 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         g_states.OnSample(fs, fs.wallMs);
         g_display.OnSample(g_states.lastGood());
         SelfTestLog(L"[pin] 余额钉在 %.2f（不再取样、不再变化）", g_fixedAmount);
+    }
+
+    // --currencies=：合成一条带**全部币种条目**的样本。
+    // 用途：真实账户只有 CNY，切换币种没有真数据可测，所以给一个夹具，
+    // 走的就是真实样本那条路（entries + 优先条目），不是特例分支。
+    if (g_currenciesGiven) {
+        dshb::Sample cs{};
+        cs.wallMs = NowWallMs();
+        cs.monotonicMs = static_cast<int64_t>(GetTickCount64());
+        cs.transportOk = true;
+        cs.httpStatus = 200;
+        cs.isAvailable = true;
+        cs.currency = "CNY";
+        cs.amountsOk = false;
+        std::string spec = g_currenciesSpec;
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            const size_t sp = spec.find(' ', pos);
+            const std::string item = spec.substr(pos, (sp == std::string::npos) ? std::string::npos : sp - pos);
+            const size_t eq = item.find('=');
+            if (eq != std::string::npos) {
+                dshb::CurrencyAmount ca{};
+                ca.currency = item.substr(0, eq);
+                if (dshb::ParseAmount(item.substr(eq + 1), &ca.total)) ca.ok = true;
+                if (ca.currency == "CNY" && ca.ok) {
+                    cs.total = ca.total;
+                    cs.amountsOk = true;
+                }
+                cs.entries.push_back(ca);
+            }
+            if (sp == std::string::npos) break;
+            pos = sp + 1;
+        }
+        g_states.OnSample(cs, cs.wallMs);
+        if (cs.amountsOk) g_display.OnSample(g_states.lastGood());
+        SelfTestLog(L"[cur] 合成样本：%hs 条", std::to_string(cs.entries.size()).c_str());
     }
 
     // 手动设定三件参数（所有者定的接口）：实际数字 R、上次的实际数字 L、运算了 k 帧。
@@ -698,11 +811,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                     g_display.Update(dt);
 
                     const dshb::ConnState st = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
-                    const bool currencyKnown =
-                        g_states.hasGood() && g_states.lastGood().CurrencyKnown();
-                    renderer.SetWidgetFrame(dshb::BuildWidgetFrame(
-                        st, g_display, currencyKnown,
-                        g_states.hasGood() ? g_states.lastGood().CurrencySymbolW() : L""));
+    // 币种跟着**显示层当前选中的那个**走（点符号可切换），不再只看状态机里那条
+    const std::string shownCode = g_display.shownCurrency();
+    const bool currencyKnown = g_states.hasGood() && (shownCode == "CNY" || shownCode == "USD");
+    const wchar_t* shownSym = (shownCode == "CNY") ? L"\u00A5" : ((shownCode == "USD") ? L"$" : L"");
+    renderer.SetWidgetFrame(dshb::BuildWidgetFrame(st, g_display, currencyKnown, shownSym));
                     renderer.RenderFrame(rollElapsed);
 
                     if (g_runSeconds > 0.0 && rollElapsed >= g_runSeconds) break;
@@ -1065,7 +1178,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 所以换数据源不需要动它——这正是把这两件事分开的目的。
         {
             const dshb::Sample s = g_fake.NextIfDue(elapsed);
-            if (s.wallMs != 0 && !g_realApiOn && !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0 && g_seq.empty()) {   // 钉值/真接口时不喂
+            if (s.wallMs != 0 && !g_realApiOn && !g_currenciesGiven && !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0 && g_seq.empty()) {   // 钉值/真接口/合成样本时不喂
                 g_states.OnSample(s, s.wallMs);
             }
         }
@@ -1092,7 +1205,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 }
                 g_states.SetNoKey(!haveKey);
 
-                const bool manualRun = g_fixedGiven || g_realGiven || g_lastGiven || g_frames >= 0 ||
+                const bool manualRun = g_currenciesGiven || g_fixedGiven || g_realGiven || g_lastGiven || g_frames >= 0 ||
                                        !g_seq.empty();
                 if (haveKey && !g_apiOff && !manualRun) {
                     dshb::BalanceSourceConfig cfg{};
@@ -1191,6 +1304,34 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         }
 
         if (!manualMode) g_display.OnSample(g_states.lastGood());
+        // --click-test：注入三次手势，验证"只有单击才切换"这条规则。
+        // 走的是和真实鼠标**同一个**判定函数，不是旁路。
+        if (g_clickTest) {
+            static int ctStage = 0;
+            static double ctAt = 1.0;
+            if (ctStage < 3 && elapsed >= ctAt) {
+                const dshb::SymbolRect sr = dshb::CurrencySymbolRect();
+                if (sr.valid) {
+                    const int cx = static_cast<int>((sr.l + sr.r) * 0.5f);
+                    const int cy = static_cast<int>((sr.t + sr.b) * 0.5f);
+                    if (ctStage == 0) {
+                        SelfTestLog(L"[click-test] 手势 1：干净的单击（应当切换）");
+                        g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
+                        FinishLeftGesture(cx, cy);
+                    } else if (ctStage == 1) {
+                        SelfTestLog(L"[click-test] 手势 2：从符号拖出 40px（不应切换）");
+                        g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
+                        FinishLeftGesture(cx + 40, cy);
+                    } else {
+                        SelfTestLog(L"[click-test] 手势 3：按住 900ms 再松（不应切换）");
+                        g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64() - 900; g_pressValid = true;
+                        FinishLeftGesture(cx, cy);
+                    }
+                    ++ctStage;
+                    ctAt = elapsed + 1.5;
+                }
+            }
+        }
         g_display.Update(dt);
 
         // 组装这一帧要显示的东西，交给渲染层。渲染层不关心余额是怎么来的。

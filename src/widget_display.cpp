@@ -38,14 +38,65 @@ void DisplayedAmount::MarkUnreadable() {
     tripsDirty_ = true;
 }
 
+// 用户点了币种符号：换成清单里的下一个。
+// 记住的是**名字**，所以下一次样本里顺序变了也切得对。
+void DisplayedAmount::SelectCurrency(const std::string& code) {
+    selectedCurrency_ = code;
+    tripsDirty_ = true;
+}
+
+std::string DisplayedAmount::NextCurrency() const {
+    if (availableCurrencies_.size() < 2) return std::string();
+    std::string current = selectedCurrency_.empty() ? currencyShown_ : selectedCurrency_;
+    for (size_t i = 0; i < availableCurrencies_.size(); ++i) {
+        if (availableCurrencies_[i] == current) {
+            return availableCurrencies_[(i + 1) % availableCurrencies_.size()];
+        }
+    }
+    return availableCurrencies_[0];
+}
+
 void DisplayedAmount::OnSample(const Sample& s) {
     if (!s.amountsOk) return;                 // 读不到的样本不参与显示
 
-    const double yuan = s.total.ToDouble();
+    // ---- 币种选择 ----
+    // 清单来自样本；没选中（或选中的这个币种这次没出现）就用接口给的优先条目。
+    // 按名字找而不是按下标：接口不保证数组顺序（设计 §2.2）。
+    availableCurrencies_.clear();
+    for (const CurrencyAmount& e : s.entries) {
+        if (e.ok) availableCurrencies_.push_back(e.currency);
+    }
+    Amount picked = s.total;
+    std::string pickedCode = s.currency;
+    if (!s.entries.empty()) {
+        const CurrencyAmount* hit = nullptr;
+        if (!selectedCurrency_.empty()) {
+            for (const CurrencyAmount& e : s.entries) {
+                if (e.ok && e.currency == selectedCurrency_) { hit = &e; break; }
+            }
+        }
+        if (!hit) {
+            for (const CurrencyAmount& e : s.entries) {
+                if (e.ok && e.currency == s.currency) { hit = &e; break; }
+            }
+        }
+        if (!hit) {
+            for (const CurrencyAmount& e : s.entries) {
+                if (e.ok) { hit = &e; break; }
+            }
+        }
+        if (hit) {
+            picked = hit->total;
+            pickedCode = hit->currency;
+        }
+    }
+    currencyShown_ = pickedCode;
+
+    const double yuan = picked.ToDouble();
     latest_ = yuan;
 
     // 余额为 0 需要连续两次采样确认：防止瞬时 0 把整个界面闪成灰白
-    if (s.total.raw == 0) {
+    if (picked.raw == 0) {
         if (zeroPending_) {
             zeroConfirmed_ = true;
         } else {
