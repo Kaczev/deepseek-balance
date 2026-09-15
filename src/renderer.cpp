@@ -93,6 +93,24 @@ namespace {
 //   鐥囩姸涓嶄細鎶ラ敊锛屽彧浼氳鍗婇€忔槑澶勬暣浣撳亸鏆椼€?
 //   绾﹀畾锛氫唬鐮侀噷鍐欒璁¤壊锛堢洿閫?RGBA锛夛紝浜ょ粰 D2D锛涘彧鏈?*绂诲睆浣嶅浘鍥炶**鍜?
 //   鎵嬪伐鍐欎綅鍥炬椂鎵嶉渶瑕佽嚜宸遍涔樸€?
+// UTF-8 (std::string) -> UTF-16 (std::wstring).
+//
+// WHY this is needed rather than the tempting one-liner:
+//     std::wstring t(s.begin(), s.end());
+// that does NOT decode anything -- it takes each BYTE of the UTF-8 string and makes it
+// one wchar_t. For ASCII (the amounts) it happens to look right, which is why the bug
+// survived; for Chinese it produces mojibake on screen. Measured: the estimate line
+// rendered as "鎸夊綋鍓嶉€熷害" before this fix.
+std::wstring Widen(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    const int need = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()),
+                                        nullptr, 0);
+    if (need <= 0) return std::wstring();
+    std::wstring out(static_cast<size_t>(need), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), out.data(), need);
+    return out;
+}
+
 const D2D1_COLOR_F StraightRgba(float r, float g, float b, float a) {
     return D2D1::ColorF(r, g, b, a);
 }
@@ -360,7 +378,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
 
     // 浣欓鏁板瓧锛氬眳涓€傛暟瀛椾笌绗﹀彿涓€璧烽噺瀹藉害锛屼繚璇?鏁翠綋"灞呬腑鑰屼笉鏄?鏁板瓧"灞呬腑銆?
     {
-        const std::wstring digits(f.amountText.begin(), f.amountText.end());
+        const std::wstring digits = Widen(f.amountText);
         const std::wstring symbol = f.currencySymbol ? f.currencySymbol : L"";
         const std::wstring& measureText = digits;
 
@@ -458,7 +476,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
 
     // 娓呴浂棰勪及锛氬簳閮ㄥ眳涓皬瀛椼€侰9 涔嬪墠杩欓噷鏄┖鐨勨€斺€?*涓嶇紪鍋囨暟鎹?*銆?
     if (!f.zeroTimeText.empty() && estFmt) {
-        const std::wstring t(f.zeroTimeText.begin(), f.zeroTimeText.end());
+        const std::wstring t = Widen(f.zeroTimeText);
         ID2D1SolidColorBrush* b = nullptr;
         if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, kEstimateAlpha), &b)) && b) {
             IDWriteTextLayout* layout = nullptr;
@@ -466,10 +484,13 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                     t.c_str(), static_cast<UINT32>(t.size()), estFmt, kEntityWidthDip * s, 64.0f,
                     &layout)) &&
                 layout) {
+                // 按排版宽度居中。**不要**改成"按墨迹居中"：这一版我试过，把 overhang 的符号
+                // 用反了，文案被推到中线右边 45 px（实测 x 中心 282，而中线是 237.5）。
+                // 按排版宽度居中的残差只有左偏 4 px（末尾是半角括号，右侧边距大），可接受。
                 const float w = MeasureTextWidth(t, estFmt);
-                rt->DrawTextLayout(D2D1::Point2F(cx - w * 0.5f, (kMarginDip + kEntityHeightDip - kEstimateInsetDip) * s),
-                                   layout, b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                layout->Release();
+                rt->DrawTextLayout(
+                    D2D1::Point2F(cx - w * 0.5f, (kMarginDip + kEntityHeightDip - kEstimateInsetDip) * s),
+                    layout, b, D2D1_DRAW_TEXT_OPTIONS_NONE);
             }
             b->Release();
         }

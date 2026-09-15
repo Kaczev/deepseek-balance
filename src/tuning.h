@@ -49,7 +49,7 @@ inline constexpr int kCornerRadiusDip = 12;
 // 曾经是按位数分档的（位数越多字号越小），但那是没有根据的谨慎：实测在 315 DIP
 // 宽的面板里，即使用到 7 位（99999.99），数字两侧仍各空 70 px 以上，根本不会挤到边。
 // 所以现在只有一个值；觉得数字偏大或偏小，就改这一个数。
-inline constexpr float kNumberFixedSizeDip = 60.0f;
+inline constexpr float kNumberFixedSizeDip = 45.0f;
 
 // 右上角那行："deepseek 余额"（同时兼状态文案）。
 inline constexpr float kTitleSizeDip = 15.0f;

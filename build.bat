@@ -9,12 +9,17 @@ rem  steps document under the "bu-rukku" (not-committed) folder.
 rem
 rem  Rules enforced here:
 rem   1. vcvars64.bat must run first; cl/cmake/ninja are NOT on PATH.
-rem   2. After vcvars64.bat, NEVER touch PATH. Doing so replaces PATH
-rem      with an expanded copy, silently drops the MSVC toolchain, and
-rem      cmake then reports "No CMAKE_CXX_COMPILER could be found" --
-rem      which looks like a missing compiler but is not.
-rem   3. Build log goes to build\build.log, not stdout, so that a pipe
-rem      on the caller side cannot stall the build.
+rem   2. After vcvars64.bat, NEVER touch PATH.
+rem   3. Build log goes to build\build.log, not stdout.
+rem   4. EVERY source and header is checked against build\dshb.exe. If any is
+rem      newer, the object cache is thrown away and everything is recompiled.
+rem      WHY (measured 2026-09-15): this project's generated build.ninja has NO
+rem      MSVC header dependency tracking -- no "deps = msvc" and no depfile --
+rem      so ninja only compares the .cpp timestamps. Editing src\tuning.h (the
+rem      file the owner tunes) therefore changed NOTHING: ninja printed
+rem      "ninja: no work to do", the old exe was left in place, and the widget
+rem      kept showing the old sizes. A full recompile costs a few seconds, and
+rem      silently not rebuilding costs a lot more than that.
 rem ============================================================
 setlocal
 
@@ -37,12 +42,35 @@ if not exist "%CMAKE%" (
 
 echo ==== %DATE% %TIME% ==== > "%LOG%"
 
-rem CMakeCache.txt is the authoritative marker that the build dir is configured.
-rem Checking build.ninja instead breaks as soon as the cache is deleted alone:
-rem the script then skips configuring and cmake reports "not a CMake build
-rem directory (missing CMakeCache.txt)".
-if not exist "build\CMakeCache.txt" (
+rem ------------------------------------------------------------------
+rem Is any tracked source newer than the existing artifact?
+rem
+rem Done with PowerShell because forfiles only accepts a DATE, not a
+rem time-of-day -- "forfiles /D +09/15/2026" counts every file from today
+rem as newer, and comparing against a date derived from the exe's own date
+rem says "not newer" for changes made later the same day. Measured.
+rem ------------------------------------------------------------------
+set "STALE="
+if exist "build\dshb.exe" (
+  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$exe=(Get-Item 'build\dshb.exe').LastWriteTime;" ^
+    "$new=Get-ChildItem -Path src,tools -Recurse -Include *.h,*.cpp -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $exe };" ^
+    "$cm=Get-Item 'CMakeLists.txt' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $exe };" ^
+    "if($new -or $cm){ exit 1 } else { exit 0 }" >nul 2>&1
+  if errorlevel 1 set "STALE=1"
+)
+
+rem A first-time build, or a stale one, gets the cache wiped so that every
+rem object is genuinely recompiled rather than trusted.
+set "RECONFIG="
+if not exist "build\CMakeCache.txt" set "RECONFIG=1"
+if defined STALE set "RECONFIG=1"
+
+if defined RECONFIG (
+  if defined STALE echo [build] a source is newer than the exe: forcing a full rebuild >> "%LOG%"
   echo [build] configuring ... >> "%LOG%"
+  if exist "build\CMakeFiles" rd /s /q "build\CMakeFiles" >nul 2>&1
+  if exist "build\CMakeCache.txt" del /q "build\CMakeCache.txt" >nul 2>&1
   call "%VCVARS%" >nul 2>&1
   if errorlevel 1 exit /b 3
   "%CMAKE%" -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MAKE_PROGRAM="%NINJA%" >> "%LOG%" 2>&1
