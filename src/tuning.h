@@ -105,7 +105,7 @@ inline constexpr float kRollSnapGrid = 0.01f;
 // ★ 缓动曲线指数 c：位置 = L + D × (1 − rate^k)^c。
 //   c = 1 就是原来的 (1 − rate^k)；c > 1 起步更慢、尾段更有"收"的感觉；
 //   c < 1 起步更快。这是外观旋钮，由所有者调。
-inline constexpr float kRollCurveC = 1.0f;
+inline constexpr float kRollCurveC = 5.0f;
 
 // ★ 步长 D 的取整口径（两种都留着，便于对比）：
 //   true  = floor((R − L)/n)          —— 所有者指定的写法

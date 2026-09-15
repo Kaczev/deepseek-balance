@@ -342,7 +342,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         fs.isAvailable = true;
         fs.amountsOk = true;
         fs.currency = "CNY";
-        fs.total = dshb::Amount::FromYuan(static_cast<int64_t>(g_fixedAmount));
+        fs.total = dshb::Amount::FromYuanDouble(g_fixedAmount);
         g_states.OnSample(fs, fs.wallMs);
         g_display.OnSample(g_states.lastGood());
         SelfTestLog(L"[pin] 余额钉在 %.2f（不再取样、不再变化）", g_fixedAmount);
@@ -366,7 +366,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         ms.isAvailable = true;
         ms.amountsOk = true;
         ms.currency = "CNY";
-        ms.total = dshb::Amount::FromYuan(static_cast<int64_t>(R));
+        ms.total = dshb::Amount::FromYuanDouble(R);
         g_states.OnSample(ms, ms.wallMs);
         g_display.OnSample(g_states.lastGood());
         g_display.SetManual(L, R, k);
@@ -946,7 +946,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 sq.isAvailable = true;
                 sq.amountsOk = true;
                 sq.currency = "CNY";
-                sq.total = dshb::Amount::FromYuan(static_cast<int64_t>(g_seq[idx]));
+                sq.total = dshb::Amount::FromYuanDouble(g_seq[idx]);
                 g_states.OnSample(sq, sq.wallMs);
                 g_display.OnSample(g_states.lastGood());
                 // ★ 余额为 0 需要"连续两次"才确认（防瞬时 0 把界面闪成灰色）。

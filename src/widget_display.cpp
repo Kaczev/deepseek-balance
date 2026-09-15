@@ -172,7 +172,7 @@ void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountT
                 }
             }
             if (!kept) {
-                t.from = Lg;
+                t.from = std::floor(Lg);   // ★ 必须是整数格：否则静止时轮子停在两个数字之间（实测踩过）
                 t.ratePower = 1.0;
             }
             t.D = endGrid - t.from;

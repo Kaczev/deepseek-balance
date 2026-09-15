@@ -23,6 +23,17 @@ struct Amount {
 
     static Amount FromYuan(int64_t yuan) { return Amount{yuan * kUnitsPerYuan}; }
 
+    // ★ 从"元"的浮点数构造，**保留到分**。
+    //   FromYuan 只接受整元：调用方写 FromYuan((int64_t)x) 时小数会被截掉
+    //   （实测踩过：--seq=100.50 被当成 100.00、30.66 被当成 30.00，
+    //    而且因为"静止帧"和"滚完帧"都被同样截断，对比还是通过的——假通过）。
+    static Amount FromYuanDouble(double yuan) {
+        const double cents = (yuan < 0.0 ? -yuan : yuan) * 100.0 + 0.5;
+        const AmountRaw c = static_cast<AmountRaw>(cents);
+        const AmountRaw raw = c * 100;   // 1 分 = 100 raw
+        return Amount{yuan < 0.0 ? -raw : raw};
+    }
+
     double ToDouble() const { return static_cast<double>(raw) / kUnitsPerYuan; }
 
     // 保留两位小数的字符串（用于显示与日志）。不做本地化分隔符。
