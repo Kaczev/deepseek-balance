@@ -53,6 +53,9 @@ double g_rollTo = 0.0;           // --roll-to=N：滚动抓帧的目标金额（
 int g_rollFrames = 0;            // --roll=N：是否导出滚动瞬间（N 只用于日志，步数看 g_rollSteps）
 int g_rollSteps = 0;             // --roll=N：跳变之后推进多少帧（1/60 秒一步）
 bool g_rollLoop = false;         // --roll=loop：每 2 秒来回跳一次，用肉眼反复看滚动
+// --fixed-amount=N: 把余额钉在 N，不再取样、不再变化。0 = 关闭。
+// 用途：做动画时内容必须先站住不动，否则分不清画面变化是动画造成的还是新采样造成的。
+double g_fixedAmount = 0.0;
 dshb::FakeSource g_fake;         // 模拟数据源（B3）
 dshb::StateMachine g_states;     // 连接状态机（B8）
 dshb::DisplayedAmount g_display; // 显示值（C2/C3）：跳变的测量值 -> 连续的显示值
@@ -265,6 +268,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_uiScale = _wtof(argv[i] + 11);
         } else if (wcsncmp(argv[i], L"--roll-to=", 10) == 0) {
             g_rollTo = _wtof(argv[i] + 10);       // 滚动抓帧的目标金额
+        } else if (wcsncmp(argv[i], L"--fixed-amount=", 15) == 0) {
+            g_fixedAmount = _wtof(argv[i] + 15);
         } else if (wcsncmp(argv[i], L"--roll=", 7) == 0) {
             g_rollFrames = 1;                     // 只要出现这个参数就进入滚动抓帧模式
             if (wcscmp(argv[i] + 7, L"loop") == 0) {
@@ -275,6 +280,24 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         }
     }
     if (argv) LocalFree(argv);
+
+    // --fixed-amount：在这里、任何数据源之前喂一次就够。
+    // 状态机与显示值都只认 SAMPLE，所以只钉显示值会让状态机空着（屏幕上变成 --.--），
+    // 只钉状态机又会被后面的滚动设置覆盖（实测落在 99.80）。一个喂入口 + 三处跳过。
+    if (g_fixedAmount > 0.0) {
+        dshb::Sample fs{};
+        fs.wallMs = NowWallMs();
+        fs.monotonicMs = static_cast<int64_t>(GetTickCount64());
+        fs.transportOk = true;
+        fs.httpStatus = 200;
+        fs.isAvailable = true;
+        fs.amountsOk = true;
+        fs.currency = "CNY";
+        fs.total = dshb::Amount::FromYuan(static_cast<int64_t>(g_fixedAmount));
+        g_states.OnSample(fs, fs.wallMs);
+        g_display.OnSample(g_states.lastGood());
+        SelfTestLog(L"[pin] 余额钉在 %.2f（不再取样、不再变化）", g_fixedAmount);
+    }
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
@@ -442,7 +465,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // --roll=N：把"余额跳变之后第 N/60 秒"这一瞬间单独抓出来。
         // 用途是**看滚动动画**——静态单帧看不出数字是怎么滚过去的，
         // 连拍若干张不同 N 的图才能看出过程（动画也是要人眼判的东西）。
-        if (g_rollFrames > 0 || g_rollFrames == 0) {
+        if ((g_rollFrames > 0 || g_rollFrames == 0) && g_fixedAmount <= 0.0) {
             // --roll=N：把"余额跳变之后第 N 帧"这一瞬间单独抓出来。
             // 用途是**看滚动动画**——静态单帧看不出数字是怎么滚过去的，
             // 连拍若干张不同 N 的图才能看出过程（动画也是要人眼判的东西）。
@@ -549,7 +572,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             SelfTestLog(L"[roll] 跳变前=%.2f 跳变后目标=%.2f 推进 %d 帧后显示=%.2f",
                         before, g_display.target(), g_rollSteps, g_display.value());
         } else {
-            for (double vt = 0.0; vt <= t + 0.0001; vt += (1.0 / 60.0)) {
+            for (double vt = 0.0; g_fixedAmount <= 0.0 && vt <= t + 0.0001; vt += (1.0 / 60.0)) {
                 const dshb::Sample s = g_fake.NextIfDue(vt);
                 if (s.wallMs != 0) {
                     g_states.OnSample(s, s.wallMs);
@@ -834,7 +857,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 所以换数据源不需要动它——这正是把这两件事分开的目的。
         {
             const dshb::Sample s = g_fake.NextIfDue(elapsed);
-            if (s.wallMs != 0) {
+            if (s.wallMs != 0 && g_fixedAmount <= 0.0) {   // 钉值时不喂
                 g_states.OnSample(s, s.wallMs);
             }
         }

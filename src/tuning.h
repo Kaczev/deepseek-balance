@@ -55,10 +55,10 @@ inline constexpr float kNumberFixedSizeDip = 45.0f;
 inline constexpr float kTitleSizeDip = 15.0f;
 
 // 币种符号（¥）的字号。它只在"币种已知"时画。
-inline constexpr float kCurrencySizeDip = 18.0f;
+inline constexpr float kCurrencySizeDip = 30.0f;
 
 // 面板底部那行预估文案（例如"约可用 X 天"）。
-inline constexpr float kEstimateSizeDip = 12.0f;
+inline constexpr float kEstimateSizeDip = 15.0f;
 
 // 调试浮层的字号（等宽字体 Consolas）。
 inline constexpr float kDebugSizeDip = 13.0f;
