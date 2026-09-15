@@ -46,3 +46,10 @@ add_executable(tauprobe tools/tauprobe.cpp src/widget_display.cpp src/state_mach
 add_executable(coordprobe tools/coordprobe.cpp src/amount.cpp)
 target_compile_definitions(tauprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(tauprobe PRIVATE src)
+
+# api probe: balance endpoint transport + parsing + error routing, with an offline case
+# runner. Same shape as coordprobe above; winhttp is the only extra library.
+add_executable(apiprobe tools/apiprobe.cpp src/api_client.cpp src/json_min.cpp)
+target_compile_definitions(apiprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_include_directories(apiprobe PRIVATE src)
+target_link_libraries(apiprobe PRIVATE winhttp)
