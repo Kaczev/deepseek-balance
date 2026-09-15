@@ -268,6 +268,13 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_uiScale = _wtof(argv[i] + 11);
         } else if (wcsncmp(argv[i], L"--roll-to=", 10) == 0) {
             g_rollTo = _wtof(argv[i] + 10);       // 滚动抓帧的目标金额
+        } else if (wcsncmp(argv[i], L"--digit-draw=", 13) == 0) {
+            // 0/static = 整串一次画完；1/axis = 逐位按坐标画（修正公式）；2/user = 所有者原式
+            const wchar_t* v = argv[i] + 13;
+            if (wcscmp(v, L"axis") == 0) dshb::g_digitDrawMode = 1;
+            else if (wcscmp(v, L"user") == 0) dshb::g_digitDrawMode = 2;
+            else if (wcscmp(v, L"rest") == 0) dshb::g_digitDrawMode = 3;
+            else dshb::g_digitDrawMode = _wtoi(v);
         } else if (wcsncmp(argv[i], L"--fixed-amount=", 15) == 0) {
             g_fixedAmount = _wtof(argv[i] + 15);
         } else if (wcsncmp(argv[i], L"--roll=", 7) == 0) {

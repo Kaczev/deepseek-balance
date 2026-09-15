@@ -100,6 +100,8 @@ private:
 // 布局诊断开关（临时）：打开后把"算出来画在哪、实际量到多宽"记在内存里。
 // ★ 写文件必须由外面在**绘制结束之后**调用 DumpLayoutProbe 完成：
 //   在绘制路径里做文件 I/O 会让进程崩溃（实测 0xC0000409，试了两次）。
+// 数字绘制模式：0 = 整串一次画完（默认）；1 = 逐位按坐标画（修正公式）；2 = 逐位按所有者的原式画（对照用）
+extern int g_digitDrawMode;
 void SetLayoutProbe(bool on);
 void DumpLayoutProbe();
 

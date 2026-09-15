@@ -4,6 +4,7 @@
 // 鏁板瓧銆佹洸绾裤€侀鑹层€佸績璺抽兘鏄悗闈㈡楠ょ殑浜嬶紙瀹炴柦姝ラ C/D/E锛夈€?
 
 #include "renderer.h"
+#include "roll_axis.h"
 
 #include <d2d1.h>
 #include <d2d1helper.h>
@@ -58,6 +59,10 @@ void LayoutProbe(const char* tag, float a, float b, float c, float d) {
 }
 
 }  // namespace
+
+// 数字绘制模式（见 renderer.h）：定义必须在 dshb 作用域里，不能落进上面的匿名 namespace，
+// 否则 main.cpp 链接时找不到 dshb::g_digitDrawMode。
+int g_digitDrawMode = 0;
 
 void SetLayoutProbe(bool on) {
     g_layoutProbe = on;
@@ -449,6 +454,10 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             const float inkW = MeasureTextWidth(measureText, numFmt2) - inkInsetDip * s;
             const float inkLeft = cx - (inkW + gap + symbolW) * 0.5f - inkInsetDip * s;
 
+            // 两条路二选一：整串一次画完（默认）或逐位按坐标画。
+            // ★ 曾经写成"逐位接在整串之后"，于是同一个字被画了两遍——墨迹位置一模一样，
+            //   但边缘抗锯齿叠加，多出约 600 个像素的差异。必须互斥。
+            if (g_digitDrawMode == 0) {
             for (size_t i = 0; i < target.size(); ++i) {
                 const float chX = (i < charXs.size()) ? (inkLeft + charXs[i]) : inkLeft;
                 IDWriteTextLayout* li = nullptr;
@@ -459,6 +468,79 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                     rt->DrawTextLayout(D2D1::Point2F(chX, numberTop), li, b,
                                        D2D1_DRAW_TEXT_OPTIONS_NONE);
                     li->Release();
+                }
+            }
+            }
+
+            // ---- 逐位按坐标画（--digit-draw=axis / user）----
+            //
+            // 静止位置 = 现在这条静态路径画出来的位置（numberTop）。每位在自己的列上，
+            // 按 offset(d) 上下平移，并用一行高的窗口裁剪；窗口高度就是 h（相邻数字间距），
+            // 所以静止时一个数字能完整装下（实测墨迹 33 px < h 52 px），滚动中才切到两个。
+            if (g_digitDrawMode != 0) {
+                // S = 显示数字，直接取要画的这段文本（不再另传管线，也保证
+                // "坐标里用的 S" 与 "屏幕上写的字" 一定是同一个数）。
+                dshb::Amount shownAmount{};
+                dshb::ParseAmount(f.amountText.c_str(), &shownAmount);
+                const float h = lineH * s;   // 行距（像素）
+                const float inkTopDip = 9.863f * s;   // 单字布局的墨迹顶端内缩（实测）
+                const float inkH = 33.0f * s;         // 墨迹高度（实测）
+                const float winMid = numberTop + inkTopDip + inkH * 0.5f;
+                const float winTop = winMid - h * 0.5f;
+                const float winBottom = winMid + h * 0.5f;
+                for (size_t i = 0; i < target.size(); ++i) {
+                    const float chX = (i < charXs.size()) ? (inkLeft + charXs[i]) : inkLeft;
+                    const int place = dshb::axis::PlaceOfSlot(f.amountText, static_cast<int>(i));
+                    if (place == dshb::axis::kNoPlace) {
+                        // 小数点等非数字字符：原位画出，不参与滚动
+                        IDWriteTextLayout* lp = nullptr;
+                        const wchar_t cp[2] = {target[i], 0};
+                        if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(cp, 1, numFmt2, 256.0f,
+                                                                          128.0f, &lp)) &&
+                            lp) {
+                            rt->DrawTextLayout(D2D1::Point2F(chX, numberTop), lp, b,
+                                               D2D1_DRAW_TEXT_OPTIONS_NONE);
+                            lp->Release();
+                        }
+                        continue;
+                    }
+                    const dshb::axis::PlaceState st = (g_digitDrawMode == 3)
+                                                          ? dshb::axis::StateAtRest(shownAmount, place)
+                                                          : dshb::axis::StateAt(shownAmount, place);
+                    // 只在"这个数字真的会被切到"时才开裁剪层。
+                    // 静止时数字完整落在窗口内，开裁剪只会让 D2D 换一套抗锯齿：墨迹位置
+                    // 一模一样，却有几百个像素的细微差别（实测 593 px）。不开裁剪时静止帧与
+                    // 原来的整串绘制逐像素相同——这条等价关系正是"坐标系没改坏静止画面"的证据。
+                    bool needClip = false;
+                    for (int d2 = 0; d2 < 10 && !needClip; ++d2) {
+                        const double off2 = (g_digitDrawMode == 2)
+                                                ? dshb::axis::OffsetOfUserFormula(st, d2, h)
+                                                : dshb::axis::OffsetOf(st, d2, h);
+                        const float y2 = numberTop + static_cast<float>(off2);
+                        if (y2 + inkTopDip + inkH < winTop || y2 + inkTopDip > winBottom) continue;
+                        if (y2 + inkTopDip < winTop || y2 + inkTopDip + inkH > winBottom) needClip = true;
+                    }
+                    if (needClip) {
+                        rt->PushAxisAlignedClip(D2D1::RectF(chX, winTop, chX + h, winBottom),
+                                                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                    }
+                    for (int digit = 0; digit < 10; ++digit) {
+                        const double off = (g_digitDrawMode == 2)
+                            ? dshb::axis::OffsetOfUserFormula(st, digit, h)
+                            : dshb::axis::OffsetOf(st, digit, h);
+                        const float y = numberTop + static_cast<float>(off);
+                        if (y + inkTopDip + inkH < winTop || y + inkTopDip > winBottom) continue;
+                        IDWriteTextLayout* ld = nullptr;
+                        const wchar_t cd[2] = {static_cast<wchar_t>(L'0' + digit), 0};
+                        if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(cd, 1, numFmt2, 256.0f,
+                                                                          128.0f, &ld)) &&
+                            ld) {
+                            rt->DrawTextLayout(D2D1::Point2F(chX, y), ld, b,
+                                               D2D1_DRAW_TEXT_OPTIONS_NONE);
+                            ld->Release();
+                        }
+                    }
+                    if (needClip) rt->PopAxisAlignedClip();
                 }
             }
         }
