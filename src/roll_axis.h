@@ -145,15 +145,15 @@ inline PlaceState StateAt(const Amount& value, int place) {
 
 // 数字 digit 相对「静止位置」的偏移（单位与 h 相同，y 向下为正）。
 //
-//   offset(d) = ((d − B) mod 10) × h − frac × h
+//   offset(d) = ((d − B) mod 10) × h + frac × h
 //
-//   · d = B   ->  −frac × h        ：显示中的那位，frac 变大就往上走（值变大往上滚）
-//   · d = B+1 ->  +(1−frac) × h    ：从下方补上来的那位
+//   · d = B   ->  +frac × h        ：正在走的那位，往下走（所有者给的偏移：99.50 的个位 +0.50h）
+//   · d = B+1 ->  −(1−frac) × h    ：从**上面**补进来的那位（99.50 的个位 −0.50h）
 //   · 其余数字的偏移至少 h，一行高的窗口里不可能出现，不必画。
 inline double OffsetOf(const PlaceState& st, int digit, double h) {
     int k = (digit - st.base) % 10;
     if (k < 0) k += 10;
-    return static_cast<double>(k) * h - st.frac * h;
+    return static_cast<double>(k) * h + st.frac * h;
 }
 
 // ★ 所有者最初的写法：((B + d) mod 10) × h。**保留在这里只为了能把它渲染出来对照**，

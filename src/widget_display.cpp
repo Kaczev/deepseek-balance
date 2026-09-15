@@ -51,6 +51,7 @@ void DisplayedAmount::OnSample(const Sample& s) {
     //   "变量可以突变，但要套一个显示变量，那个显示变量是逐渐变化、跟着那个突变变量的"。
     //   起点值只记来给自检报告"走了多少比例"，不参与计算。
     rollFromValue_ = hasValue_ ? value_ : yuan;
+    rollStartValue_ = hasValue_ ? value_ : yuan;   // 本次行程的起点金额
 
     target_ = yuan;
     if (!hasValue_) {
@@ -61,7 +62,7 @@ void DisplayedAmount::OnSample(const Sample& s) {
 }
 
 double DisplayedAmount::UpdateValue(double dtSeconds) {
-    if (!hasValue_) { places_.clear(); return 0.0; }
+    if (!hasValue_) { trips_.clear(); places_.clear(); return 0.0; }
     if (frozen_) return value_;   // 手动冻结：显示值不推进
 
     const double diff = target_ - value_;
@@ -94,90 +95,80 @@ double DisplayedAmount::UpdateValue(double dtSeconds) {
 //   而"追赶一个只会 ±1 变的目标"既保住了整数落点，又让过程连续（滚动感）。
 //
 // 文本决定有哪些位次：高位是 0 时文本里根本没有那一位，于是它自动隐藏。
+// 每一位自己的行程：轮子只有在自己这一位要变的时候才动。
+//
+// ★ 为什么不能直接用 S/n 当相位（所有者发现的错）：
+//   S=99.10 时十位 S/10=9.91 -> 相位 0.91，看起来"9 快走完了、0 占满"。
+//   可 99.10 跌到 99.00 时**十位根本不会变**，轮子就该稳稳停在 9 上。
+//   所以相位来自"这一位从哪走到哪"，而不是相对整十的绝对位置。
+//
+// 行程的起止都取整数（floor），并且全体共用同一个进度 phase，所以：
+//   · 静止时 phase==1，每位正好落在自己的数字上（读数清晰）
+//   · 只有自己这一位要变的轮子才动，别的纹丝不动
+//   · 该动的位同时开始、同时结束
 void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountText) {
+    (void)dtSeconds;
     if (!hasValue_ || amountText.empty()) {
+        trips_.clear();
         places_.clear();
         return;
     }
 
-    // 显示值取整成"分"，避免用 double 直接除出漂移。
-    const double cents = std::floor(value_ * 100.0 + 0.5);
-    const double raw = cents * 100.0;          // 单位 1/10000 元，与 Amount::raw 同尺度
+    // 全体共用的进度：从本次行程的起点金额走到目标金额，走了多少。
+    // 用指数平滑的显示值来算，所以"值到哪儿、轮子就到哪儿"，两者永远同步。
+    const double span = rollStartValue_ - target_;
+    double phase = 1.0;
+    if (std::fabs(span) > 1e-9) {
+        phase = (rollStartValue_ - value_) / span;
+        if (phase < 0.0) phase = 0.0;
+        if (phase > 1.0) phase = 1.0;
+    }
+    if (phaseOverride_ >= 0.0) phase = phaseOverride_;
+    if (value_ == target_ && phaseOverride_ < 0.0) phase = 1.0;   // 落定就是 1，保证对准数字
+    const double eased = phase * phase * (3.0 - 2.0 * phase);      // smoothstep：两头慢中间快
+    phaseNow_ = phase;
 
-    std::vector<axis::PlaceCoord> next;
-    next.reserve(places_.size());
+    // 有哪些位次由文本决定（高位是 0 时文本里没有它 -> 自动隐藏）。
+    places_.clear();   // 每次重建都要清空：忘了它同一帧会重复累加（实测 places=12）
+    std::vector<Trip> next;
+    next.reserve(trips_.size());
     for (int slot = 0; slot < static_cast<int>(amountText.size()); ++slot) {
         const int place = axis::PlaceOfSlot(amountText, slot);
         if (place == axis::kNoPlace) continue;
-
         const double denom = std::pow(10.0, static_cast<double>(place) + 4.0);
-        const double tgt = std::floor(raw / denom);      // 整数目标
-
-        double coord = tgt;
-        for (const axis::PlaceCoord& pc : places_) {
-            if (pc.place == place) { coord = pc.coord; break; }
+        double from = 0.0;
+        bool found = false;
+        for (const Trip& t : trips_) {
+            if (t.place == place) { from = t.from; found = true; break; }
         }
-        // 一阶滞后：把"目标一格一格跳"变成"轮子连续滚动"
-        // 手动冻结时直接取目标（k=1）：能停在一个精确状态上读数
-        const double k = frozen_ ? 1.0 : (1.0 - std::exp(-dtSeconds / kPlaceRollTauSeconds));
-        coord += (tgt - coord) * k;
-        // 追到看不见差距就直接落在整数上 —— 静止时每位正好压在自己的数字上
-        if (std::fabs(tgt - coord) < 1e-3) coord = tgt;
+        if (!found) {
+            // 这一位是新出现的：起点取"它上一次该在的位置"，即目标之前的那个金额对应的整数坐标。
+            const double rawFrom = std::floor(rollStartValue_ * 100.0 + 0.5) * 100.0;
+            from = std::floor(rawFrom / denom);
+        }
+        const double rawTo = std::floor(target_ * 100.0 + 0.5) * 100.0;
+        const double to = std::floor(rawTo / denom);
+        Trip t;
+        t.place = place;
+        t.from = from;
+        t.to = to;
+        next.push_back(t);
 
-        next.push_back(axis::PlaceCoord{place, coord});
+        // 这一位的当前坐标：只在自己 from != to 时才动。
+        const double coord = from + (to - from) * eased;
+        places_.push_back(axis::PlaceCoord{place, coord});
     }
-    places_ = next;
+    trips_ = next;
 }
 
-// 对外只有一个 Update：先推进显示值，再让每一位朝自己的整数目标追赶。
-// 这样"值"和"坐标"永远在同一帧里一起走，调用方不需要记得多调一次。
+// 对外只有一个 Update：先推进显示值，再按行程刷新每一位的坐标。
+// 这样"值"和"轮子"永远在同一帧里一起走，调用方不需要记得多调一次。
 double DisplayedAmount::Update(double dtSeconds) {
     const double shown = UpdateValue(dtSeconds);
     AdvancePlaces(dtSeconds, TextToShow());
     return shown;
 }
 
-// 每位坐标的读数表：位次、纵实际坐标、纵显示坐标、显示数字、两格之间、数字0画在何处。
-// 单位是"格"；渲染层会把 h（相邻数字间距）打进日志，乘上去就是像素。
-std::string DisplayedAmount::PlaceReport() const {
-    std::string out;
-    char buf[240];
-    const std::string text = TextToShow();
-    std::snprintf(buf, sizeof(buf), "S(display)=%.4f  frozen=%d  places=%d\n", value_,
-                  frozen_ ? 1 : 0, static_cast<int>(places_.size()));
-    out += buf;
-    out += " place   actualY=S/n     shownY(coord)  digit  frac    digit0_at(grid)\n";
-    for (const axis::PlaceCoord& pc : places_) {
-        const double denom = std::pow(10.0, static_cast<double>(pc.place) + 4.0);
-        const double actual = std::floor(value_ * 100.0 + 0.5) * 100.0 / denom;
-        const int base = static_cast<int>(std::floor(pc.coord));
-        const double frac = pc.coord - static_cast<double>(base);
-        const int digit = ((base % 10) + 10) % 10;
-        // 数字 0 相对参考点的偏移（格）：((0 - B) mod 10) - frac
-        int k0 = (0 - base) % 10;
-        if (k0 < 0) k0 += 10;
-        const double digit0 = static_cast<double>(k0) - frac;
-        std::snprintf(buf, sizeof(buf), " %+4d   %12.4f   %12.4f    %d    %.4f   %+10.4f\n",
-                      pc.place, actual, pc.coord, digit, frac, digit0);
-        out += buf;
-    }
-    (void)text;
-    return out;
-}
-const wchar_t* StatusTextFor(ConnState state) {
-    switch (state) {
-    case ConnState::ColdStart: return L"正在读取";
-    case ConnState::Ok: return L"deepseek 余额";
-    case ConnState::NoKey: return L"未找到 DEEPSEEK_API_KEY";
-    case ConnState::AuthFailed: return L"API Key 无效";
-    case ConnState::Exhausted: return L"余额已耗尽，请充值";
-    case ConnState::RateLimited: return L"请求过于频繁";
-    case ConnState::NetworkError: return L"无法连接";
-    case ConnState::Stale: return L"数据已过期";
-    case ConnState::Unavailable: return L"账户不可用";
-    default: return L"deepseek 余额";
-    }
-}
 
 std::string DisplayedAmount::TextToShow() const {
     if (!hasValue_) return "--.--";
@@ -233,4 +224,46 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     return f;
 }
 
+const wchar_t* StatusTextFor(ConnState state) {
+    switch (state) {
+    case ConnState::ColdStart: return L"正在读取";
+    case ConnState::Ok: return L"deepseek 余额";
+    case ConnState::NoKey: return L"未找到 DEEPSEEK_API_KEY";
+    case ConnState::AuthFailed: return L"API Key 无效";
+    case ConnState::Exhausted: return L"余额已耗尽，请充值";
+    case ConnState::RateLimited: return L"请求过于频繁";
+    case ConnState::NetworkError: return L"无法连接";
+    case ConnState::Stale: return L"数据已过期";
+    case ConnState::Unavailable: return L"账户不可用";
+    default: return L"deepseek 余额";
+    }
+}
+
+std::string DisplayedAmount::PlaceReport() const {
+    std::string out;
+    char buf[240];
+    std::snprintf(buf, sizeof(buf), "value=%.4f target=%.4f start=%.4f frozen=%d places=%d phase=%.3f\n", value_, target_, rollStartValue_,
+                  frozen_ ? 1 : 0, static_cast<int>(places_.size()), phaseNow_);
+    out += buf;
+    out += " place  actualY=S/n      coord     digit  frac     from       to\n";
+    for (const axis::PlaceCoord& pc : places_) {
+        const double denom = std::pow(10.0, static_cast<double>(pc.place) + 4.0);
+        const double actual = std::floor(value_ * 100.0 + 0.5) * 100.0 / denom;
+        const int base = static_cast<int>(std::floor(pc.coord));
+        const double frac = pc.coord - static_cast<double>(base);
+        const int digit = ((base % 10) + 10) % 10;
+        double tfrom = 0.0, tto = 0.0;
+        bool found = false;
+        for (const Trip& tt : trips_) {
+            if (tt.place == pc.place) { tfrom = tt.from; tto = tt.to; found = true; break; }
+        }
+        (void)found;
+        std::snprintf(buf, sizeof(buf), " %+4d  %11.4f  %10.4f    %d  %.4f  %8.2f %8.2f\n",
+                      pc.place, actual, pc.coord, digit, frac, tfrom, tto);
+        out += buf;
+    }
+    return out;
+}
+
 }  // namespace dshb
+

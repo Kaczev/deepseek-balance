@@ -63,6 +63,10 @@ double g_realAmount = 0.0;
 double g_displayAmount = 0.0;
 bool g_noAnim = false;
 bool g_report = false;
+// --crisp：坐标取 S/n 的整数部分（静止读数清晰）。默认用连续坐标（有"两格之间"的中间态）。
+bool g_crisp = false;
+// --phase=P：强行指定行程进度 0..1（>=0 生效），用来停在任意一刻看轮子位置。
+double g_phaseOverride = -1.0;
 dshb::FakeSource g_fake;         // 模拟数据源（B3）
 dshb::StateMachine g_states;     // 连接状态机（B8）
 dshb::DisplayedAmount g_display; // 显示值（C2/C3）：跳变的测量值 -> 连续的显示值
@@ -282,6 +286,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_displayAmount = _wtof(argv[i] + 10);
         } else if (wcscmp(argv[i], L"--no-anim") == 0) {
             g_noAnim = true;
+        } else if (wcsncmp(argv[i], L"--phase=", 8) == 0) {
+            g_phaseOverride = _wtof(argv[i] + 8);   // 停在行程的哪一刻（0..1）
+        } else if (wcscmp(argv[i], L"--crisp") == 0) {
+            g_crisp = true;
         } else if (wcscmp(argv[i], L"--report") == 0) {
             g_report = true;
         } else if (wcsncmp(argv[i], L"--digit-draw=", 13) == 0) {
@@ -341,6 +349,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         g_display.OnSample(g_states.lastGood());
         if (g_noAnim && g_displayAmount <= 0.0) g_display.ForceDisplay(real);
         if (g_displayAmount > 0.0) g_display.ForceDisplay(g_displayAmount);
+        g_display.SetCrisp(g_crisp);
+        if (g_phaseOverride >= 0.0) g_display.SetPhaseOverride(g_phaseOverride);
         SelfTestLog(L"[manual] real=%.4f display(forced)=%.4f frozen=%d", real, g_displayAmount,
                     g_display.frozen() ? 1 : 0);
     }
@@ -626,7 +636,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             SelfTestLog(L"[roll] 跳变前=%.2f 跳变后目标=%.2f 推进 %d 帧后显示=%.2f",
                         before, g_display.target(), g_rollSteps, g_display.value());
         } else {
-            for (double vt = 0.0; g_fixedAmount <= 0.0 && vt <= t + 0.0001; vt += (1.0 / 60.0)) {
+            for (double vt = 0.0; g_fixedAmount <= 0.0 && g_realAmount <= 0.0 && g_displayAmount <= 0.0 && vt <= t + 0.0001; vt += (1.0 / 60.0)) {
                 const dshb::Sample s = g_fake.NextIfDue(vt);
                 if (s.wallMs != 0) {
                     g_states.OnSample(s, s.wallMs);
@@ -985,6 +995,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 显示值推进（C3）：测量值可以跳，显示值必须连续跟随。
         // 手动模式（--real / --display / --fixed-amount）下不喂样本，否则会把冻结的值改掉。
         const bool manualMode = (g_fixedAmount > 0.0 || g_realAmount > 0.0 || g_displayAmount > 0.0);
+        g_display.SetCrisp(g_crisp);
+        if (g_phaseOverride >= 0.0) g_display.SetPhaseOverride(g_phaseOverride);
         if (!manualMode) g_display.OnSample(g_states.lastGood());
         g_display.Update(dt);
 

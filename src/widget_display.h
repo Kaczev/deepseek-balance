@@ -61,22 +61,28 @@ public:
     double snapYuan = 0.005;
 
     // ★ 每一位当前的纵坐标（连续）。渲染层按 place 取值来画数字。
-    //   静止时等于 floor(显示数字 / 10^位次)（整数，读数清晰）；
-    //   滚动中是朝那个整数追赶的中间值（两格之间，于是两位数字一起画）。
+    //   静止时每一位正好落在自己的数字上（整数坐标）；滚动中落在两格之间，
+    //   于是显示位与它旁边那位数字一起画出来。
     const std::vector<axis::PlaceCoord>& places() const { return places_; }
 
-    // ★ 手动设定显示值并**冻结**：不再做指数平滑、不再追赶，坐标直接落在整数上。
+    // ★ 手动设定**显示值**并冻结：不做指数平滑。
     //   用途是排查与调参——必须能停在一个状态上看清楚，否则分不清是机制错还是过程错。
+    //   注意：**只设显示值，不动 target_**。target_ 是"实际数字"，是每一位行程的终点；
+    //   早先这里把 target_ 也设成 yuan，结果行程起点=终点，轮子永远不动（实测踩过）。
     void ForceDisplay(double yuan) {
         value_ = yuan;
-        target_ = yuan;
         rollFromValue_ = yuan;
+        rollStartValue_ = yuan;
         hasValue_ = true;
         frozen_ = true;
+        trips_.clear();
         places_.clear();
     }
 
     bool frozen() const { return frozen_; }
+    void SetCrisp(bool on) { crisp_ = on; }
+    // 强行指定相位 0..1（>=0 生效）：用来停在行程的任意一刻看效果。
+    void SetPhaseOverride(double p) { phaseOverride_ = p; }
 
     // 每位坐标的读数表。单位是"格"，乘 h 就是像素。每行：
     //   位次  纵实际坐标(S÷10^位次)  纵显示坐标  显示数字  两格之间  数字0画在何处
@@ -122,10 +128,23 @@ private:
     double rollFromValue_ = 0.0;
 
     // 每一位的纵坐标（见 places()）
+    // 每一位自己的行程：从 from 走到 to。轮子只在自己这一位要变的时候才动。
+    struct Trip {
+        int place = axis::kNoPlace;
+        double from = 0.0;   // 起点坐标（整数）
+        double to = 0.0;     // 终点坐标（整数）
+    };
+    std::vector<Trip> trips_;
+    // 每一位当前的纵坐标（见 places()），渲染层按它画
     std::vector<axis::PlaceCoord> places_;
+    double rollStartValue_ = 0.0;   // 本次行程的起点金额（用于算进度）
+    double phaseOverride_ = -1.0;   // >=0 时强行指定相位（调参/排查用）
+    double phaseNow_ = 0.0;         // 本帧实际用的相位（读数用）
 
-    // 手动冻结：为真时不推进显示值、不追赶坐标（坐标直接取整数目标）
+    // 手动冻结：为真时不推进显示值
     bool frozen_ = false;
+    // true = 坐标取 S/n 的整数部分（静止读数清晰）；false = 用连续坐标 S/n（有"两格之间"）
+    bool crisp_ = false;
 
     // 按当前显示值刷新每位坐标：目标是 floor(显示值 / 10^位次)，本帧朝它追赶 dt 秒。
     // "有哪些位次"由文本决定——高位是 0 时文本里没有这一位，于是自动隐藏。

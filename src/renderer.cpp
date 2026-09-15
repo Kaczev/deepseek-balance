@@ -518,7 +518,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                 if (haveFrameCoord) {
                     const int base = static_cast<int>(std::floor(frameCoord));
                     const double frac = frameCoord - static_cast<double>(base);
-                    const float yb = numberTop + static_cast<float>(-frac * h);
+                    const float yb = numberTop + static_cast<float>(frac * h);   // 所有者：正在走的那位往下
                     const int lo = ((base % 10) + 10) % 10;
                     const int hi = (lo + 1) % 10;
                     const bool cutLo = (yb + inkTopDip < winTop || yb + inkTopDip + inkH > winBottom);
@@ -528,7 +528,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                     }
                     const int draw2[2] = {lo, hi};
                     for (int k2 = 0; k2 < 2; ++k2) {
-                        const float y = yb + static_cast<float>(k2) * h;
+                        const float y = yb - static_cast<float>(k2) * h;   // hi 从上面补进来
                         if (y + inkTopDip + inkH < winTop || y + inkTopDip > winBottom) continue;
                         IDWriteTextLayout* ld = nullptr;
                         const wchar_t cd[2] = {static_cast<wchar_t>(L'0' + draw2[k2]), 0};
