@@ -60,8 +60,8 @@ void DisplayedAmount::OnSample(const Sample& s) {
     }
 }
 
-double DisplayedAmount::Update(double dtSeconds) {
-    if (!hasValue_) return 0.0;
+double DisplayedAmount::UpdateValue(double dtSeconds) {
+    if (!hasValue_) { places_.clear(); return 0.0; }
 
     const double diff = target_ - value_;
     if (diff == 0.0) return value_;
@@ -70,19 +70,69 @@ double DisplayedAmount::Update(double dtSeconds) {
     // ★ 指数逼近的尾巴在数值上永远不为 0，但在视觉上早就不动了。
     //   这一条把那段"看不见的尾巴"切掉，最后一位数字才能干脆落定；
     //   没有它，数字会在 99.997 这种地方磨蹭很久（实测过）。
-    if (std::fabs(diff) <= snapYuan) {
+    if (std::fabs(diff) <= kDisplaySnapYuan) {
         value_ = target_;
         return value_;
     }
 
     // 连续函数：每帧走掉剩余差距的一部分。步长与 dt 挂钩，所以帧率变化不影响手感。
     // 这是**唯一的**运动规律——没有"某次滚动的时长"这个参数。
-    const double step = 1.0 - std::exp(-dtSeconds / tau);
+    const double step = 1.0 - std::exp(-dtSeconds / kDisplayTauSeconds);
     value_ += diff * step;
 
     // 走完这一步可能刚好越过了截断线，顺手再判一次，避免多花一帧
-    if (std::fabs(target_ - value_) <= snapYuan) value_ = target_;
+    if (std::fabs(target_ - value_) <= kDisplaySnapYuan) value_ = target_;
     return value_;
+}
+
+// 每一位的纵坐标：目标是 floor(显示值 / 10^位次)，本帧朝目标追赶 dt 秒。
+//
+// 为什么不是直接令 coord = 显示值 / 10^位次：
+//   那样静止时高位永远停在两格之间。实测 99.50 的十位会变成 9.95 -> frac 0.95，
+//   整格几乎滚到 0，屏幕上显示成 "09.00"。所以静止必须落在整数上。
+//   而"追赶一个只会 ±1 变的目标"既保住了整数落点，又让过程连续（滚动感）。
+//
+// 文本决定有哪些位次：高位是 0 时文本里根本没有那一位，于是它自动隐藏。
+void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountText) {
+    if (!hasValue_ || amountText.empty()) {
+        places_.clear();
+        return;
+    }
+
+    // 显示值取整成"分"，避免用 double 直接除出漂移。
+    const double cents = std::floor(value_ * 100.0 + 0.5);
+    const double raw = cents * 100.0;          // 单位 1/10000 元，与 Amount::raw 同尺度
+
+    std::vector<axis::PlaceCoord> next;
+    next.reserve(places_.size());
+    for (int slot = 0; slot < static_cast<int>(amountText.size()); ++slot) {
+        const int place = axis::PlaceOfSlot(amountText, slot);
+        if (place == axis::kNoPlace) continue;
+
+        const double denom = std::pow(10.0, static_cast<double>(place) + 4.0);
+        const double tgt = std::floor(raw / denom);      // 整数目标
+
+        double coord = tgt;
+        for (const axis::PlaceCoord& pc : places_) {
+            if (pc.place == place) { coord = pc.coord; break; }
+        }
+        // 一阶滞后：把"目标一格一格跳"变成"轮子连续滚动"
+        const double k = 1.0 - std::exp(-dtSeconds / kPlaceRollTauSeconds);
+        coord += (tgt - coord) * k;
+        // 追到看不见差距就直接落在整数上 —— 静止时每位正好压在自己的数字上
+        if (std::fabs(tgt - coord) < 1e-3) coord = tgt;
+
+        next.push_back(axis::PlaceCoord{place, coord});
+    }
+    places_ = next;
+}
+
+// 对外只有一个 Update：先推进显示值，再让每一位朝自己的整数目标追赶。
+// 这样"值"和"坐标"永远在同一帧里一起走，调用方不需要记得多调一次。
+double DisplayedAmount::Update(double dtSeconds) {
+    const double shown = UpdateValue(dtSeconds);
+    AdvancePlaces(dtSeconds, TextToShow());
+    return shown;
 }
 
 const wchar_t* StatusTextFor(ConnState state) {
@@ -125,6 +175,9 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
         f.amountText = "--.--";                // 占位符，不是 0.00
         f.currencySymbol = L"";
     }
+
+    // 每一位的纵坐标交给渲染层。空则渲染层退回整串绘制。
+    f.places = amount.places();
 
     // 清零预估（占位）：**只放文案，不接速率计算**。
     //

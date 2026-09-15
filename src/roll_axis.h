@@ -48,6 +48,14 @@ namespace axis {
 // 不是数字字符的槽位（小数点）用这个值表示"没有位次"。
 inline constexpr int kNoPlace = 99;
 
+// 一个位次的当前纵坐标，交给渲染层用。
+// coord 是**连续**的：静止时等于整数（读数清晰），滚动中落在两格之间（有滚动感）。
+struct PlaceCoord {
+    int place = kNoPlace;
+    double coord = 0.0;
+};
+
+
 // 小数点在文本里的下标（"100.00" 是 3）。找不到时返回 -1。
 inline int DotSlotOf(const std::string& amountText) {
     const size_t dot = amountText.find('.');

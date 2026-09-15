@@ -11,7 +11,9 @@
 
 #pragma once
 
+#include "roll_axis.h"
 #include "state_machine.h"
+#include "tuning.h"
 
 #include <cmath>     // std::fabs（rolling() 用）
 #include <cstdint>
@@ -58,6 +60,11 @@ public:
     // 这条截断把那截"看不见的尾巴"切掉，最后一位数字才能干脆落定。
     double snapYuan = 0.005;
 
+    // ★ 每一位当前的纵坐标（连续）。渲染层按 place 取值来画数字。
+    //   静止时等于 floor(显示数字 / 10^位次)（整数，读数清晰）；
+    //   滚动中是朝那个整数追赶的中间值（两格之间，于是两位数字一起画）。
+    const std::vector<axis::PlaceCoord>& places() const { return places_; }
+
     // 收到新样本。做一次确认，避免"瞬间 0"把界面闪成灰色。
     void OnSample(const Sample& s);
 
@@ -96,6 +103,14 @@ private:
 
     // 这一段的起点值，用于自检报告"走了多少比例"
     double rollFromValue_ = 0.0;
+
+    // 每一位的纵坐标（见 places()）
+    std::vector<axis::PlaceCoord> places_;
+
+    // 按当前显示值刷新每位坐标：目标是 floor(显示值 / 10^位次)，本帧朝它追赶 dt 秒。
+    // "有哪些位次"由文本决定——高位是 0 时文本里没有这一位，于是自动隐藏。
+    void AdvancePlaces(double dtSeconds, const std::string& amountText);
+    double UpdateValue(double dtSeconds);   // Update 的内核（只推进显示值）
 };
 
 
@@ -106,6 +121,8 @@ struct WidgetFrame {
     const wchar_t* currencySymbol = L"";   // 空串 = 币种未知，**不默认 ¥**
     const wchar_t* statusText = L"";       // 标题行/状态文案
     std::string zeroTimeText;       // 清零预估（C9 填；现在留占位）
+    // 每一位当前的纵坐标（渲染层按它画数字）。空 = 渲染层退回整串绘制。
+    std::vector<axis::PlaceCoord> places;
 };
 
 // 把状态 + 显示值组装成一帧。放在这里而不是渲染层，是为了让"显示什么"

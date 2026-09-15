@@ -457,7 +457,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             // 两条路二选一：整串一次画完（默认）或逐位按坐标画。
             // ★ 曾经写成"逐位接在整串之后"，于是同一个字被画了两遍——墨迹位置一模一样，
             //   但边缘抗锯齿叠加，多出约 600 个像素的差异。必须互斥。
-            if (g_digitDrawMode == 0) {
+            if (g_digitDrawMode == 0 && f.places.empty()) {
             for (size_t i = 0; i < target.size(); ++i) {
                 const float chX = (i < charXs.size()) ? (inkLeft + charXs[i]) : inkLeft;
                 IDWriteTextLayout* li = nullptr;
@@ -477,7 +477,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             // 静止位置 = 现在这条静态路径画出来的位置（numberTop）。每位在自己的列上，
             // 按 offset(d) 上下平移，并用一行高的窗口裁剪；窗口高度就是 h（相邻数字间距），
             // 所以静止时一个数字能完整装下（实测墨迹 33 px < h 52 px），滚动中才切到两个。
-            if (g_digitDrawMode != 0) {
+            if (!f.places.empty() || g_digitDrawMode != 0) {
                 // S = 显示数字，直接取要画的这段文本（不再另传管线，也保证
                 // "坐标里用的 S" 与 "屏幕上写的字" 一定是同一个数）。
                 dshb::Amount shownAmount{};
@@ -504,7 +504,42 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                         }
                         continue;
                     }
-                    const dshb::axis::PlaceState st = (g_digitDrawMode == 3)
+                    // 坐标来源优先级：1) 帧里带的每位坐标（显示层算好的，静止=整数、滚动中=连续）
+                //                  2) 没有时按 --digit-draw 的口径现算（对照用）
+                double frameCoord = 0.0;
+                bool haveFrameCoord = false;
+                for (const dshb::axis::PlaceCoord& pc : f.places) {
+                    if (pc.place == place) { frameCoord = pc.coord; haveFrameCoord = true; break; }
+                }
+                if (haveFrameCoord) {
+                    const int base = static_cast<int>(std::floor(frameCoord));
+                    const double frac = frameCoord - static_cast<double>(base);
+                    const float yb = numberTop + static_cast<float>(-frac * h);
+                    const int lo = ((base % 10) + 10) % 10;
+                    const int hi = (lo + 1) % 10;
+                    const bool cutLo = (yb + inkTopDip < winTop || yb + inkTopDip + inkH > winBottom);
+                    if (cutLo) {
+                        rt->PushAxisAlignedClip(D2D1::RectF(chX, winTop, chX + h, winBottom),
+                                                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                    }
+                    const int draw2[2] = {lo, hi};
+                    for (int k2 = 0; k2 < 2; ++k2) {
+                        const float y = yb + static_cast<float>(k2) * h;
+                        if (y + inkTopDip + inkH < winTop || y + inkTopDip > winBottom) continue;
+                        IDWriteTextLayout* ld = nullptr;
+                        const wchar_t cd[2] = {static_cast<wchar_t>(L'0' + draw2[k2]), 0};
+                        if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(cd, 1, numFmt2, 256.0f,
+                                                                          128.0f, &ld)) &&
+                            ld) {
+                            rt->DrawTextLayout(D2D1::Point2F(chX, y), ld, b,
+                                               D2D1_DRAW_TEXT_OPTIONS_NONE);
+                            ld->Release();
+                        }
+                    }
+                    if (cutLo) rt->PopAxisAlignedClip();
+                    continue;
+                }
+                const dshb::axis::PlaceState st = (g_digitDrawMode == 3)
                                                           ? dshb::axis::StateAtRest(shownAmount, place)
                                                           : dshb::axis::StateAt(shownAmount, place);
                     // 只在"这个数字真的会被切到"时才开裁剪层。

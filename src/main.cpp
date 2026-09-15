@@ -590,6 +590,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             }
         }
 
+        // 渲染前先让显示层刷一次每位坐标（dt=0：追赶系数为 0，坐标直接落在整数目标上）。
+        // 不刷的话 places 是空的，渲染层会退回整串绘制——静止画面看起来一样，
+        // 但滚动时就没有逐位坐标可用了。实测：漏掉这一步时 99.50 的坐标是空的。
+        g_display.Update(0.0);
         // 组装正文（和真实运行时同一条路径），这样导出的图就是屏幕上会看到的图
         {
             const dshb::ConnState st = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
