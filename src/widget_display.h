@@ -98,7 +98,7 @@ public:
     double target() const { return target_; }
 
     // 是否正在追一个还没到位的目标（渲染层据此决定轮子要不要转）
-    bool rolling() const { return hasValue_ && std::fabs(target_ - value_) > 0.0; }
+    bool rolling() const { return hasValue_ && std::fabs(std::fabs(target_) - value_) > 0.0; }   // value_ 是幅值
 
     // 距离目标的剩余比例，仅用于日志与自检（渲染不再需要）
     double remaining() const {

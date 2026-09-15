@@ -141,8 +141,11 @@ void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountT
         return;
     }
 
-    const double rawL = std::floor(lastReal_ * 100.0 + 0.5) * 100.0;
-    const double rawR = std::floor(target_ * 100.0 + 0.5) * 100.0;
+    // ★ 欠款（负余额）：动画一律用**绝对值**。不用负值参与动画的原因很实在：
+    //   "变小就往下滚"在 0 处会走到 9（磁带环绕），0.00 -> -1.00 会显示成 9.00。
+    //   取绝对值后，-1.00 与 +1.00 的轮子行为完全一样，符号交给文本层。
+    const double rawL = std::fabs(std::floor(lastReal_ * 100.0 + 0.5) * 100.0);
+    const double rawR = std::fabs(std::floor(target_ * 100.0 + 0.5) * 100.0);
 
     // 重建"有哪些位次"：终点按公式算，起点取这一位的当前位置（连续性）。
     if (tripsDirty_) {
@@ -245,8 +248,12 @@ std::string DisplayedAmount::TextToShow() const {
     // 两种情形其实是同一个式子。这样"内容"与"竖直偏移"永远不同时变。
     // ★ 文本用**当前动画值**（不再冻结在目标上）：列数随滚动增减，于是高位列
     //   会随滚动出现/消失。字形是按每位坐标画的，文本只负责布局，所以安全。
-    const double shown = value_;
-    return Amount{static_cast<AmountRaw>(std::llround(shown * kUnitsPerYuan))}.ToString2();
+    const double shown = value_;   // value_ 是**幅值**（动画走绝对值）
+    std::string s = Amount{static_cast<AmountRaw>(std::llround(shown * kUnitsPerYuan))}.ToString2();
+    // 负号来自**目标值**而不是动画值：否则滚动值穿过 0 的一瞬负号会闪。
+    // 幅值本来就为 0 时不加（不出现 "-0.00"）。负号是布局字符，不参与滚动。
+    if (target_ < 0.0 && s != "0.00") s.insert(s.begin(), '-');
+    return s;
 }
 
 WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, bool currencyKnown,

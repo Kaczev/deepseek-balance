@@ -59,6 +59,9 @@ double g_fixedAmount = 0.0;
 // --real=N：手动设定**实际数字**（采样值）。--display=M：手动设定**显示数字**并冻结。
 // --no-anim：显示数字不做指数平滑（跟着实际数字立刻到位）。
 // 三者都是为了"停在一个状态上看清楚"，不做自动动画。
+bool g_realGiven = false;
+bool g_lastGiven = false;
+bool g_fixedGiven = false;
 double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
 double g_displayAmount = 0.0;   // 已弃用（所有者改为 --last）
 double g_lastAmount = -1.0;   // --last=L（-1 = 未给）
@@ -287,6 +290,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
         } else if (wcsncmp(argv[i], L"--real=", 7) == 0) {
             g_realAmount = _wtof(argv[i] + 7);
+            g_realGiven = true;
         } else if (wcsncmp(argv[i], L"--seq=", 6) == 0) {
             const wchar_t* csv = argv[i] + 6;
             double v = 0.0;
@@ -300,6 +304,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_seqStep = _wtof(argv[i] + 7);
         } else if (wcsncmp(argv[i], L"--last=", 7) == 0) {
             g_lastAmount = _wtof(argv[i] + 7);
+            g_lastGiven = true;
         } else if (wcsncmp(argv[i], L"--frames=", 9) == 0) {
             g_frames = _wtoi(argv[i] + 9);
         } else if (wcsncmp(argv[i], L"--display=", 10) == 0) {
@@ -319,6 +324,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             else dshb::g_digitDrawMode = _wtoi(v);
         } else if (wcsncmp(argv[i], L"--fixed-amount=", 15) == 0) {
             g_fixedAmount = _wtof(argv[i] + 15);
+            g_fixedGiven = true;
         } else if (wcsncmp(argv[i], L"--roll=", 7) == 0) {
             g_rollFrames = 1;                     // 只要出现这个参数就进入滚动抓帧模式
             if (wcscmp(argv[i] + 7, L"loop") == 0) {
@@ -333,7 +339,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     // --fixed-amount：在这里、任何数据源之前喂一次就够。
     // 状态机与显示值都只认 SAMPLE，所以只钉显示值会让状态机空着（屏幕上变成 --.--），
     // 只钉状态机又会被后面的滚动设置覆盖（实测落在 99.80）。一个喂入口 + 三处跳过。
-    if (g_fixedAmount > 0.0) {
+    if (g_fixedGiven) {
         dshb::Sample fs{};
         fs.wallMs = NowWallMs();
         fs.monotonicMs = static_cast<int64_t>(GetTickCount64());
@@ -353,10 +359,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     //   --last=L    上次的实际数字（不给则等于 R，于是 D=0、轮子不动）
     //   --frames=k  已经运算了多少帧（不给则 0，即停在行程起点）
     // 位置完全由这三个量决定：coord_n = floor(L/n) + D_n × (1 − rate^k)
-    if (g_realAmount >= 0.0 || g_lastAmount >= 0.0 || g_frames >= 0) {
-        const double R = (g_realAmount >= 0.0) ? g_realAmount
-                                               : ((g_lastAmount >= 0.0) ? g_lastAmount : 0.0);
-        const double L = (g_lastAmount >= 0.0) ? g_lastAmount : R;
+    if (g_realGiven || g_lastGiven || g_frames >= 0) {
+        const double R = (g_realGiven) ? g_realAmount
+                                               : ((g_lastGiven) ? g_lastAmount : 0.0);
+        const double L = (g_lastGiven) ? g_lastAmount : R;
         const int k = (g_frames >= 0) ? g_frames : 0;
         dshb::Sample ms{};
         ms.wallMs = NowWallMs();
@@ -539,7 +545,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // --roll=N：把"余额跳变之后第 N/60 秒"这一瞬间单独抓出来。
         // 用途是**看滚动动画**——静态单帧看不出数字是怎么滚过去的，
         // 连拍若干张不同 N 的图才能看出过程（动画也是要人眼判的东西）。
-        if ((g_rollFrames > 0 || g_rollFrames == 0) && g_fixedAmount <= 0.0 && g_realAmount < 0.0 && g_lastAmount < 0.0 && g_frames < 0) {
+        if ((g_rollFrames > 0 || g_rollFrames == 0) && !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0) {
             // --roll=N：把"余额跳变之后第 N 帧"这一瞬间单独抓出来。
             // 用途是**看滚动动画**——静态单帧看不出数字是怎么滚过去的，
             // 连拍若干张不同 N 的图才能看出过程（动画也是要人眼判的东西）。
@@ -646,7 +652,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             SelfTestLog(L"[roll] 跳变前=%.2f 跳变后目标=%.2f 推进 %d 帧后显示=%.2f",
                         before, g_display.target(), g_rollSteps, g_display.value());
         } else {
-            for (double vt = 0.0; g_fixedAmount <= 0.0 && g_realAmount < 0.0 && g_lastAmount < 0.0 && g_frames < 0 && vt <= t + 0.0001; vt += (1.0 / 60.0)) {
+            for (double vt = 0.0; !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0 && vt <= t + 0.0001; vt += (1.0 / 60.0)) {
                 const dshb::Sample s = g_fake.NextIfDue(vt);
                 if (s.wallMs != 0) {
                     g_states.OnSample(s, s.wallMs);
@@ -964,7 +970,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 所以换数据源不需要动它——这正是把这两件事分开的目的。
         {
             const dshb::Sample s = g_fake.NextIfDue(elapsed);
-            if (s.wallMs != 0 && g_fixedAmount <= 0.0 && g_realAmount < 0.0 && g_lastAmount < 0.0 && g_frames < 0 && g_seq.empty()) {   // 钉值时不喂
+            if (s.wallMs != 0 && !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0 && g_seq.empty()) {   // 钉值时不喂
                 g_states.OnSample(s, s.wallMs);
             }
         }
@@ -1026,7 +1032,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
         // 显示值推进（C3）：测量值可以跳，显示值必须连续跟随。
         // 手动模式（--real / --display / --fixed-amount）下不喂样本，否则会把冻结的值改掉。
-        const bool manualMode = (g_fixedAmount > 0.0 || g_realAmount >= 0.0 || g_lastAmount >= 0.0 || g_frames >= 0 || !g_seq.empty());
+        const bool manualMode = (g_fixedGiven || g_realGiven || g_lastGiven || g_frames >= 0 || !g_seq.empty());
         g_display.SetCrisp(g_crisp);
         if (g_phaseOverride >= 0.0) g_display.SetPhaseOverride(g_phaseOverride);
         if (!manualMode) g_display.OnSample(g_states.lastGood());
