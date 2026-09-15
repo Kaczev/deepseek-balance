@@ -62,6 +62,7 @@ void DisplayedAmount::OnSample(const Sample& s) {
 
 double DisplayedAmount::UpdateValue(double dtSeconds) {
     if (!hasValue_) { places_.clear(); return 0.0; }
+    if (frozen_) return value_;   // 手动冻结：显示值不推进
 
     const double diff = target_ - value_;
     if (diff == 0.0) return value_;
@@ -117,7 +118,8 @@ void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountT
             if (pc.place == place) { coord = pc.coord; break; }
         }
         // 一阶滞后：把"目标一格一格跳"变成"轮子连续滚动"
-        const double k = 1.0 - std::exp(-dtSeconds / kPlaceRollTauSeconds);
+        // 手动冻结时直接取目标（k=1）：能停在一个精确状态上读数
+        const double k = frozen_ ? 1.0 : (1.0 - std::exp(-dtSeconds / kPlaceRollTauSeconds));
         coord += (tgt - coord) * k;
         // 追到看不见差距就直接落在整数上 —— 静止时每位正好压在自己的数字上
         if (std::fabs(tgt - coord) < 1e-3) coord = tgt;
@@ -135,6 +137,33 @@ double DisplayedAmount::Update(double dtSeconds) {
     return shown;
 }
 
+// 每位坐标的读数表：位次、纵实际坐标、纵显示坐标、显示数字、两格之间、数字0画在何处。
+// 单位是"格"；渲染层会把 h（相邻数字间距）打进日志，乘上去就是像素。
+std::string DisplayedAmount::PlaceReport() const {
+    std::string out;
+    char buf[240];
+    const std::string text = TextToShow();
+    std::snprintf(buf, sizeof(buf), "S(display)=%.4f  frozen=%d  places=%d\n", value_,
+                  frozen_ ? 1 : 0, static_cast<int>(places_.size()));
+    out += buf;
+    out += " place   actualY=S/n     shownY(coord)  digit  frac    digit0_at(grid)\n";
+    for (const axis::PlaceCoord& pc : places_) {
+        const double denom = std::pow(10.0, static_cast<double>(pc.place) + 4.0);
+        const double actual = std::floor(value_ * 100.0 + 0.5) * 100.0 / denom;
+        const int base = static_cast<int>(std::floor(pc.coord));
+        const double frac = pc.coord - static_cast<double>(base);
+        const int digit = ((base % 10) + 10) % 10;
+        // 数字 0 相对参考点的偏移（格）：((0 - B) mod 10) - frac
+        int k0 = (0 - base) % 10;
+        if (k0 < 0) k0 += 10;
+        const double digit0 = static_cast<double>(k0) - frac;
+        std::snprintf(buf, sizeof(buf), " %+4d   %12.4f   %12.4f    %d    %.4f   %+10.4f\n",
+                      pc.place, actual, pc.coord, digit, frac, digit0);
+        out += buf;
+    }
+    (void)text;
+    return out;
+}
 const wchar_t* StatusTextFor(ConnState state) {
     switch (state) {
     case ConnState::ColdStart: return L"正在读取";

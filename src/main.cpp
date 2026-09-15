@@ -56,6 +56,13 @@ bool g_rollLoop = false;         // --roll=loop：每 2 秒来回跳一次，用
 // --fixed-amount=N: 把余额钉在 N，不再取样、不再变化。0 = 关闭。
 // 用途：做动画时内容必须先站住不动，否则分不清画面变化是动画造成的还是新采样造成的。
 double g_fixedAmount = 0.0;
+// --real=N：手动设定**实际数字**（采样值）。--display=M：手动设定**显示数字**并冻结。
+// --no-anim：显示数字不做指数平滑（跟着实际数字立刻到位）。
+// 三者都是为了"停在一个状态上看清楚"，不做自动动画。
+double g_realAmount = 0.0;
+double g_displayAmount = 0.0;
+bool g_noAnim = false;
+bool g_report = false;
 dshb::FakeSource g_fake;         // 模拟数据源（B3）
 dshb::StateMachine g_states;     // 连接状态机（B8）
 dshb::DisplayedAmount g_display; // 显示值（C2/C3）：跳变的测量值 -> 连续的显示值
@@ -268,6 +275,15 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_uiScale = _wtof(argv[i] + 11);
         } else if (wcsncmp(argv[i], L"--roll-to=", 10) == 0) {
             g_rollTo = _wtof(argv[i] + 10);       // 滚动抓帧的目标金额
+
+        } else if (wcsncmp(argv[i], L"--real=", 7) == 0) {
+            g_realAmount = _wtof(argv[i] + 7);
+        } else if (wcsncmp(argv[i], L"--display=", 10) == 0) {
+            g_displayAmount = _wtof(argv[i] + 10);
+        } else if (wcscmp(argv[i], L"--no-anim") == 0) {
+            g_noAnim = true;
+        } else if (wcscmp(argv[i], L"--report") == 0) {
+            g_report = true;
         } else if (wcsncmp(argv[i], L"--digit-draw=", 13) == 0) {
             // 0/static = 整串一次画完；1/axis = 逐位按坐标画（修正公式）；2/user = 所有者原式
             const wchar_t* v = argv[i] + 13;
@@ -304,6 +320,29 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         g_states.OnSample(fs, fs.wallMs);
         g_display.OnSample(g_states.lastGood());
         SelfTestLog(L"[pin] 余额钉在 %.2f（不再取样、不再变化）", g_fixedAmount);
+    }
+
+    // 手动设定实际数字 / 显示数字（不做任何自动动画）。
+    //   --real=N    ：实际数字 = N（采样值）；显示数字按它走。
+    //   --display=M ：显示数字 = M 并**冻结**——用来停在一个状态上核对各位坐标。
+    //   --no-anim   ：显示数字不做指数平滑，跟着实际数字立刻到位。
+    if (g_realAmount > 0.0 || g_displayAmount > 0.0) {
+        dshb::Sample ms{};
+        ms.wallMs = NowWallMs();
+        ms.monotonicMs = static_cast<int64_t>(GetTickCount64());
+        ms.transportOk = true;
+        ms.httpStatus = 200;
+        ms.isAvailable = true;
+        ms.amountsOk = true;
+        ms.currency = "CNY";
+        const double real = (g_realAmount > 0.0) ? g_realAmount : g_displayAmount;
+        ms.total = dshb::Amount::FromYuan(static_cast<int64_t>(real));
+        g_states.OnSample(ms, ms.wallMs);
+        g_display.OnSample(g_states.lastGood());
+        if (g_noAnim && g_displayAmount <= 0.0) g_display.ForceDisplay(real);
+        if (g_displayAmount > 0.0) g_display.ForceDisplay(g_displayAmount);
+        SelfTestLog(L"[manual] real=%.4f display(forced)=%.4f frozen=%d", real, g_displayAmount,
+                    g_display.frozen() ? 1 : 0);
     }
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -472,7 +511,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // --roll=N：把"余额跳变之后第 N/60 秒"这一瞬间单独抓出来。
         // 用途是**看滚动动画**——静态单帧看不出数字是怎么滚过去的，
         // 连拍若干张不同 N 的图才能看出过程（动画也是要人眼判的东西）。
-        if ((g_rollFrames > 0 || g_rollFrames == 0) && g_fixedAmount <= 0.0) {
+        if ((g_rollFrames > 0 || g_rollFrames == 0) && g_fixedAmount <= 0.0 && g_realAmount <= 0.0 && g_displayAmount <= 0.0) {
             // --roll=N：把"余额跳变之后第 N 帧"这一瞬间单独抓出来。
             // 用途是**看滚动动画**——静态单帧看不出数字是怎么滚过去的，
             // 连拍若干张不同 N 的图才能看出过程（动画也是要人眼判的东西）。
@@ -528,6 +567,14 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                         g_display.OnSample(g_states.lastGood());
                     }
                     g_display.Update(dt);
+        if (g_report) {
+            static int tick = 0;
+            if (++tick >= 60) {
+                tick = 0;
+                const std::string rep = g_display.PlaceReport();
+                SelfTestLog(L"[axis] h=%.4f DIP\n%hs", dshb::LastLinePitchDip(), rep.c_str());
+            }
+        }
 
                     const dshb::ConnState st = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
                     const bool currencyKnown =
@@ -621,6 +668,13 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         }
 
         const bool ok = renderer.ExportFrame(g_exportPath, t);
+
+        // --report：读数写在**导出之后**——h（相邻数字间距）是绘制时量到的，
+        // 渲染前读它只会得到 0（实测 h=0.0000）。
+        if (g_report) {
+            const std::string rep = g_display.PlaceReport();
+            SelfTestLog(L"[axis] h=%.4f DIP\n%hs", dshb::LastLinePitchDip(), rep.c_str());
+        }
         // 诊断写文件放在绘制**之后**：绘制路径里做 I/O 会让进程崩（实测）
         dshb::DumpLayoutProbe();
         SelfTestLog(L"[export] %ls 帧=%d 时刻=%.3fs 结果=%ls 画布=%dx%d",
@@ -868,7 +922,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 所以换数据源不需要动它——这正是把这两件事分开的目的。
         {
             const dshb::Sample s = g_fake.NextIfDue(elapsed);
-            if (s.wallMs != 0 && g_fixedAmount <= 0.0) {   // 钉值时不喂
+            if (s.wallMs != 0 && g_fixedAmount <= 0.0 && g_realAmount <= 0.0 && g_displayAmount <= 0.0) {   // 钉值时不喂
                 g_states.OnSample(s, s.wallMs);
             }
         }
@@ -928,8 +982,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             renderer.SetDebugText(line);
         }
 
-        // 显示值推进（C3）：测量值可以跳，显示值必须连续跟随
-        g_display.OnSample(g_states.lastGood());
+        // 显示值推进（C3）：测量值可以跳，显示值必须连续跟随。
+        // 手动模式（--real / --display / --fixed-amount）下不喂样本，否则会把冻结的值改掉。
+        const bool manualMode = (g_fixedAmount > 0.0 || g_realAmount > 0.0 || g_displayAmount > 0.0);
+        if (!manualMode) g_display.OnSample(g_states.lastGood());
         g_display.Update(dt);
 
         // 组装这一帧要显示的东西，交给渲染层。渲染层不关心余额是怎么来的。
@@ -945,6 +1001,19 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         QueryPerformanceFrequency(&freq);
         QueryPerformanceCounter(&a);
         lastHr = renderer.RenderFrame(elapsed);
+        // --report：把每位坐标的读数同时写进日志并**画在窗口上**，贴在该帧渲染之后——
+        // h（相邻数字间距）是绘制时量到的，渲染前读它只会得到 0（实测 h=0.0000）。
+        if (g_report) {
+            const std::string rep = g_display.PlaceReport();
+            std::string full = "h=" + std::to_string(dshb::LastLinePitchDip()) + " DIP\n" + rep;
+            std::wstring w(full.begin(), full.end());
+            renderer.SetDebugText(w);
+            static int tick = 0;
+            if (++tick >= 60) {
+                tick = 0;
+                SelfTestLog(L"[axis] h=%.4f DIP\n%hs", dshb::LastLinePitchDip(), rep.c_str());
+            }
+        }
         QueryPerformanceCounter(&b);
         const double ms = static_cast<double>(b.QuadPart - a.QuadPart) * 1000.0 /
                           static_cast<double>(freq.QuadPart);

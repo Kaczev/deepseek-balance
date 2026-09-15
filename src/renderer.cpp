@@ -63,6 +63,8 @@ void LayoutProbe(const char* tag, float a, float b, float c, float d) {
 // 数字绘制模式（见 renderer.h）：定义必须在 dshb 作用域里，不能落进上面的匿名 namespace，
 // 否则 main.cpp 链接时找不到 dshb::g_digitDrawMode。
 int g_digitDrawMode = 0;
+namespace { float g_lastLinePitch = 0.0f; }
+float LastLinePitchDip() { return g_lastLinePitch; }
 
 void SetLayoutProbe(bool on) {
     g_layoutProbe = on;
@@ -430,7 +432,9 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             // 相邻两个数字的垂直间距 h：**必须问排版引擎**，不能用字号顶替。
             // 曾经拿字号(40)当行高，结果是数字被裁半截、滚动结束时跳一行——都是这个值错了。
             float lineH = 0.0f;
+            g_lastLinePitch = 0.0f;   // 见 LastLinePitchDip
             MeasureCharOrigins(measureText, numFmt2, &charXs, &lineH);
+            g_lastLinePitch = lineH;
             LayoutProbe("pitch", lineH, 0, 0, 0);
             const std::wstring& target = measureText;
             size_t firstDigit = 0;

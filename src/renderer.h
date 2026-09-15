@@ -102,6 +102,8 @@ private:
 //   在绘制路径里做文件 I/O 会让进程崩溃（实测 0xC0000409，试了两次）。
 // 数字绘制模式：0 = 整串一次画完（默认）；1 = 逐位按坐标画（修正公式）；2 = 逐位按所有者的原式画（对照用）
 extern int g_digitDrawMode;
+// 最近一次绘制时量到的行距 h（相邻两个数字的间距，DIP）。0 = 还没画过。
+float LastLinePitchDip();
 void SetLayoutProbe(bool on);
 void DumpLayoutProbe();
 

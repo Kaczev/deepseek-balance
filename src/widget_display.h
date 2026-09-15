@@ -65,6 +65,23 @@ public:
     //   滚动中是朝那个整数追赶的中间值（两格之间，于是两位数字一起画）。
     const std::vector<axis::PlaceCoord>& places() const { return places_; }
 
+    // ★ 手动设定显示值并**冻结**：不再做指数平滑、不再追赶，坐标直接落在整数上。
+    //   用途是排查与调参——必须能停在一个状态上看清楚，否则分不清是机制错还是过程错。
+    void ForceDisplay(double yuan) {
+        value_ = yuan;
+        target_ = yuan;
+        rollFromValue_ = yuan;
+        hasValue_ = true;
+        frozen_ = true;
+        places_.clear();
+    }
+
+    bool frozen() const { return frozen_; }
+
+    // 每位坐标的读数表。单位是"格"，乘 h 就是像素。每行：
+    //   位次  纵实际坐标(S÷10^位次)  纵显示坐标  显示数字  两格之间  数字0画在何处
+    // 数字0那一列是所有者问的：它相对参考点的偏移，能直接看出"这一位偏了多少"。
+    std::string PlaceReport() const;
     // 收到新样本。做一次确认，避免"瞬间 0"把界面闪成灰色。
     void OnSample(const Sample& s);
 
@@ -106,6 +123,9 @@ private:
 
     // 每一位的纵坐标（见 places()）
     std::vector<axis::PlaceCoord> places_;
+
+    // 手动冻结：为真时不推进显示值、不追赶坐标（坐标直接取整数目标）
+    bool frozen_ = false;
 
     // 按当前显示值刷新每位坐标：目标是 floor(显示值 / 10^位次)，本帧朝它追赶 dt 秒。
     // "有哪些位次"由文本决定——高位是 0 时文本里没有这一位，于是自动隐藏。
