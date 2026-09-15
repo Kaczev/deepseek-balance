@@ -35,6 +35,7 @@ struct LayoutProbeData {
     bool filled = false;
     float centerX = 0, symbolW = 0, digitsW = 0, left = 0;
     float boxLeft = 0, boxTop = 0, numberTop = 0, boxRight = 0;
+    float lineH = 0;   // 相邻两个数字的垂直间距 h（排版引擎给的 line advance）
 };
 LayoutProbeData g_probe;
 
@@ -45,6 +46,8 @@ void LayoutProbe(const char* tag, float a, float b, float c, float d) {
         g_probe.symbolW = b;
         g_probe.digitsW = c;
         g_probe.left = d;
+    } else if (std::strcmp(tag, "pitch") == 0) {
+        g_probe.lineH = a;
     } else if (std::strcmp(tag, "boxes") == 0) {
         g_probe.boxLeft = a;
         g_probe.boxTop = b;
@@ -77,6 +80,8 @@ void DumpLayoutProbe() {
                  g_probe.centerX, g_probe.symbolW, g_probe.digitsW, g_probe.left);
         fwprintf(f, L"[layout] 鏁板瓧椤?%.2f 鏍囬妗?%.2f,%.2f 鍙宠竟鐣?%.2f\n", g_probe.numberTop,
                  g_probe.boxLeft, g_probe.boxTop, g_probe.boxRight);
+        fwprintf(f, L"[layout] h(=line advance, 相邻数字间距) = %.4f DIP  [scale 1.0 时等于像素]\n",
+                 g_probe.lineH);
         const float blockCenter = g_probe.left + (g_probe.symbolW + g_probe.digitsW) * 0.5f;
         fwprintf(f, L"[layout] 鍚堝苟鍧椾腑蹇?%.2f 涓庡疄浣撳尯涓績涔嬪樊=%.2f锛堢洰鏍囷細鎺ヨ繎 0锛塡n",
                  blockCenter, blockCenter - g_probe.centerX);
@@ -417,9 +422,11 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             // leaves the visible digits off-centre (measured: the block sat 6.5 px left of
             // the panel centre, because a leading "1" carries a wide left side bearing).
             std::vector<float> charXs;
+            // 相邻两个数字的垂直间距 h：**必须问排版引擎**，不能用字号顶替。
+            // 曾经拿字号(40)当行高，结果是数字被裁半截、滚动结束时跳一行——都是这个值错了。
             float lineH = 0.0f;
             MeasureCharOrigins(measureText, numFmt2, &charXs, &lineH);
-
+            LayoutProbe("pitch", lineH, 0, 0, 0);
             const std::wstring& target = measureText;
             size_t firstDigit = 0;
             for (size_t k = 0; k < target.size(); ++k) {
