@@ -147,9 +147,11 @@ void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountT
     // 重建"有哪些位次"：终点按公式算，起点取这一位的当前位置（连续性）。
     if (tripsDirty_) {
         std::vector<Trip> next;
-        for (int slot = 0; slot < static_cast<int>(amountText.size()); ++slot) {
-            const int place = axis::PlaceOfSlot(amountText, slot);
-            if (place == axis::kNoPlace) continue;
+        // ★ 行程覆盖**全部位次**（+6..−2），不再只覆盖目标文本里那几列。
+        //   原因：100.00 -> 0.33 时十位/百位在目标文本里已经不存在了，只按文本建
+        //   行程它们就当场消失（所有者要的是"滚到低于 1 才消失"）。
+        //   超出的高位坐标为 0 -> 渲染层按"整数位坐标 ≥ 1 才画"隐藏。
+        for (int place = 6; place >= -2; --place) {
             const double denom = std::pow(10.0, static_cast<double>(place) + 4.0);
             const double Lg = rawL / denom;   // 起点格（不提前取整）
             // 终点：所有者口径 L + floor((R−L)/n)，或 floor(R/n)
@@ -241,7 +243,9 @@ std::string DisplayedAmount::TextToShow() const {
     if (!hasValue_) return "--.--";
     // 文本只由目标值决定：滚动期间冻结在目标上，落位后 value_ == target_，
     // 两种情形其实是同一个式子。这样"内容"与"竖直偏移"永远不同时变。
-    const double shown = rolling() ? target_ : value_;
+    // ★ 文本用**当前动画值**（不再冻结在目标上）：列数随滚动增减，于是高位列
+    //   会随滚动出现/消失。字形是按每位坐标画的，文本只负责布局，所以安全。
+    const double shown = value_;
     return Amount{static_cast<AmountRaw>(std::llround(shown * kUnitsPerYuan))}.ToString2();
 }
 

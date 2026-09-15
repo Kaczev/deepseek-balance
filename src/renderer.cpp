@@ -516,6 +516,9 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                     if (pc.place == place) { frameCoord = pc.coord; haveFrameCoord = true; break; }
                 }
                 if (haveFrameCoord) {
+                // ★ 整数高位（十位及以上）：坐标滚到低于 1 就**不画**，于是这一列随滚动消失；
+                //   反向滚动时坐标从 0 涨过 1 才出现。个位（place 0）与小数位恒画。
+                if (place >= 1 && frameCoord < 1.0) continue;
                     const int base = static_cast<int>(std::floor(frameCoord));
                     const double frac = frameCoord - static_cast<double>(base);
                     const float yb = numberTop + static_cast<float>(frac * h);   // 所有者：正在走的那位往下
