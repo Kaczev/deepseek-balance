@@ -88,28 +88,12 @@ inline constexpr float kEstimateInsetDip = 26.0f;
 // 3b. 显示数字跟随实际数字的三个常数（所有者指定）
 // ---------------------------------------------------------------------------
 
-// 指数平滑速率：显示数字每秒钟走掉剩余差距的 (1 − e^(−dt/τ))。
-// 值越大追得越快。它与采样间隔无关——采样是 10 秒一次，这里决定的是"跳变后多久追平"。
-// 0.10 秒大约是"1 秒内看起来已经到位"。
-inline constexpr float kDisplayTauSeconds = 0.10f;
-
-// 截断常数 N（元）：|实际数字 − 显示数字| < N 时，直接令显示数字 = 实际数字。
-// 指数逼近永远到不了目标，会停在 99.9997 这种地方、看着像在抖；这条把"看不见的尾巴"
-// 切掉，最后一位才能干脆落定。
-inline constexpr float kDisplaySnapYuan = 0.005f;
 
 // ★ 滚动速度：每帧把"剩余量"乘上这个系数（所有者给的做法：记一个量每帧自乘，不做幂运算）。
 //   剩余 = D × rate^k，所以 rate 越小滚得越快、越早到位；越接近 1 越慢越长。
 //   ★ 这是**每帧**系数（窗口是垂直同步的，约 60 帧/秒），不是每秒系数：
 //     改成按秒算就要用 pow(rate, dt×60)，而所有者要的正是避免幂运算。
-inline constexpr float kRollRate = 0.86f;
-
-// 每一位朝自己的整数目标追赶的时间常数（秒）。
-// 一个位次的目标是 floor(显示数字 / 10^位次)，它只会 ±1 地一格一格变。
-// 追赶把"目标一格一格跳"变成"轮子连续滚动"；追到差 < 1e-3 格就直接落在整数上，
-// 所以静止时每一位都正好压在自己的数字上（读数清晰），滚动时才会出现两格之间。
-// 越小滚得越利落，越大越"黏"。
-inline constexpr float kPlaceRollTauSeconds = 0.05f;
+inline constexpr float kRollRate = 0.99f;
 
 // ---------------------------------------------------------------------------
 // 4. 颜色与透明度
@@ -123,9 +107,6 @@ inline constexpr float kPanelColorB = 246.0f / 255.0f;
 // 面板整体不透明度（0 = 全透明，1 = 不透明）。
 inline constexpr float kPanelOpacity = 0.95f;
 
-// 同一支底色的 32 位写法（窗口创建/清屏路径用，格式 0xAABBGGRR 的 RGB 部分）。
-// 改底色时**两处都要改**：上面的三个分量，和这里的整数。
-inline constexpr uint32_t kBaseColorBgra = 0xF6896C;
 
 // 各处文字的透明度（文字一律白色，只有透明度不同）。
 inline constexpr float kTitleAlpha = 0.85f;      // 右上角标题
@@ -135,7 +116,6 @@ inline constexpr float kEstimateAlpha = 0.75f;   // 底部预估文案
 
 // 调试浮层里用的几个颜色（正常运行时看不到）。
 inline constexpr float kProbeRedAlpha = 0.50f;   // 预乘自检用的纯红方块
-inline constexpr float kRingAlpha = 0.95f;       // 调试用的光环
 inline constexpr float kWarnR = 1.00f;           // 警告色（偏黄）
 inline constexpr float kWarnG = 0.94f;
 inline constexpr float kWarnB = 0.60f;

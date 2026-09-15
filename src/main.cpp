@@ -63,8 +63,11 @@ double g_realAmount = 0.0;
 double g_displayAmount = 0.0;   // 已弃用（所有者改为 --last）
 double g_lastAmount = 0.0;      // --last=L：上次的实际数字
 int g_frames = -1;              // --frames=k：已经运算了多少帧（-1 = 未给）
+// --seq=v0,v1,v2 ...：每 --step 秒把实际数字换成下一个（L 自动取上一次的实际数字）。
+std::vector<double> g_seq;
+double g_seqStep = 3.0;
+int g_seqIdx = -1;
 bool g_noAnim = false;
-bool g_report = false;
 // --crisp：坐标取 S/n 的整数部分（静止读数清晰）。默认用连续坐标（有"两格之间"的中间态）。
 bool g_crisp = false;
 // --phase=P：强行指定行程进度 0..1（>=0 生效），用来停在任意一刻看轮子位置。
@@ -284,6 +287,17 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
         } else if (wcsncmp(argv[i], L"--real=", 7) == 0) {
             g_realAmount = _wtof(argv[i] + 7);
+        } else if (wcsncmp(argv[i], L"--seq=", 6) == 0) {
+            const wchar_t* csv = argv[i] + 6;
+            double v = 0.0;
+            while (swscanf_s(csv, L"%lf", &v) == 1) {
+                g_seq.push_back(v);
+                const wchar_t* comma = wcschr(csv, L',');
+                if (!comma) break;
+                csv = comma + 1;
+            }
+        } else if (wcsncmp(argv[i], L"--step=", 7) == 0) {
+            g_seqStep = _wtof(argv[i] + 7);
         } else if (wcsncmp(argv[i], L"--last=", 7) == 0) {
             g_lastAmount = _wtof(argv[i] + 7);
         } else if (wcsncmp(argv[i], L"--frames=", 9) == 0) {
@@ -296,8 +310,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_phaseOverride = _wtof(argv[i] + 8);   // 停在行程的哪一刻（0..1）
         } else if (wcscmp(argv[i], L"--crisp") == 0) {
             g_crisp = true;
-        } else if (wcscmp(argv[i], L"--report") == 0) {
-            g_report = true;
         } else if (wcsncmp(argv[i], L"--digit-draw=", 13) == 0) {
             // 0/static = 整串一次画完；1/axis = 逐位按坐标画（修正公式）；2/user = 所有者原式
             const wchar_t* v = argv[i] + 13;
@@ -583,14 +595,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                         g_display.OnSample(g_states.lastGood());
                     }
                     g_display.Update(dt);
-        if (g_report) {
-            static int tick = 0;
-            if (++tick >= 60) {
-                tick = 0;
-                const std::string rep = g_display.PlaceReport();
-                SelfTestLog(L"[axis] h=%.4f DIP\n%hs", dshb::LastLinePitchDip(), rep.c_str());
-            }
-        }
 
                     const dshb::ConnState st = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
                     const bool currencyKnown =
@@ -685,12 +689,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
         const bool ok = renderer.ExportFrame(g_exportPath, t);
 
-        // --report：读数写在**导出之后**——h（相邻数字间距）是绘制时量到的，
-        // 渲染前读它只会得到 0（实测 h=0.0000）。
-        if (g_report) {
-            const std::string rep = g_display.PlaceReport();
-            SelfTestLog(L"[axis] h=%.4f DIP\n%hs", dshb::LastLinePitchDip(), rep.c_str());
-        }
         // 诊断写文件放在绘制**之后**：绘制路径里做 I/O 会让进程崩（实测）
         dshb::DumpLayoutProbe();
         SelfTestLog(L"[export] %ls 帧=%d 时刻=%.3fs 结果=%ls 画布=%dx%d",
@@ -930,6 +928,34 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         if (!g_running) break;
 
         const double dt = clock.Tick();
+
+        // --seq：每 g_seqStep 秒把实际数字换成序列里的下一个。
+        // 换值时喂一条样本 -> 显示层的 OnSample 会把 L 记成"上一次的实际数字"，
+        // 于是三件参数（R / L / k）自动齐备，正是所有者要的动画实验。
+        if (!g_seq.empty()) {
+            const int want = static_cast<int>(elapsed / g_seqStep);
+            const int idx = (want < static_cast<int>(g_seq.size())) ? want
+                                                                    : static_cast<int>(g_seq.size()) - 1;
+            if (idx != g_seqIdx) {
+                g_seqIdx = idx;
+                dshb::Sample sq{};
+                sq.wallMs = NowWallMs();
+                sq.monotonicMs = static_cast<int64_t>(GetTickCount64());
+                sq.transportOk = true;
+                sq.httpStatus = 200;
+                sq.isAvailable = true;
+                sq.amountsOk = true;
+                sq.currency = "CNY";
+                sq.total = dshb::Amount::FromYuan(static_cast<int64_t>(g_seq[idx]));
+                g_states.OnSample(sq, sq.wallMs);
+                g_display.OnSample(g_states.lastGood());
+                // ★ 余额为 0 需要"连续两次"才确认（防瞬时 0 把界面闪成灰色）。
+                //   序列里只喂一次 0，会被这条规则挡掉（实测：real=0 完全不生效）。
+                //   这里补喂一次让确认成立。
+                if (g_seq[idx] == 0.0) g_display.OnSample(g_states.lastGood());
+                SelfTestLog(L"[seq] t=%.2fs 第 %d 个值 -> real=%.2f", elapsed, idx, g_seq[idx]);
+            }
+        }
         elapsed += dt;
         g_elapsed = elapsed;
 
@@ -938,7 +964,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 所以换数据源不需要动它——这正是把这两件事分开的目的。
         {
             const dshb::Sample s = g_fake.NextIfDue(elapsed);
-            if (s.wallMs != 0 && g_fixedAmount <= 0.0 && g_realAmount <= 0.0 && g_lastAmount <= 0.0 && g_frames < 0) {   // 钉值时不喂
+            if (s.wallMs != 0 && g_fixedAmount <= 0.0 && g_realAmount <= 0.0 && g_lastAmount <= 0.0 && g_frames < 0 && g_seq.empty()) {   // 钉值时不喂
                 g_states.OnSample(s, s.wallMs);
             }
         }
@@ -1000,7 +1026,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
         // 显示值推进（C3）：测量值可以跳，显示值必须连续跟随。
         // 手动模式（--real / --display / --fixed-amount）下不喂样本，否则会把冻结的值改掉。
-        const bool manualMode = (g_fixedAmount > 0.0 || g_realAmount > 0.0 || g_lastAmount > 0.0 || g_frames >= 0);
+        const bool manualMode = (g_fixedAmount > 0.0 || g_realAmount > 0.0 || g_lastAmount > 0.0 || g_frames >= 0 || !g_seq.empty());
         g_display.SetCrisp(g_crisp);
         if (g_phaseOverride >= 0.0) g_display.SetPhaseOverride(g_phaseOverride);
         if (!manualMode) g_display.OnSample(g_states.lastGood());
@@ -1019,19 +1045,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         QueryPerformanceFrequency(&freq);
         QueryPerformanceCounter(&a);
         lastHr = renderer.RenderFrame(elapsed);
-        // --report：把每位坐标的读数同时写进日志并**画在窗口上**，贴在该帧渲染之后——
-        // h（相邻数字间距）是绘制时量到的，渲染前读它只会得到 0（实测 h=0.0000）。
-        if (g_report) {
-            const std::string rep = g_display.PlaceReport();
-            std::string full = "h=" + std::to_string(dshb::LastLinePitchDip()) + " DIP\n" + rep;
-            std::wstring w(full.begin(), full.end());
-            renderer.SetDebugText(w);
-            static int tick = 0;
-            if (++tick >= 60) {
-                tick = 0;
-                SelfTestLog(L"[axis] h=%.4f DIP\n%hs", dshb::LastLinePitchDip(), rep.c_str());
-            }
-        }
         QueryPerformanceCounter(&b);
         const double ms = static_cast<double>(b.QuadPart - a.QuadPart) * 1000.0 /
                           static_cast<double>(freq.QuadPart);

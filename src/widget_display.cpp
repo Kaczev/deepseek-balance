@@ -240,32 +240,6 @@ const wchar_t* StatusTextFor(ConnState state) {
     }
 }
 
-std::string DisplayedAmount::PlaceReport() const {
-    std::string out;
-    char buf[240];
-    std::snprintf(buf, sizeof(buf), "value=%.4f L=%.4f R=%.4f r=%.4f eased=%.4f frozen=%d places=%d\n",
-                  value_, lastReal_, target_, r_, phaseNow_, frozen_ ? 1 : 0,
-                  static_cast<int>(places_.size()));
-    out += buf;
-    out += " place  actualY=S/n      coord     digit  frac     from       to\n";
-    for (const axis::PlaceCoord& pc : places_) {
-        const double denom = std::pow(10.0, static_cast<double>(pc.place) + 4.0);
-        const double actual = std::floor(value_ * 100.0 + 0.5) * 100.0 / denom;
-        const int base = static_cast<int>(std::floor(pc.coord));
-        const double frac = pc.coord - static_cast<double>(base);
-        const int digit = ((base % 10) + 10) % 10;
-        double tfrom = 0.0, tto = 0.0;
-        bool found = false;
-        for (const Trip& tt : trips_) {
-            if (tt.place == pc.place) { tfrom = tt.from; tto = tt.to; found = true; break; }
-        }
-        (void)found;
-        std::snprintf(buf, sizeof(buf), " %+4d  %11.4f  %10.4f    %d  %.4f  %8.2f %8.2f  D=%+.0f\n",
-                      pc.place, actual, pc.coord, digit, frac, tfrom, tto, tto - tfrom);
-        out += buf;
-    }
-    return out;
-}
 
 }  // namespace dshb
 

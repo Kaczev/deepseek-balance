@@ -90,10 +90,6 @@ public:
     // 兼容旧工具：直接指定"已走完比例"（等价于给一个 rate^k）。
     void SetPhaseOverride(double p) { phaseOverride_ = p; }
 
-    // 每位坐标的读数表。单位是"格"，乘 h 就是像素。每行：
-    //   位次  纵实际坐标(S÷10^位次)  纵显示坐标  显示数字  两格之间  数字0画在何处
-    // 数字0那一列是所有者问的：它相对参考点的偏移，能直接看出"这一位偏了多少"。
-    std::string PlaceReport() const;
     // 收到新样本。做一次确认，避免"瞬间 0"把界面闪成灰色。
     void OnSample(const Sample& s);
 
