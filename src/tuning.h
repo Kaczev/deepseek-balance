@@ -98,6 +98,12 @@ inline constexpr float kDisplayTauSeconds = 0.10f;
 // 切掉，最后一位才能干脆落定。
 inline constexpr float kDisplaySnapYuan = 0.005f;
 
+// ★ 滚动速度：每帧把"剩余量"乘上这个系数（所有者给的做法：记一个量每帧自乘，不做幂运算）。
+//   剩余 = D × rate^k，所以 rate 越小滚得越快、越早到位；越接近 1 越慢越长。
+//   ★ 这是**每帧**系数（窗口是垂直同步的，约 60 帧/秒），不是每秒系数：
+//     改成按秒算就要用 pow(rate, dt×60)，而所有者要的正是避免幂运算。
+inline constexpr float kRollRate = 0.86f;
+
 // 每一位朝自己的整数目标追赶的时间常数（秒）。
 // 一个位次的目标是 floor(显示数字 / 10^位次)，它只会 ±1 地一格一格变。
 // 追赶把"目标一格一格跳"变成"轮子连续滚动"；追到差 < 1e-3 格就直接落在整数上，

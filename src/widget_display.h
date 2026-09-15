@@ -71,6 +71,8 @@ public:
     //   早先这里把 target_ 也设成 yuan，结果行程起点=终点，轮子永远不动（实测踩过）。
     void ForceDisplay(double yuan) {
         value_ = yuan;
+        lastReal_ = yuan;    // L = 手动设定的显示值：行程从这里出发
+        tripsDirty_ = true;  // 重建行程：from=floor(L/n)，to=floor(R/n)
         rollFromValue_ = yuan;
         rollStartValue_ = yuan;
         hasValue_ = true;
@@ -135,6 +137,10 @@ private:
         double to = 0.0;     // 终点坐标（整数）
     };
     std::vector<Trip> trips_;
+    double lastReal_ = 0.0;      // L：上次变化时的实际数字（行程起点）
+    bool tripsDirty_ = false;    // 有新样本/新手动值 -> 下一帧重建行程
+    double r_ = 1.0;             // rate^k：每帧自乘，避免幂运算
+    bool animating_ = false;     // 是否还在滚
     // 每一位当前的纵坐标（见 places()），渲染层按它画
     std::vector<axis::PlaceCoord> places_;
     double rollStartValue_ = 0.0;   // 本次行程的起点金额（用于算进度）

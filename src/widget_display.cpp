@@ -51,9 +51,10 @@ void DisplayedAmount::OnSample(const Sample& s) {
     //   "变量可以突变，但要套一个显示变量，那个显示变量是逐渐变化、跟着那个突变变量的"。
     //   起点值只记来给自检报告"走了多少比例"，不参与计算。
     rollFromValue_ = hasValue_ ? value_ : yuan;
-    rollStartValue_ = hasValue_ ? value_ : yuan;   // 本次行程的起点金额
 
-    target_ = yuan;
+    lastReal_ = hasValue_ ? target_ : yuan;   // L：上一次的实际数字
+    target_ = yuan;                            // R：这一次的实际数字
+    tripsDirty_ = true;                        // 让下一帧重建每一位的行程
     if (!hasValue_) {
         // 第一次拿到值就直接落位：从 0 滚上去会让人以为余额在涨
         value_ = yuan;
@@ -106,6 +107,20 @@ double DisplayedAmount::UpdateValue(double dtSeconds) {
 //   · 静止时 phase==1，每位正好落在自己的数字上（读数清晰）
 //   · 只有自己这一位要变的轮子才动，别的纹丝不动
 //   · 该动的位同时开始、同时结束
+// 每一位的滚动位置（所有者给的映射，这里按整数坐标实现）。
+//
+//   L = 上次变化时的实际数字，R = 这次的实际数字
+//   D_n = floor(R/n) − floor(L/n)        这一位要走几格（0 = 完全不动）
+//   coord_n(k) = floor(L/n) + D_n × (1 − rate^k)
+//
+//   · rate^k 用"一个量每帧自乘"实现，不做幂运算（所有者的要求）
+//   · k→∞ 时 coord 正好落在 floor(R/n)：整数 -> 读数清晰
+//   · D_n == 0 的位从头到尾不动（所以"下降时十位应跟个位一样"成立）
+//   · 全体同时开始、按同一条 rate 曲线收敛，所以一起到位
+//
+// ★ D 为什么不是 floor((R−L)/n)：起点不在整数格上时会漏步。
+//   例：L=99.50, R=100.00, n=10 -> floor(0.50/10)=0（十位不动），
+//   可十位的数字要从 9 变成 0，必须走 1 步；floor(R/n)−floor(L/n)=10−9=1 ✓
 void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountText) {
     (void)dtSeconds;
     if (!hasValue_ || amountText.empty()) {
@@ -114,51 +129,46 @@ void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountT
         return;
     }
 
-    // 全体共用的进度：从本次行程的起点金额走到目标金额，走了多少。
-    // 用指数平滑的显示值来算，所以"值到哪儿、轮子就到哪儿"，两者永远同步。
-    const double span = rollStartValue_ - target_;
-    double phase = 1.0;
-    if (std::fabs(span) > 1e-9) {
-        phase = (rollStartValue_ - value_) / span;
-        if (phase < 0.0) phase = 0.0;
-        if (phase > 1.0) phase = 1.0;
+    // 有新样本/新手动值时重建行程：from = floor(L/n)，to = floor(R/n)。
+    if (tripsDirty_) {
+        trips_.clear();
+        const double rawL = std::floor(lastReal_ * 100.0 + 0.5) * 100.0;
+        const double rawR = std::floor(target_ * 100.0 + 0.5) * 100.0;
+        for (int slot = 0; slot < static_cast<int>(amountText.size()); ++slot) {
+            const int place = axis::PlaceOfSlot(amountText, slot);
+            if (place == axis::kNoPlace) continue;
+            const double denom = std::pow(10.0, static_cast<double>(place) + 4.0);
+            Trip t;
+            t.place = place;
+            t.from = std::floor(rawL / denom);
+            t.to = std::floor(rawR / denom);
+            trips_.push_back(t);
+        }
+        r_ = 1.0;             // 剩余量回到满格，重新开始滚
+        animating_ = true;
+        tripsDirty_ = false;
     }
-    if (phaseOverride_ >= 0.0) phase = phaseOverride_;
-    if (value_ == target_ && phaseOverride_ < 0.0) phase = 1.0;   // 落定就是 1，保证对准数字
-    const double eased = phase * phase * (3.0 - 2.0 * phase);      // smoothstep：两头慢中间快
-    phaseNow_ = phase;
 
-    // 有哪些位次由文本决定（高位是 0 时文本里没有它 -> 自动隐藏）。
+    // 推进"剩余量"：每帧自乘一次 rate。r_ = rate^k。
+    if (animating_) {
+        r_ *= kRollRate;
+        if (r_ < 0.01) { r_ = 0.0; animating_ = false; }   // 所有者：rate^k < 0.01 就截断为 0
+    }
+    double eased = 1.0 - r_;                 // 已走完的比例
+    if (phaseOverride_ >= 0.0) eased = phaseOverride_;   // 调参：停在行程任意一刻
+    phaseNow_ = eased;   // 记录本帧**实际**用的已走完比例（覆盖之后）
+
     places_.clear();   // 每次重建都要清空：忘了它同一帧会重复累加（实测 places=12）
-    std::vector<Trip> next;
-    next.reserve(trips_.size());
     for (int slot = 0; slot < static_cast<int>(amountText.size()); ++slot) {
         const int place = axis::PlaceOfSlot(amountText, slot);
         if (place == axis::kNoPlace) continue;
-        const double denom = std::pow(10.0, static_cast<double>(place) + 4.0);
-        double from = 0.0;
-        bool found = false;
         for (const Trip& t : trips_) {
-            if (t.place == place) { from = t.from; found = true; break; }
+            if (t.place != place) continue;
+            const double coord = t.from + (t.to - t.from) * eased;
+            places_.push_back(axis::PlaceCoord{place, coord});
+            break;
         }
-        if (!found) {
-            // 这一位是新出现的：起点取"它上一次该在的位置"，即目标之前的那个金额对应的整数坐标。
-            const double rawFrom = std::floor(rollStartValue_ * 100.0 + 0.5) * 100.0;
-            from = std::floor(rawFrom / denom);
-        }
-        const double rawTo = std::floor(target_ * 100.0 + 0.5) * 100.0;
-        const double to = std::floor(rawTo / denom);
-        Trip t;
-        t.place = place;
-        t.from = from;
-        t.to = to;
-        next.push_back(t);
-
-        // 这一位的当前坐标：只在自己 from != to 时才动。
-        const double coord = from + (to - from) * eased;
-        places_.push_back(axis::PlaceCoord{place, coord});
     }
-    trips_ = next;
 }
 
 // 对外只有一个 Update：先推进显示值，再按行程刷新每一位的坐标。
@@ -242,8 +252,9 @@ const wchar_t* StatusTextFor(ConnState state) {
 std::string DisplayedAmount::PlaceReport() const {
     std::string out;
     char buf[240];
-    std::snprintf(buf, sizeof(buf), "value=%.4f target=%.4f start=%.4f frozen=%d places=%d phase=%.3f\n", value_, target_, rollStartValue_,
-                  frozen_ ? 1 : 0, static_cast<int>(places_.size()), phaseNow_);
+    std::snprintf(buf, sizeof(buf), "value=%.4f L=%.4f R=%.4f r=%.4f eased=%.4f frozen=%d places=%d\n",
+                  value_, lastReal_, target_, r_, phaseNow_, frozen_ ? 1 : 0,
+                  static_cast<int>(places_.size()));
     out += buf;
     out += " place  actualY=S/n      coord     digit  frac     from       to\n";
     for (const axis::PlaceCoord& pc : places_) {
@@ -258,8 +269,8 @@ std::string DisplayedAmount::PlaceReport() const {
             if (tt.place == pc.place) { tfrom = tt.from; tto = tt.to; found = true; break; }
         }
         (void)found;
-        std::snprintf(buf, sizeof(buf), " %+4d  %11.4f  %10.4f    %d  %.4f  %8.2f %8.2f\n",
-                      pc.place, actual, pc.coord, digit, frac, tfrom, tto);
+        std::snprintf(buf, sizeof(buf), " %+4d  %11.4f  %10.4f    %d  %.4f  %8.2f %8.2f  D=%+.0f\n",
+                      pc.place, actual, pc.coord, digit, frac, tfrom, tto, tto - tfrom);
         out += buf;
     }
     return out;
