@@ -73,13 +73,10 @@ public:
         frozen_ = true;
         lastReal_ = lastReal;   // L
         target_ = real;         // R
-        r_ = 1.0;
-        for (int i = 0; i < frames; ++i) r_ *= kRollRate;   // rate^k，逐次自乘
-        if (r_ < 0.01) r_ = 0.0;
-        frames_ = frames;
-        animating_ = false;     // 手动模式不自己推进
-        SyncValueFromTrips();   // 显示值 = L + (R−L)×(1−rate^k)
+        frames_ = frames;       // k
+        animating_ = false;
         tripsDirty_ = true;
+        SyncValueFromTrips();
         trips_.clear();
         places_.clear();
     }
@@ -129,20 +126,22 @@ private:
     // 这一段的起点值，用于自检报告"走了多少比例"
     double rollFromValue_ = 0.0;
 
-    // 每一位的纵坐标（见 places()）
-    // 每一位自己的行程：从 from 走到 to。轮子只在自己这一位要变的时候才动。
+    // ★ 每一位**自己管自己**：自己记着当前坐标、自己的目标、自己还剩多少要滚。
+    //   全体共用一个 rate^k 是错的：中途来了新值就要重置那个共用状态，所有轮子被
+    //   拽回起点——所有者看到的"突变"就是这么来的（他 rate=0.99 一轮约 7.6 秒，
+    //   而序列每 3 秒换一次值，必然落在滚动中途）。
+    //   分开之后：新值只改各自的 target，coord 从当前位置继续走，不会跳。
     struct Trip {
         int place = axis::kNoPlace;
-        double from = 0.0;   // 起点坐标（整数）
-        double to = 0.0;     // 终点坐标（整数）
+        double coord = 0.0;    // 当前坐标（连续）
+        double target = 0.0;   // 目标坐标（整数）
     };
     std::vector<Trip> trips_;
-    double lastReal_ = 0.0;      // L：上次变化时的实际数字（行程起点）
-    bool tripsDirty_ = false;    // 有新样本/新手动值 -> 下一帧重建行程
-    double r_ = 1.0;             // rate^k：每帧自乘，避免幂运算
-    bool animating_ = false;     // 是否还在滚
-    int frames_ = 0;             // k：本次变化已经运算了多少帧
-    void SyncValueFromTrips();    // 显示值 = L + (R−L)×(1−rate^k)
+    double lastReal_ = 0.0;      // L：上次变化时的实际数字
+    bool tripsDirty_ = false;    // 有新样本/新手动值 -> 下一帧重建（并保留已有 coord）
+    bool animating_ = false;     // 是否还有位在滚
+    int frames_ = 0;             // k：手动模式下用来算 rate^k
+    void SyncValueFromTrips();   // 显示值由最细那一位的坐标导出（保持一致）
     // 每一位当前的纵坐标（见 places()），渲染层按它画
     std::vector<axis::PlaceCoord> places_;
     double rollStartValue_ = 0.0;   // 本次行程的起点金额（用于算进度）

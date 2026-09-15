@@ -59,9 +59,9 @@ double g_fixedAmount = 0.0;
 // --real=N：手动设定**实际数字**（采样值）。--display=M：手动设定**显示数字**并冻结。
 // --no-anim：显示数字不做指数平滑（跟着实际数字立刻到位）。
 // 三者都是为了"停在一个状态上看清楚"，不做自动动画。
-double g_realAmount = 0.0;
+double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
 double g_displayAmount = 0.0;   // 已弃用（所有者改为 --last）
-double g_lastAmount = 0.0;      // --last=L：上次的实际数字
+double g_lastAmount = -1.0;   // --last=L（-1 = 未给）
 int g_frames = -1;              // --frames=k：已经运算了多少帧（-1 = 未给）
 // --seq=v0,v1,v2 ...：每 --step 秒把实际数字换成下一个（L 自动取上一次的实际数字）。
 std::vector<double> g_seq;
@@ -353,10 +353,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     //   --last=L    上次的实际数字（不给则等于 R，于是 D=0、轮子不动）
     //   --frames=k  已经运算了多少帧（不给则 0，即停在行程起点）
     // 位置完全由这三个量决定：coord_n = floor(L/n) + D_n × (1 − rate^k)
-    if (g_realAmount > 0.0 || g_lastAmount > 0.0 || g_frames >= 0) {
-        const double R = (g_realAmount > 0.0) ? g_realAmount
-                                               : ((g_lastAmount > 0.0) ? g_lastAmount : 0.0);
-        const double L = (g_lastAmount > 0.0) ? g_lastAmount : R;
+    if (g_realAmount >= 0.0 || g_lastAmount >= 0.0 || g_frames >= 0) {
+        const double R = (g_realAmount >= 0.0) ? g_realAmount
+                                               : ((g_lastAmount >= 0.0) ? g_lastAmount : 0.0);
+        const double L = (g_lastAmount >= 0.0) ? g_lastAmount : R;
         const int k = (g_frames >= 0) ? g_frames : 0;
         dshb::Sample ms{};
         ms.wallMs = NowWallMs();
@@ -539,7 +539,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // --roll=N：把"余额跳变之后第 N/60 秒"这一瞬间单独抓出来。
         // 用途是**看滚动动画**——静态单帧看不出数字是怎么滚过去的，
         // 连拍若干张不同 N 的图才能看出过程（动画也是要人眼判的东西）。
-        if ((g_rollFrames > 0 || g_rollFrames == 0) && g_fixedAmount <= 0.0 && g_realAmount <= 0.0 && g_lastAmount <= 0.0 && g_frames < 0) {
+        if ((g_rollFrames > 0 || g_rollFrames == 0) && g_fixedAmount <= 0.0 && g_realAmount < 0.0 && g_lastAmount < 0.0 && g_frames < 0) {
             // --roll=N：把"余额跳变之后第 N 帧"这一瞬间单独抓出来。
             // 用途是**看滚动动画**——静态单帧看不出数字是怎么滚过去的，
             // 连拍若干张不同 N 的图才能看出过程（动画也是要人眼判的东西）。
@@ -646,7 +646,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             SelfTestLog(L"[roll] 跳变前=%.2f 跳变后目标=%.2f 推进 %d 帧后显示=%.2f",
                         before, g_display.target(), g_rollSteps, g_display.value());
         } else {
-            for (double vt = 0.0; g_fixedAmount <= 0.0 && g_realAmount <= 0.0 && g_lastAmount <= 0.0 && g_frames < 0 && vt <= t + 0.0001; vt += (1.0 / 60.0)) {
+            for (double vt = 0.0; g_fixedAmount <= 0.0 && g_realAmount < 0.0 && g_lastAmount < 0.0 && g_frames < 0 && vt <= t + 0.0001; vt += (1.0 / 60.0)) {
                 const dshb::Sample s = g_fake.NextIfDue(vt);
                 if (s.wallMs != 0) {
                     g_states.OnSample(s, s.wallMs);
@@ -964,7 +964,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 所以换数据源不需要动它——这正是把这两件事分开的目的。
         {
             const dshb::Sample s = g_fake.NextIfDue(elapsed);
-            if (s.wallMs != 0 && g_fixedAmount <= 0.0 && g_realAmount <= 0.0 && g_lastAmount <= 0.0 && g_frames < 0 && g_seq.empty()) {   // 钉值时不喂
+            if (s.wallMs != 0 && g_fixedAmount <= 0.0 && g_realAmount < 0.0 && g_lastAmount < 0.0 && g_frames < 0 && g_seq.empty()) {   // 钉值时不喂
                 g_states.OnSample(s, s.wallMs);
             }
         }
@@ -1026,7 +1026,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
         // 显示值推进（C3）：测量值可以跳，显示值必须连续跟随。
         // 手动模式（--real / --display / --fixed-amount）下不喂样本，否则会把冻结的值改掉。
-        const bool manualMode = (g_fixedAmount > 0.0 || g_realAmount > 0.0 || g_lastAmount > 0.0 || g_frames >= 0 || !g_seq.empty());
+        const bool manualMode = (g_fixedAmount > 0.0 || g_realAmount >= 0.0 || g_lastAmount >= 0.0 || g_frames >= 0 || !g_seq.empty());
         g_display.SetCrisp(g_crisp);
         if (g_phaseOverride >= 0.0) g_display.SetPhaseOverride(g_phaseOverride);
         if (!manualMode) g_display.OnSample(g_states.lastGood());

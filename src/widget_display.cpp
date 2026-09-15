@@ -54,7 +54,6 @@ void DisplayedAmount::OnSample(const Sample& s) {
 
     lastReal_ = hasValue_ ? target_ : yuan;   // L = 上一次的实际数字（所有者的定义）
     target_ = yuan;                            // R：这一次的实际数字
-    r_ = 1.0;                                  // rate^0 = 1：剩余量满格
     frames_ = 0;                               // k = 0：本次变化还没运算过
     animating_ = true;
     tripsDirty_ = true;                        // 下一帧重建每一位的行程
@@ -77,9 +76,6 @@ double DisplayedAmount::UpdateValue(double dtSeconds) {
     return value_;
 }
 
-void DisplayedAmount::SyncValueFromTrips() {
-    value_ = lastReal_ + (target_ - lastReal_) * (1.0 - r_);
-}
 
 // 每一位的纵坐标：目标是 floor(显示值 / 10^位次)，本帧朝目标追赶 dt 秒。
 //
@@ -114,6 +110,17 @@ void DisplayedAmount::SyncValueFromTrips() {
 // ★ D 为什么不是 floor((R−L)/n)：起点不在整数格上时会漏步。
 //   例：L=99.50, R=100.00, n=10 -> floor(0.50/10)=0（十位不动），
 //   可十位的数字要从 9 变成 0，必须走 1 步；floor(R/n)−floor(L/n)=10−9=1 ✓
+// 每一位**自己管自己**地滚。
+//
+//   每位记着：当前坐标 coord、目标坐标 target（整数）。每帧：
+//       剩余 = (target − coord) × rate     // 剩余量每帧乘一次 rate，避免幂运算
+//       |剩余| < kRollSnapGrid  -> coord = target（**这一位**自己收尾）
+//       否则                    -> coord = target − 剩余
+//
+//   · 截断是**每位独立判断**的：某一位先到位就先停，不被别的位拖住
+//   · 新值到来时只改 target，coord 从当前位置继续走 -> 不会跳
+//     （全体共用一个 rate^k 时，中途来新值要重置共用状态，所有轮子被拽回起点，
+//       所有者看到的"突变"正是如此；他 rate=0.99 一轮要 7.6 秒，而序列每 3 秒换值）
 void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountText) {
     (void)dtSeconds;
     if (!hasValue_ || amountText.empty()) {
@@ -122,44 +129,73 @@ void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountT
         return;
     }
 
-    // 有新样本/新手动值时重建行程：from = floor(L/n)，to = floor(R/n)。
+    // 重建"有哪些位次"：保留已有的 coord（关键——这是不跳的原因），只更新 target。
     if (tripsDirty_) {
-        trips_.clear();
-        const double rawL = std::floor(lastReal_ * 100.0 + 0.5) * 100.0;
-        const double rawR = std::floor(target_ * 100.0 + 0.5) * 100.0;
+        std::vector<Trip> next;
         for (int slot = 0; slot < static_cast<int>(amountText.size()); ++slot) {
             const int place = axis::PlaceOfSlot(amountText, slot);
             if (place == axis::kNoPlace) continue;
             const double denom = std::pow(10.0, static_cast<double>(place) + 4.0);
             Trip t;
             t.place = place;
-            t.from = std::floor(rawL / denom);
-            t.to = std::floor(rawR / denom);
-            trips_.push_back(t);
+            t.target = std::floor(std::floor(target_ * 100.0 + 0.5) * 100.0 / denom);
+            // 已有这一位就沿用它的当前位置；新出现的位从"上一次的实际数字"对应的整数出发。
+            bool kept = false;
+            for (const Trip& old : trips_) {
+                if (old.place == place) { t.coord = old.coord; kept = true; break; }
+            }
+            if (!kept) {
+                const double rawL = std::floor(lastReal_ * 100.0 + 0.5) * 100.0;
+                t.coord = std::floor(rawL / denom);
+            }
+            next.push_back(t);
         }
+        trips_ = next;
         tripsDirty_ = false;
+        animating_ = true;
     }
 
-    // 推进"剩余量"：每帧自乘一次 rate。r_ = rate^k。
-    if (animating_) {
-        r_ *= kRollRate;
-        if (r_ < 0.01) { r_ = 0.0; animating_ = false; }   // 所有者：rate^k < 0.01 就截断为 0
-    }
-    double eased = 1.0 - r_;                 // 已走完的比例
-    if (phaseOverride_ >= 0.0) eased = phaseOverride_;   // 调参：停在行程任意一刻
-    phaseNow_ = eased;   // 记录本帧**实际**用的已走完比例（覆盖之后）
-
-    places_.clear();   // 每次重建都要清空：忘了它同一帧会重复累加（实测 places=12）
-    for (int slot = 0; slot < static_cast<int>(amountText.size()); ++slot) {
-        const int place = axis::PlaceOfSlot(amountText, slot);
-        if (place == axis::kNoPlace) continue;
-        for (const Trip& t : trips_) {
-            if (t.place != place) continue;
-            const double coord = t.from + (t.to - t.from) * eased;
-            places_.push_back(axis::PlaceCoord{place, coord});
-            break;
+    // 交给手动模式：按 k 帧算出每一位的坐标（不推进，直接摆到那一帧的位置）。
+    if (frozen_) {
+        places_.clear();
+        for (Trip& t : trips_) {
+            const double rawL = std::floor(lastReal_ * 100.0 + 0.5) * 100.0;
+            const double denom = std::pow(10.0, static_cast<double>(t.place) + 4.0);
+            const double start = std::floor(rawL / denom);
+            double remaining = (t.target - start);
+            for (int i = 0; i < frames_; ++i) remaining *= kRollRate;
+            if (std::fabs(remaining) < kRollSnapGrid) t.coord = t.target;
+            else t.coord = t.target - remaining;
+            places_.push_back(axis::PlaceCoord{t.place, t.coord});
         }
+        SyncValueFromTrips();
+        return;
     }
+
+    // 正常推进：每位各自收敛、各自截断。
+    bool anyMoving = false;
+    places_.clear();
+    for (Trip& t : trips_) {
+        double remaining = (t.target - t.coord) * static_cast<double>(kRollRate);
+        if (std::fabs(remaining) < kRollSnapGrid) {
+            t.coord = t.target;            // 这一位自己到位了
+        } else {
+            t.coord = t.target - remaining;
+            anyMoving = true;
+        }
+        places_.push_back(axis::PlaceCoord{t.place, t.coord});
+    }
+    animating_ = anyMoving;
+    SyncValueFromTrips();
+}
+
+// 显示值由**最细那一位**的坐标导出，保证"文本/状态"与"轮子位置"永远一致。
+// 没有细位（比如只有整数位）时退回 L + (R−L) 的粗略值。
+void DisplayedAmount::SyncValueFromTrips() {
+    for (const Trip& t : trips_) {
+        if (t.place == -2) { value_ = t.coord / 100.0; return; }
+    }
+    value_ = target_;
 }
 
 // 对外只有一个 Update：先推进显示值，再按行程刷新每一位的坐标。
