@@ -37,6 +37,10 @@ bool g_premulProbe = false;       // 预乘自检（A8c）
 wchar_t g_exportPath[MAX_PATH] = L"frame.png";
 int g_frameNo = 1;
 HWND g_hwnd = nullptr;
+
+// Defined further down; declared here because WndProc (which runs before them) calls them.
+void InstallEscHook();
+void RemoveEscHook();
 bool g_running = true;
 dshb::Renderer* g_renderer = nullptr;
 double g_elapsed = 0.0;          // 单调时钟累计秒数；帧循环和 WndProc 共用
@@ -127,6 +131,7 @@ const char* ConnStateNameUtf8(dshb::ConnState s) {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_DESTROY:
+        RemoveEscHook();
         g_running = false;
         PostQuitMessage(0);
         return 0;
@@ -182,6 +187,45 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// ---------------------------------------------------------------------------
+// Esc closes the widget.
+//
+// WHY a keyboard hook instead of WM_KEYDOWN: this window is deliberately
+// non-activating (it must never steal focus from what the user is doing), so it
+// never receives keyboard messages -- the WM_KEYDOWN branch in WndProc below is
+// unreachable in practice. A low-level hook sees the key before any window does
+// and needs no focus at all. It is installed only while the widget is on screen,
+// never in the offscreen export / self-test runs.
+//
+// The hook does NOT swallow the key: it returns CallNextHookEx unconditionally, so
+// Esc still reaches whatever the user was actually typing into.
+// ---------------------------------------------------------------------------
+HHOOK g_escHook = nullptr;
+
+LRESULT CALLBACK EscHookProc(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)) {
+        const KBDLLHOOKSTRUCT* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
+        // Any Escape closes it, injected or not. NOTE: do NOT filter on the LLKHF_INJECTED
+        // bit here -- measured, that bit is set on ordinary hardware key presses too (a
+        // keyboard hook receiving events destined for another process sees injected=1),
+        // so filtering on it silently disables the feature. Esc is harmless to accept.
+        if (kb && kb->vkCode == VK_ESCAPE) {
+            SelfTestLog(L"[key] Esc -> closing the widget");
+            g_running = false;
+            if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+        }
+    }
+    return CallNextHookEx(g_escHook, code, wp, lp);
+}
+
+void InstallEscHook() {
+    if (!g_escHook) g_escHook = SetWindowsHookExW(WH_KEYBOARD_LL, EscHookProc, nullptr, 0);
+}
+
+void RemoveEscHook() {
+    if (g_escHook) { UnhookWindowsHookEx(g_escHook); g_escHook = nullptr; }
 }
 
 }  // namespace
@@ -346,6 +390,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     }
 
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+
+    // Esc closes the widget. Installed here (the widget is on screen from now on) and
+    // removed in WM_DESTROY. See EscHookProc for why a low-level hook is needed.
+    InstallEscHook();
 
     // ---- 预乘自检（A8c）：先于导帧，因为它可能顺便导一张探针 PNG ----
     // 判据不是"R 等于多少"，而是 **R 与 A 的关系**：

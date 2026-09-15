@@ -182,14 +182,6 @@ double FlashPulse(double nowSeconds, double flashStart) {
 static float g_numberFontSizeDip = 0.0f;
 
 // FONT SIZES (DIP) for the balance number, indexed by how many digits it shows
-// (the currency sign is not counted). The number is deliberately NOT one fixed size:
-// as the balance gains digits the panel would otherwise overflow, so the size steps
-// down and the block stays centred -- the layout expands and contracts with the number.
-// Values are appearance parameters: change them to taste, they are the only place the
-// sizes live.
-const int kNumberSizeCount =
-    static_cast<int>(sizeof(kNumberSizeByDigits) / sizeof(kNumberSizeByDigits[0]));
-
 enum class FontRole { Title, Number, NumberFlex, Unit, Estimate, Debug };
 
 IDWriteTextFormat* TextFormatFor(FontRole role) {
@@ -219,7 +211,7 @@ IDWriteTextFormat* TextFormatFor(FontRole role) {
         case FontRole::Estimate: size = kEstimateSizeDip; break;
         case FontRole::Debug: size = kDebugSizeDip; break;
         case FontRole::NumberFlex:
-            size = (flexSize > 0.0f) ? flexSize : kNumberSizeByDigits[0];
+            size = (flexSize > 0.0f) ? flexSize : kNumberFixedSizeDip;
             weight = DWRITE_FONT_WEIGHT_SEMI_BOLD;
             break;
         }
@@ -381,16 +373,9 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
 
         // ADAPTIVE SIZE + CENTRING.
         //
-        // The number is not drawn at one fixed size: as the balance gains digits it would
-        // otherwise run into the panel edges. The size steps down with the digit count
-        // (kNumberSizeByDigits) and the block stays centred horizontally, so the layout
-        // expands and contracts with the number instead of overflowing.
-        int digitCount = 0;
-        for (wchar_t ch : measureText) {
-            if (ch >= L'0' && ch <= L'9') ++digitCount;
-        }
-        const int sizeIdx = (digitCount < kNumberSizeCount) ? digitCount : (kNumberSizeCount - 1);
-        g_numberFontSizeDip = kNumberSizeByDigits[sizeIdx];
+        // digits. Measured with the panel at 315 DIP: even 99999.99 has 74 px of clearance on
+        // each side, so the old per-digit table was shrinking the layout for no reason.
+        g_numberFontSizeDip = kNumberFixedSizeDip;
         IDWriteTextFormat* numFmt2 = TextFormatFor(FontRole::NumberFlex);
         if (!numFmt2) numFmt2 = numFmt;
 
