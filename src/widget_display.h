@@ -65,18 +65,21 @@ public:
     //   于是显示位与它旁边那位数字一起画出来。
     const std::vector<axis::PlaceCoord>& places() const { return places_; }
 
-    // ★ 手动设定**显示值**并冻结：不做指数平滑。
-    //   用途是排查与调参——必须能停在一个状态上看清楚，否则分不清是机制错还是过程错。
-    //   注意：**只设显示值，不动 target_**。target_ 是"实际数字"，是每一位行程的终点；
-    //   早先这里把 target_ 也设成 yuan，结果行程起点=终点，轮子永远不动（实测踩过）。
-    void ForceDisplay(double yuan) {
-        value_ = yuan;
-        lastReal_ = yuan;    // L = 手动设定的显示值：行程从这里出发
-        tripsDirty_ = true;  // 重建行程：from=floor(L/n)，to=floor(R/n)
-        rollFromValue_ = yuan;
-        rollStartValue_ = yuan;
+    // ★ 手动设定三件参数并冻结。所有者定的参数就是这三个，没有"display"：
+    //     R = 实际数字、L = 上次的实际数字、frames = 已经运算了多少帧 k。
+    //   位置完全由它们决定：coord_n = floor(L/n) + D_n × (1 − rate^k)，K 就是 frames。
+    void SetManual(double lastReal, double real, int frames) {
         hasValue_ = true;
         frozen_ = true;
+        lastReal_ = lastReal;   // L
+        target_ = real;         // R
+        r_ = 1.0;
+        for (int i = 0; i < frames; ++i) r_ *= kRollRate;   // rate^k，逐次自乘
+        if (r_ < 0.01) r_ = 0.0;
+        frames_ = frames;
+        animating_ = false;     // 手动模式不自己推进
+        SyncValueFromTrips();   // 显示值 = L + (R−L)×(1−rate^k)
+        tripsDirty_ = true;
         trips_.clear();
         places_.clear();
     }
@@ -84,6 +87,7 @@ public:
     bool frozen() const { return frozen_; }
     void SetCrisp(bool on) { crisp_ = on; }
     // 强行指定相位 0..1（>=0 生效）：用来停在行程的任意一刻看效果。
+    // 兼容旧工具：直接指定"已走完比例"（等价于给一个 rate^k）。
     void SetPhaseOverride(double p) { phaseOverride_ = p; }
 
     // 每位坐标的读数表。单位是"格"，乘 h 就是像素。每行：
@@ -141,6 +145,8 @@ private:
     bool tripsDirty_ = false;    // 有新样本/新手动值 -> 下一帧重建行程
     double r_ = 1.0;             // rate^k：每帧自乘，避免幂运算
     bool animating_ = false;     // 是否还在滚
+    int frames_ = 0;             // k：本次变化已经运算了多少帧
+    void SyncValueFromTrips();    // 显示值 = L + (R−L)×(1−rate^k)
     // 每一位当前的纵坐标（见 places()），渲染层按它画
     std::vector<axis::PlaceCoord> places_;
     double rollStartValue_ = 0.0;   // 本次行程的起点金额（用于算进度）

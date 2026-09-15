@@ -52,9 +52,12 @@ void DisplayedAmount::OnSample(const Sample& s) {
     //   起点值只记来给自检报告"走了多少比例"，不参与计算。
     rollFromValue_ = hasValue_ ? value_ : yuan;
 
-    lastReal_ = hasValue_ ? target_ : yuan;   // L：上一次的实际数字
+    lastReal_ = hasValue_ ? target_ : yuan;   // L = 上一次的实际数字（所有者的定义）
     target_ = yuan;                            // R：这一次的实际数字
-    tripsDirty_ = true;                        // 让下一帧重建每一位的行程
+    r_ = 1.0;                                  // rate^0 = 1：剩余量满格
+    frames_ = 0;                               // k = 0：本次变化还没运算过
+    animating_ = true;
+    tripsDirty_ = true;                        // 下一帧重建每一位的行程
     if (!hasValue_) {
         // 第一次拿到值就直接落位：从 0 滚上去会让人以为余额在涨
         value_ = yuan;
@@ -62,30 +65,20 @@ void DisplayedAmount::OnSample(const Sample& s) {
     }
 }
 
+// 显示值不是独立状态量，而是由三个参数导出的：
+//     S = L + (R − L) × (1 − rate^k)
+// rate^k 被截断为 0 时 S 恰好等于 R，所以"落定精确"是公式自带的，不需要吸附补丁。
+// 这也是所有者这次的意思：参数是"实际数字 / 上次的实际数字 / 运算了 n 帧"，没有 display。
 double DisplayedAmount::UpdateValue(double dtSeconds) {
+    (void)dtSeconds;
     if (!hasValue_) { trips_.clear(); places_.clear(); return 0.0; }
-    if (frozen_) return value_;   // 手动冻结：显示值不推进
-
-    const double diff = target_ - value_;
-    if (diff == 0.0) return value_;
-
-    // 截断：差到看不见就直接吸附。
-    // ★ 指数逼近的尾巴在数值上永远不为 0，但在视觉上早就不动了。
-    //   这一条把那段"看不见的尾巴"切掉，最后一位数字才能干脆落定；
-    //   没有它，数字会在 99.997 这种地方磨蹭很久（实测过）。
-    if (std::fabs(diff) <= kDisplaySnapYuan) {
-        value_ = target_;
-        return value_;
-    }
-
-    // 连续函数：每帧走掉剩余差距的一部分。步长与 dt 挂钩，所以帧率变化不影响手感。
-    // 这是**唯一的**运动规律——没有"某次滚动的时长"这个参数。
-    const double step = 1.0 - std::exp(-dtSeconds / kDisplayTauSeconds);
-    value_ += diff * step;
-
-    // 走完这一步可能刚好越过了截断线，顺手再判一次，避免多花一帧
-    if (std::fabs(target_ - value_) <= kDisplaySnapYuan) value_ = target_;
+    if (frozen_) return value_;
+    SyncValueFromTrips();
     return value_;
+}
+
+void DisplayedAmount::SyncValueFromTrips() {
+    value_ = lastReal_ + (target_ - lastReal_) * (1.0 - r_);
 }
 
 // 每一位的纵坐标：目标是 floor(显示值 / 10^位次)，本帧朝目标追赶 dt 秒。
@@ -144,8 +137,6 @@ void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountT
             t.to = std::floor(rawR / denom);
             trips_.push_back(t);
         }
-        r_ = 1.0;             // 剩余量回到满格，重新开始滚
-        animating_ = true;
         tripsDirty_ = false;
     }
 
