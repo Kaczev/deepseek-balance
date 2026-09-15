@@ -134,14 +134,9 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     //   为什么不再用 rolling() 做条件：轮子现在不只在滚动时用，它**就是**画数字的
     //   唯一路径（滚动结束不再切到另一条静止路径，那正是"结束时跳一行"的来源）。
     //   所以未滚动时也必须给值，否则轮子按 0 算、画面上会变成 00.00。
-    //   f.roll.active 保留给"轮子要不要按小数部分偏移"用——落定后它是 0，
     //   轮子自然停在整行上，与静止状态逐像素一致。
     if (haveNumber) {
-        f.roll.active = amount.rolling();
-        f.roll.amount = amount.value();
     } else {
-        f.roll.active = false;
-        f.roll.amount = 0.0;
     }
     return f;
 }

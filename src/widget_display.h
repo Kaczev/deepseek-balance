@@ -98,19 +98,6 @@ private:
     double rollFromValue_ = 0.0;
 };
 
-// ★ 逐位里程表的正确模型（所有者指出）：
-//   每一位是一个 **0..9 的竖带**，带子的位置**由该位的连续值直接决定**。
-//   不是"旧数字往上、新数字往上"——那是两格的切换动画，看起来就是整块换掉。
-//
-//   带子位置 = frac(该位的连续值) × 行高。所以：
-//     · 余额只动 0.01 -> 只有最右那位挪 1/10 格，其余纹丝不动
-//     · 余额大跳    -> 各位飞快转过去（带一点模糊），然后落定
-struct NumberRoll {
-    bool active = false;
-    // 这一帧的连续金额。各位的带子位置由它除以各自的位权算出。
-    // **它不是"动画参数"，就是当前显示值本身**——滚动没有自己的时长。
-    double amount = 0.0;
-};
 
 struct WidgetFrame {
     ConnState state = ConnState::ColdStart;
@@ -119,7 +106,6 @@ struct WidgetFrame {
     const wchar_t* currencySymbol = L"";   // 空串 = 币种未知，**不默认 ¥**
     const wchar_t* statusText = L"";       // 标题行/状态文案
     std::string zeroTimeText;       // 清零预估（C9 填；现在留占位）
-    NumberRoll roll;
 };
 
 // 把状态 + 显示值组装成一帧。放在这里而不是渲染层，是为了让"显示什么"

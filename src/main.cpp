@@ -14,7 +14,6 @@
 #include "sampling.h"
 #include "single_instance.h"
 #include "state_machine.h"
-#include "wheel.h"
 
 #include <windows.h>
 #include <objbase.h>    // CoInitializeEx / COINIT_APARTMENTTHREADED
@@ -495,9 +494,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 const double tgt = g_display.target();
                 const double span = 19.90 - tgt;
                 const double rem = (span == 0.0) ? 0.0 : (g_display.value() - tgt) / span;
-                SelfTestLog(L"[rollstep] i=%d value=%.4f target=%.4f 剩余=%.4f active=%d text=%hs",
-                            i, g_display.value(), tgt, rem, fd.roll.active ? 1 : 0,
-                            fd.amountText.c_str());
+                SelfTestLog(L"[rollstep] i=%d value=%.4f target=%.4f rem=%.4f text=%hs",
+                            i, g_display.value(), tgt, rem, fd.amountText.c_str());
             }
 
             SelfTestLog(L"[roll] 跳变前=%.2f 跳变后目标=%.2f 推进 %d 帧后显示=%.2f",
@@ -563,72 +561,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             if (!cond) ++failed;
         };
 
-        // 里程表诊断：打开它，函数会把自己**实际收到**的文本与金额写进 wheel-trace.log。
-        // ★ 上一步的结论是"金额比预期小 100 倍"，照着这个线索要做的第一件事
-        //   不是改算法，而是**看清调用方到底传了什么**。
-        dshb::g_wheelTrace = true;
-        {
-            const dshb::AppPaths& p = dshb::Paths();
-            dshb::g_wheelTraceDir = std::string(p.dataDir.begin(), p.dataDir.end());
-        }
-
-        // --- 里程表带子的算法（与渲染分离，所以这里能直接断言） ---
-        // ★ 判据的核心只有一条：**"落位行"上露出的数字必须等于文本自己的数字**。
-        //   这一条成立，画面上看到的就是余额本身；不成立的话，露出来的会是别的数字。
-        {
-            auto landingDigits = [](const std::string& text, double amount) {
-                std::string s;
-                for (const dshb::WheelDraw& d : dshb::ComputeWheel(text, amount)) {
-                    if (d.row == 0) s.push_back(static_cast<char>('0' + d.digit));
-                }
-                return s;
-            };
-            auto textDigits = [](const std::string& text) {
-                std::string s;
-                for (char c : text) {
-                    if (c >= '0' && c <= '9') s.push_back(c);
-                }
-                return s;
-            };
-
-            struct WheelCase {
-                const char* text;
-                double amount;
-            };
-            const WheelCase wc[] = {
-                {"34.56", 34.56}, {"99.50", 99.50}, {"00.00", 0.00},
-                {"09.07", 9.07},  {"12.34", 12.34}, {"0.03", 0.03},
-            };
-            for (const WheelCase& c : wc) {
-                const std::string got = landingDigits(c.text, c.amount);
-                const std::string want = textDigits(c.text);
-                if (got != want) {
-                    SelfTestLog(L"[check]   文本=%hs 金额=%.2f 实际=%hs 期望=%hs", c.text, c.amount,
-                                got.c_str(), want.c_str());
-                }
-                expect(got == want, L"里程表：落位行露出的数字等于文本本身");
-            }
-
-            // 每一位都必须有且只有一个"落位行"条目，否则那一位会空着
-            {
-                const auto w = dshb::ComputeWheel("34.56", 34.56);
-                int landing = 0;
-                for (const dshb::WheelDraw& d : w) {
-                    if (d.row == 0) ++landing;
-                }
-                expect(landing == 4, L"里程表：四个数字位各有一个落位条目");
-            }
-
-            // 小数点不参与滚动
-            {
-                const auto w = dshb::ComputeWheel("34.56", 34.56);
-                bool dotSkipped = true;
-                for (const dshb::WheelDraw& d : w) {
-                    if (d.slot == 2) dotSkipped = false;   // '3','4','.','5','6' 的第 2 位是小数点
-                }
-                expect(dotSkipped, L"里程表：小数点不产生滚动条目");
-            }
-        }
 
         // --- 金额解析（十进制，不是浮点） ---
         {

@@ -4,7 +4,6 @@
 // 鏁板瓧銆佹洸绾裤€侀鑹层€佸績璺抽兘鏄悗闈㈡楠ょ殑浜嬶紙瀹炴柦姝ラ C/D/E锛夈€?
 
 #include "renderer.h"
-#include "wheel.h"
 
 #include <d2d1.h>
 #include <d2d1helper.h>
@@ -360,8 +359,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
         // 璇婃柇锛氭覆鏌撳眰瀹為檯鎷垮埌鐨勬枃鏈笌婊氬姩閲忥紙鍙湪 --layout-probe 鏃惰褰曪級
         {
             char buf[256];
-            std::snprintf(buf, sizeof(buf), "text=%s rollActive=%d rollAmount=%.4f",
-                          f.amountText.c_str(), f.roll.active ? 1 : 0, f.roll.amount);
+        std::snprintf(buf, sizeof(buf), "text=%s", f.amountText.c_str());
             LayoutProbe(buf, 0, 0, 0, 0);
         }
 
@@ -396,25 +394,6 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             //   鈽?涔熶笉鐢ㄤ竴鏉?"0\n1\n...\n9" 鐨勫琛屾帓鐗堬細DirectWrite 鐨勮嚜鍔ㄨ璺濅笉鎸?
             //     鎴戜滑瑕佺殑琛岄珮璧帮紙瀹炴祴鍗佽琚帇鍒扮害 17 鍍忕礌涓€琛岋紝鍗佷綅閮介湶鍚屼竴涓暟瀛楋級銆?
             //     鍗佷釜鏁板瓧鍚勮嚜瀹氫綅锛屼綅缃畬鍏ㄥ彲鎺с€?
-            static IDWriteTextLayout* digitLayouts[10] = {};
-            static bool digitTried = false;
-            if (!digitTried) {
-                digitTried = true;
-                IDWriteFactory* dw = DebugWriteFactory();
-                if (dw && numFmt) {
-                    for (int d = 0; d < 10; ++d) {
-                        const wchar_t buf[2] = {static_cast<wchar_t>(L'0' + d), 0};
-                        if (FAILED(dw->CreateTextLayout(buf, 1, numFmt, 256.0f, 128.0f,
-                                                        &digitLayouts[d]))) {
-                            digitLayouts[d] = nullptr;
-                        }
-                    }
-                }
-            }
-
-            constexpr double kRowDip = 40.0;   // 涓€涓暟瀛楀崰鐨勯珮搴?= 瀛楀彿
-            const double rowPx = kRowDip * s;
-
             // 鐢?*鏁翠覆鏁板瓧鑷繁鐨勬帓鐗?*閲忓嚭閫愬瓧绗︾殑鍘熺偣涓庤楂樸€?
             // 杩欐牱姣忎竴浣嶇殑鏍煎瓙浣嶇疆銆佷互鍙?鏁板瓧鍦ㄨ閲屼粠鍝紑濮?锛岄兘鏄棶鎺掔増寮曟搸寰楁潵鐨勶紝
             // 涓嶅啀闈犵寽鈥斺€斾箣鍓嶅嚑鐗堝氨鏄寽鍋忕Щ锛岀粨鏋滄暟瀛楃敾鍒板埆鐨勬牸瀛愰噷銆?
@@ -423,67 +402,40 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             MeasureCharOrigins(measureText, numFmt, &charXs, &lineH);
 
             const std::wstring& target = measureText;
-            for (size_t i = 0; i < target.size(); ++i) {
-                const bool isDigit = target[i] >= L'0' && target[i] <= L'9';
-                const float chX = (i < charXs.size()) ? (left + charXs[i]) : left;
-                const float w = MeasureCharWidth(target[i], numFmt);
+            // STATIC DRAW: the whole amount string is laid out once and drawn in a single
+            // call, so the engine positions every character itself. The decimal point then
+            // lands on the digits' baseline, spacing comes from the font, and nothing is
+            // clipped. No wheel, no per-digit tape, no clip window.
+            //
+            // The vertical anchor is derived from the first digit's measured ink inset
+            // (how far its ink starts below the layout origin) instead of being assumed, so
+            // the digits sit centred on the panel midline whatever the font's metrics are.
+            size_t firstDigit = 0;
+            for (size_t k = 0; k < target.size(); ++k) {
+                if (target[k] >= L'0' && target[k] <= L'9') { firstDigit = k; break; }
+            }
 
-                if (isDigit && digitLayouts[0]) {
-                    // ★★ 永远走轮子，**不要**在"滚动结束"时切到另一条静止路径。
-                    //   所有者报的"滚动结束时严重跳变"就是这条切换造成的：
-                    //     滚动中：y = numberTop + rowPx * (1 - frac + row)
-                    //             frac==0 且 row==0 时 -> numberTop + rowPx
-                    //     静止时：y = numberTop            <- 整整差一行（40 px）
-                    //   我把这两条路径当成等价了，其实不等价，于是切换那一帧数字跳一行。
-                    //   轮子本身就是"该位当前值"的完整表达：frac==0 时画出来的就是静止
-                    //   状态。所以只留一条路径，**"切换"这个动作根本不存在**。
-                    // 鈽?鐢ㄥ崟鐙祴杩囩殑绾嚱鏁扮畻甯﹀瓙锛屾覆鏌撳眰涓嶅啀鑷繁绠椾綅鏉冦€?
-                    //   涓婁竴鐗堣繖閲屾槸鍐呰仈鐨勪竴濂楁暟瀛︼紝杩為敊鍥涙閮介潬鐪嬪浘鐚滃師鍥狅紱
-                    //   鎶藉嚭鏉ヤ箣鍚庣敱 --selftest-b 鐩存帴鏂█"钀戒綅琛岄湶鍑虹殑鏁板瓧 = 鏂囨湰鏈韩"銆?
-                    const std::vector<dshb::WheelDraw> wheels =
-                        dshb::ComputeWheel(f.amountText, f.roll.amount);
+            float inkTopDip = 9.863f;
+            IDWriteTextLayout* one = nullptr;
+            const wchar_t chBuf[2] = {target[firstDigit], 0};
+            if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(chBuf, 1, numFmt, 256.0f, 128.0f,
+                                                               &one)) &&
+                one) {
+                DWRITE_OVERHANG_METRICS o0{};
+                one->GetOverhangMetrics(&o0);
+                inkTopDip = -o0.top;
+                one->Release();
+            }
 
-                    // 瑁佸壀绐楀彛锛氫互"钀戒綅琛?涓哄噯锛屼笂涓嬪悇鍗婅锛岀獥鍙ｉ噷姝ｅソ涓€涓暟瀛?
-                    const float bandTop = numberTop + static_cast<float>(rowPx) -
-                                          static_cast<float>(0.5 * rowPx);
-                    const float bandBottom = bandTop + static_cast<float>(rowPx);
-                    rt->PushAxisAlignedClip(D2D1::RectF(chX, bandTop, chX + w, bandBottom),
-                                            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-
-                    // 鏁板瓧鐨?钀戒綅琛?鏄?numberTop 鍐嶅線涓嬩竴鏁磋锛堟帓鐗堟椤剁鍒板瓧褰箣闂?
-                    // 杩樻湁涓€娈佃鍐呭墠瀵硷紝姝ｅソ涓€琛屸€斺€攌RowDip 鍙栧瓧鍙峰氨鏄繖涓師鍥狅級銆?
-                    // 鍐嶅姞涓?璇ヤ綅鍦ㄤ袱琛屼箣闂寸殑浣嶇疆"frac锛屽甫瀛愭墠鏄繛缁粦鍔ㄧ殑銆?
-                    // 该位的"连续值"必须问 wheel 模块要，**不要在这里再算一遍位权**。
-                    // ★ 第一版这里内联了一套自己的位权算法（"右边还有几个数字字符"），
-                    //   和 ComputeWheel 里那套含义不一致——两边不一致的直接后果是
-                    //   带子被整体挪偏一行，而画面上表现为"数字根本不是余额"。
-                    //   位权只允许在 wheel.cpp 里实现一次。
-                    double wheelValue = 0.0;
-                    if (dshb::WheelValueAt(f.amountText, static_cast<int>(i), f.roll.amount,
-                                           &wheelValue)) {
-                        const double frac = wheelValue - std::floor(wheelValue);
-                        for (const dshb::WheelDraw& wd : wheels) {
-                            if (wd.slot != static_cast<int>(i)) continue;
-                            if (!digitLayouts[wd.digit]) continue;
-                            const float y = static_cast<float>(
-                                numberTop + rowPx * (1.0 - frac + wd.row));
-                            rt->DrawTextLayout(D2D1::Point2F(chX, y), digitLayouts[wd.digit], b,
-                                               D2D1_DRAW_TEXT_OPTIONS_NONE);
-                        }
-                    }
-                    rt->PopAxisAlignedClip();
-                } else {
-                    // 灏忔暟鐐广€侀€楀彿銆佷互鍙婇潤姝㈢殑浣嶏細鎸夐噺鍑烘潵鐨勫師鐐瑰師鍦扮敾
-                    IDWriteTextLayout* l = nullptr;
-                    const wchar_t buf[2] = {target[i], 0};
-                    if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
-                            buf, 1, numFmt, 256.0f, 128.0f, &l)) &&
-                        l) {
-                        rt->DrawTextLayout(D2D1::Point2F(chX, numberTop), l, b,
-                                           D2D1_DRAW_TEXT_OPTIONS_NONE);
-                        l->Release();
-                    }
-                }
+            IDWriteTextLayout* whole = nullptr;
+            if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(measureText.c_str(),
+                                                               static_cast<UINT32>(measureText.size()),
+                                                               numFmt, 4096.0f, 256.0f, &whole)) &&
+                whole) {
+                const float lineTop = numberTop - inkTopDip * s;
+                rt->DrawTextLayout(D2D1::Point2F(left, lineTop), whole, b,
+                                   D2D1_DRAW_TEXT_OPTIONS_NONE);
+                whole->Release();
             }
             b->Release();
         }
