@@ -133,8 +133,10 @@ private:
     //   分开之后：新值只改各自的 target，coord 从当前位置继续走，不会跳。
     struct Trip {
         int place = axis::kNoPlace;
-        double coord = 0.0;    // 当前坐标（连续）
-        double target = 0.0;   // 目标坐标（整数）
+        double from = 0.0;        // 起点坐标（格）
+        double D = 0.0;           // 这一位要走多少格（带符号）
+        double ratePower = 1.0;   // 这一位自己的 rate^k，每帧自乘一次
+        double coord = 0.0;       // 当前坐标
     };
     std::vector<Trip> trips_;
     double lastReal_ = 0.0;      // L：上次变化时的实际数字

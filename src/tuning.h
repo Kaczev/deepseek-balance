@@ -93,7 +93,7 @@ inline constexpr float kEstimateInsetDip = 26.0f;
 //   剩余 = D × rate^k，所以 rate 越小滚得越快、越早到位；越接近 1 越慢越长。
 //   ★ 这是**每帧**系数（窗口是垂直同步的，约 60 帧/秒），不是每秒系数：
 //     改成按秒算就要用 pow(rate, dt×60)，而所有者要的正是避免幂运算。
-inline constexpr float kRollRate = 0.99f;
+inline constexpr float kRollRate = 0.97f;
 
 // ★ 每位自己的截断阈值（单位：格）。**每一位分开判断**：
 //   当"这一位自己的剩余移动距离" < 这个值时，直接把这一位放到位（坐标 = 目标整数）。
@@ -101,6 +101,17 @@ inline constexpr float kRollRate = 0.99f;
 //   这样某一位先到位就先停下来，不会被其他位的进度拖住。
 //   一位的"格"就是它自己的一个数字：距离 1.0 格 = 正好走到下一个数字。
 inline constexpr float kRollSnapGrid = 0.01f;
+
+// ★ 缓动曲线指数 c：位置 = L + D × (1 − rate^k)^c。
+//   c = 1 就是原来的 (1 − rate^k)；c > 1 起步更慢、尾段更有"收"的感觉；
+//   c < 1 起步更快。这是外观旋钮，由所有者调。
+inline constexpr float kRollCurveC = 1.0f;
+
+// ★ 步长 D 的取整口径（两种都留着，便于对比）：
+//   true  = floor((R − L)/n)          —— 所有者指定的写法
+//   false = floor(R/n) − floor(L/n)   —— 起点不在整数格上时不会多走一步
+//   两者只在"起点不是 n 的整数倍"时不同。
+inline constexpr bool kRollDDiffFloor = false;  // 默认 B：floor(R/n) − floor(L/n)
 
 // ---------------------------------------------------------------------------
 // 4. 颜色与透明度

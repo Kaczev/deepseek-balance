@@ -121,6 +121,18 @@ double DisplayedAmount::UpdateValue(double dtSeconds) {
 //   · 新值到来时只改 target，coord 从当前位置继续走 -> 不会跳
 //     （全体共用一个 rate^k 时，中途来新值要重置共用状态，所有轮子被拽回起点，
 //       所有者看到的"突变"正是如此；他 rate=0.99 一轮要 7.6 秒，而序列每 3 秒换值）
+// 每一位自己管自己地滚。位置公式（所有者给的）：
+//
+//     coord_n(k) = L + D_n × (1 − rate^k)^c        D_n = floor((R − L)/n)
+//
+// 实现要点：
+//   · 每位自带 ratePower = rate^k，每帧自乘一次（不做幂运算）
+//   · 截断**每位独立**：这一位自己的剩余距离 < kRollSnapGrid 就放到位
+//   · 新值到来只改终点，起点取"这一位当前坐标" -> 不会跳
+//     （全体共用一个 rate^k 时，中途来新值要重置共用状态、所有轮子被拽回起点，
+//       所有者看到的"突变"就是这样来的）
+//   · D 的取整口径由 kRollDDiffFloor 选：所有者的 floor((R−L)/n)，
+//     或 floor(R/n) − floor(L/n)（起点不在整数格上时不会多走一格）
 void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountText) {
     (void)dtSeconds;
     if (!hasValue_ || amountText.empty()) {
@@ -129,25 +141,42 @@ void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountT
         return;
     }
 
-    // 重建"有哪些位次"：保留已有的 coord（关键——这是不跳的原因），只更新 target。
+    const double rawL = std::floor(lastReal_ * 100.0 + 0.5) * 100.0;
+    const double rawR = std::floor(target_ * 100.0 + 0.5) * 100.0;
+
+    // 重建"有哪些位次"：终点按公式算，起点取这一位的当前位置（连续性）。
     if (tripsDirty_) {
         std::vector<Trip> next;
         for (int slot = 0; slot < static_cast<int>(amountText.size()); ++slot) {
             const int place = axis::PlaceOfSlot(amountText, slot);
             if (place == axis::kNoPlace) continue;
             const double denom = std::pow(10.0, static_cast<double>(place) + 4.0);
+            const double Lg = rawL / denom;   // 起点格（不提前取整）
+            // 终点：所有者口径 L + floor((R−L)/n)，或 floor(R/n)
+            double endGrid;
+            if (kRollDDiffFloor) {
+                endGrid = Lg + std::floor((rawR - rawL) / denom);
+            } else {
+                endGrid = std::floor(rawR / denom);
+            }
             Trip t;
             t.place = place;
-            t.target = std::floor(std::floor(target_ * 100.0 + 0.5) * 100.0 / denom);
-            // 已有这一位就沿用它的当前位置；新出现的位从"上一次的实际数字"对应的整数出发。
             bool kept = false;
             for (const Trip& old : trips_) {
-                if (old.place == place) { t.coord = old.coord; kept = true; break; }
+                if (old.place == place) {
+                    t.from = old.coord;        // 从当前位置继续，不跳
+                    // 缓动不沿用：上一次那位已经吸附（ratePower=0），沿用会让它当场跳到新终点
+                    t.ratePower = 1.0;
+                    kept = true;
+                    break;
+                }
             }
             if (!kept) {
-                const double rawL = std::floor(lastReal_ * 100.0 + 0.5) * 100.0;
-                t.coord = std::floor(rawL / denom);
+                t.from = Lg;
+                t.ratePower = 1.0;
             }
+            t.D = endGrid - t.from;
+            t.coord = t.from + t.D * std::pow(1.0 - t.ratePower, kRollCurveC);
             next.push_back(t);
         }
         trips_ = next;
@@ -155,17 +184,15 @@ void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountT
         animating_ = true;
     }
 
-    // 交给手动模式：按 k 帧算出每一位的坐标（不推进，直接摆到那一帧的位置）。
+    // 手动模式：按 k 帧直接摆到那一帧的位置（不推进）。
     if (frozen_) {
         places_.clear();
         for (Trip& t : trips_) {
-            const double rawL = std::floor(lastReal_ * 100.0 + 0.5) * 100.0;
-            const double denom = std::pow(10.0, static_cast<double>(t.place) + 4.0);
-            const double start = std::floor(rawL / denom);
-            double remaining = (t.target - start);
-            for (int i = 0; i < frames_; ++i) remaining *= kRollRate;
-            if (std::fabs(remaining) < kRollSnapGrid) t.coord = t.target;
-            else t.coord = t.target - remaining;
+            t.ratePower = 1.0;
+            for (int i = 0; i < frames_; ++i) t.ratePower *= kRollRate;
+            const double eased = 1.0 - t.ratePower;
+            t.coord = t.from + t.D * std::pow(eased, kRollCurveC);
+            if (std::fabs(t.D - (t.coord - t.from)) < kRollSnapGrid) t.coord = t.from + t.D;
             places_.push_back(axis::PlaceCoord{t.place, t.coord});
         }
         SyncValueFromTrips();
@@ -176,11 +203,14 @@ void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountT
     bool anyMoving = false;
     places_.clear();
     for (Trip& t : trips_) {
-        double remaining = (t.target - t.coord) * static_cast<double>(kRollRate);
+        t.ratePower *= kRollRate;                       // rate^k 自乘，避免幂运算
+        const double eased = 1.0 - t.ratePower;
+        t.coord = t.from + t.D * std::pow(eased, kRollCurveC);
+        const double remaining = (t.from + t.D) - t.coord;   // 这一位还差多少格
         if (std::fabs(remaining) < kRollSnapGrid) {
-            t.coord = t.target;            // 这一位自己到位了
+            t.coord = t.from + t.D;                    // 这一位自己到位了
+            t.ratePower = 0.0;
         } else {
-            t.coord = t.target - remaining;
             anyMoving = true;
         }
         places_.push_back(axis::PlaceCoord{t.place, t.coord});
