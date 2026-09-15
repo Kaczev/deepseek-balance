@@ -24,7 +24,10 @@ add_executable(dshb
     src/sampling.cpp
     src/state_machine.cpp
     src/widget_display.cpp
-  )
+    src/api_client.cpp
+    src/json_min.cpp
+    src/balance_source.cpp
+)
 
 set_target_properties(dshb PROPERTIES WIN32_EXECUTABLE TRUE)
 
@@ -36,7 +39,7 @@ target_compile_definitions(dshb PRIVATE
 
 target_link_libraries(dshb PRIVATE
     d2d1 d3d11 dcomp dwrite windowscodecs
-    user32 gdi32 ole32 uuid shell32)
+    user32 gdi32 ole32 uuid shell32 winhttp)
 
 target_sources(dshb PRIVATE src/app.manifest)
 set_property(TARGET dshb PROPERTY VS_DPI_AWARE "PerMonitor")

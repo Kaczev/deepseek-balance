@@ -14,6 +14,7 @@
 #include "sampling.h"
 #include "single_instance.h"
 #include "state_machine.h"
+#include "balance_source.h"
 
 #include <windows.h>
 #include <objbase.h>    // CoInitializeEx / COINIT_APARTMENTTHREADED
@@ -63,6 +64,18 @@ bool g_realGiven = false;
 bool g_lastGiven = false;
 bool g_fixedGiven = false;
 bool g_rollGiven = false;   // 是否真的传了 --roll（默认 g_rollFrames=0 与 --roll=0 无法区分）
+
+// ---- 真接口（J1/J2/J4/J6）----
+// 默认在有 Key 时启用；--api=off 关掉（回到假数据源，调试用）。HTTP 在后台线程。
+bool g_apiOff = false;          // --api=off
+bool g_apiOnce = false;         // --api-once：只取一次（自检用）
+bool g_realApiOn = false;       // 真接口是否已启动（启动后就不再喂假数据源）
+std::wstring g_apiHost = L"api.deepseek.com";
+int g_apiPort = 443;
+bool g_apiPlainHttp = false;
+int g_apiTimeoutMs = 5000;
+int g_apiIntervalMs = 10000;
+dshb::BalanceSource g_apiSource;
 double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
 double g_displayAmount = 0.0;   // 已弃用（所有者改为 --last）
 double g_lastAmount = -1.0;   // --last=L（-1 = 未给）
@@ -253,6 +266,52 @@ void RemoveEscHook() {
 
 }  // namespace
 
+// 从 DSH 的凭据文件里取 Key：~/.dsh/.credentials.yaml 的 refs.DEEPSEEK_API_KEY。
+//
+// ★ 为什么需要它：这台机器上 DEEPSEEK_API_KEY **不在环境变量里**（进程里没有、
+//   用户级/机器级也没设），DSH 把模型凭据存在自己的全局文件里，旧版工具就是从那里拿的。
+//   只做最小解析：找 refs 段里那一行，因此不引入 YAML 依赖。
+//   值绝不打印、绝不写日志（设计 §10.5 / J6），只报用了哪个来源。
+static bool ReadKeyFromDshCredentials(std::wstring* out) {
+    wchar_t profile[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH) == 0) return false;
+    const std::wstring path = std::wstring(profile) + L"\\.dsh\\.credentials.yaml";
+
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"rb") != 0 || !fp) return false;
+    std::string blob;
+    char buf[4096];
+    size_t got = 0;
+    while ((got = std::fread(buf, 1, sizeof(buf), fp)) > 0) blob.append(buf, got);
+    std::fclose(fp);
+
+    // 逐行扫：只认 "  DEEPSEEK_API_KEY: <值>" 这一行
+    size_t pos = 0;
+    while (pos < blob.size()) {
+        size_t eol = blob.find('\n', pos);
+        if (eol == std::string::npos) eol = blob.size();
+        std::string line = blob.substr(pos, eol - pos);
+        pos = eol + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        size_t i = 0;
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+        if (line.compare(i, 16, "DEEPSEEK_API_KEY") != 0) continue;
+        size_t c = line.find(':', i);
+        if (c == std::string::npos) continue;
+        std::string v = line.substr(c + 1);
+        while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
+        while (!v.empty() && (v.back() == '\r' || v.back() == ' ')) v.pop_back();
+        if (v.size() >= 2 && ((v.front() == '"' && v.back() == '"') || (v.front() == '\'' && v.back() == '\''))) {
+            v = v.substr(1, v.size() - 2);
+        }
+        // 只接受看起来像 Key 的值（避免把占位符当成 Key）
+        if (v.size() < 20 || v.compare(0, 3, "sk-") != 0) continue;
+        out->assign(v.begin(), v.end());   // 值本身是 ASCII
+        return true;
+    }
+    return false;
+}
+
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -275,6 +334,20 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_selftestB = true;
         } else if (wcscmp(argv[i], L"--layout-probe") == 0) {
             g_layoutProbe = true;
+        } else if (wcscmp(argv[i], L"--api=off") == 0) {
+            g_apiOff = true;
+        } else if (wcscmp(argv[i], L"--api-once") == 0) {
+            g_apiOnce = true;
+        } else if (wcsncmp(argv[i], L"--api-host=", 11) == 0) {
+            g_apiHost = argv[i] + 11;
+        } else if (wcsncmp(argv[i], L"--api-port=", 11) == 0) {
+            g_apiPort = _wtoi(argv[i] + 11);
+        } else if (wcscmp(argv[i], L"--api-plain-http") == 0) {
+            g_apiPlainHttp = true;
+        } else if (wcsncmp(argv[i], L"--api-timeout-ms=", 17) == 0) {
+            g_apiTimeoutMs = _wtoi(argv[i] + 17);
+        } else if (wcsncmp(argv[i], L"--api-interval-ms=", 18) == 0) {
+            g_apiIntervalMs = _wtoi(argv[i] + 18);
         } else if (wcsncmp(argv[i], L"--scenario=", 11) == 0) {
             // Accepts a 1-based number (as printed by ScenarioName) or an ASCII alias.
             // A name that is not recognised USED to be swallowed by _wtoi and silently
@@ -490,7 +563,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     }
     if (!renderer.Create(g_hwnd, size)) {
         SelfTestLog(L"[main] 渲染器创建失败（D3D11 / DComp / 交换链）");
-        DestroyWindow(g_hwnd);
+    DestroyWindow(g_hwnd);
         CoUninitialize();
         return 3;
     }
@@ -544,7 +617,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
         renderer.Destroy();
         g_renderer = nullptr;
-        DestroyWindow(g_hwnd);
+    DestroyWindow(g_hwnd);
         CoUninitialize();
         return premultiplied ? 0 : 8;
     }
@@ -637,7 +710,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 }
                 renderer.Destroy();
                 g_renderer = nullptr;
-                DestroyWindow(g_hwnd);
+    DestroyWindow(g_hwnd);
                 CoUninitialize();
                 return 0;
             }
@@ -724,7 +797,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                     size.widthPx, size.heightPx);
         renderer.Destroy();
         g_renderer = nullptr;
-        DestroyWindow(g_hwnd);
+    DestroyWindow(g_hwnd);
         CoUninitialize();
         return ok ? 0 : 7;
     }
@@ -992,7 +1065,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 所以换数据源不需要动它——这正是把这两件事分开的目的。
         {
             const dshb::Sample s = g_fake.NextIfDue(elapsed);
-            if (s.wallMs != 0 && !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0 && g_seq.empty()) {   // 钉值时不喂
+            if (s.wallMs != 0 && !g_realApiOn && !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0 && g_seq.empty()) {   // 钉值/真接口时不喂
                 g_states.OnSample(s, s.wallMs);
             }
         }
@@ -1000,12 +1073,47 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // Key 缺失是启动时检查一次即可（设计 §4 的 NoKey 态）
         {
             static bool keyChecked = false;
-            static bool haveKey = true;
             if (!keyChecked) {
                 keyChecked = true;
-                wchar_t buf[8]{};
-                haveKey = GetEnvironmentVariableW(L"DEEPSEEK_API_KEY", buf, 8) > 0;
+                // ★ 原来是 buf[8]：只够"判断有没有"，不够真的拿去发请求。
+                //   要发请求就必须完整读出来。Key 绝不写进任何日志（J6）。
+                wchar_t keyBuf[512]{};
+                bool haveKey = GetEnvironmentVariableW(L"DEEPSEEK_API_KEY", keyBuf, 512) > 0;
+                if (haveKey) {
+                    SelfTestLog(L"[api] Key 取自环境变量 DEEPSEEK_API_KEY");
+                } else {
+                    // 环境变量没有 -> 回落到 DSH 的全局凭据文件（旧版就是这么拿的）
+                    std::wstring fromStore;
+                    if (ReadKeyFromDshCredentials(&fromStore)) {
+                        wcsncpy_s(keyBuf, fromStore.c_str(), _TRUNCATE);
+                        haveKey = true;
+                        SelfTestLog(L"[api] Key 取自 DSH 凭据文件 refs.DEEPSEEK_API_KEY（不打印内容）");
+                    }
+                }
                 g_states.SetNoKey(!haveKey);
+
+                const bool manualRun = g_fixedGiven || g_realGiven || g_lastGiven || g_frames >= 0 ||
+                                       !g_seq.empty();
+                if (haveKey && !g_apiOff && !manualRun) {
+                    dshb::BalanceSourceConfig cfg{};
+                    cfg.host = g_apiHost;
+                    cfg.port = g_apiPort;
+                    cfg.plainHttp = g_apiPlainHttp;
+                    cfg.timeoutMs = g_apiTimeoutMs;
+                    cfg.intervalMs = g_apiIntervalMs;
+                    cfg.once = g_apiOnce;
+                    // 宽字符 -> UTF-8；api_client 只用它发请求，不打印
+                    char narrow[1024]{};
+                    const int nc = WideCharToMultiByte(CP_UTF8, 0, keyBuf, -1, narrow,
+                                                       sizeof(narrow), nullptr, nullptr);
+                    if (nc > 0) cfg.apiKey.assign(narrow);
+                    g_apiSource.Start(cfg);
+                    g_realApiOn = true;
+                    SelfTestLog(L"[api] 真接口已启动：host=%ls port=%d 间隔=%dms 超时=%dms",
+                                g_apiHost.c_str(), g_apiPort, g_apiIntervalMs, g_apiTimeoutMs);
+                } else if (!haveKey) {
+                    SelfTestLog(L"[api] 未找到 DEEPSEEK_API_KEY：走 NoKey 态，不发请求");
+                }
             }
         }
 
@@ -1057,6 +1165,31 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         const bool manualMode = (g_fixedGiven || g_realGiven || g_lastGiven || g_frames >= 0 || !g_seq.empty());
         g_display.SetCrisp(g_crisp);
         if (g_phaseOverride >= 0.0) g_display.SetPhaseOverride(g_phaseOverride);
+        // ---- 真接口：UI 线程只做"取样本、取日志"两件事（HTTP 在后台线程，§11.1）----
+        if (g_realApiOn) {
+            dshb::Sample rs{};
+            while (g_apiSource.Poll(&rs)) {
+                g_states.OnSample(rs, rs.wallMs);
+                // 只有成功的样本才动显示值；失败时保持原样（所有者："先当作没变"）
+                if (rs.amountsOk) g_display.OnSample(g_states.lastGood());
+            }
+            std::string apiLine;
+            while (g_apiSource.PollLog(&apiLine)) SelfTestLog(L"[api] %hs", apiLine.c_str());
+            // 连续失败到第 5 次才显示 --.--（阈值在 tuning.h）。
+            // 跨过阈值/恢复各记一行：J6 要求日志能还原"为什么显示成这样"。
+            static bool gaveUp = false;
+            const int fails = g_apiSource.consecutiveFailures();
+            if (fails >= dshb::kUnreadableAfterFailures && !gaveUp) {
+                gaveUp = true;
+                g_display.MarkUnreadable();
+                SelfTestLog(L"[api] 连续失败 %d 次：显示 --.--（阈值 %d）", fails,
+                            dshb::kUnreadableAfterFailures);
+            } else if (fails == 0 && gaveUp) {
+                gaveUp = false;
+                SelfTestLog(L"[api] 采样恢复成功：显示恢复实时余额");
+            }
+        }
+
         if (!manualMode) g_display.OnSample(g_states.lastGood());
         g_display.Update(dt);
 
@@ -1103,6 +1236,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
     renderer.Destroy();
     g_renderer = nullptr;
+    g_apiSource.Stop();
     DestroyWindow(g_hwnd);
     CoUninitialize();
     return 0;

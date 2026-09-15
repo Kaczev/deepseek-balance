@@ -28,6 +28,16 @@ void DiffSpan(const std::string& a, const std::string& b, int* from, int* to) {
 
 }  // namespace
 
+// 连续取不到值：回到"没有值"的状态（界面显示 --.--），但**历史不丢**：
+// 下一次成功样本会重新落位。所有者：先当作没变，连续 5 次才显示 --.--。
+void DisplayedAmount::MarkUnreadable() {
+    hasValue_ = false;
+    trips_.clear();
+    places_.clear();
+    animating_ = false;
+    tripsDirty_ = true;
+}
+
 void DisplayedAmount::OnSample(const Sample& s) {
     if (!s.amountsOk) return;                 // 读不到的样本不参与显示
 

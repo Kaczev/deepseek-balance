@@ -105,6 +105,10 @@ inline constexpr float kRollSnapGrid = 0.01f;
 // ★ 缓动曲线指数 c：位置 = L + D × (1 − rate^k)^c。
 //   c = 1 就是原来的 (1 − rate^k)；c > 1 起步更慢、尾段更有"收"的感觉；
 //   c < 1 起步更快。这是外观旋钮，由所有者调。
+// ★ 所有者定的规则：取不到值时**先当作没变**（显示保持原样），
+//   连续失败到第 5 次才显示 --.--。
+inline constexpr int kUnreadableAfterFailures = 5;
+
 inline constexpr float kNumberShiftRate = 0.90f;   // 整块数字横向滑动：每帧把残差乘上它（同 kRollRate 的风格）
 inline constexpr float kNumberShiftSnapDip = 0.05f;   // 横向残差 < 它就直接吸附（免得永远差一点点）
 inline constexpr float kRollCurveC = 10.0f;

@@ -94,6 +94,9 @@ public:
     double Update(double dtSeconds);
 
     bool hasValue() const { return hasValue_; }
+    // 连续失败到达阈值后调用：显示回到"没有值"（即 --.--）。
+    // 下次成功样本会经 OnSample 自动恢复。
+    void MarkUnreadable();
     double value() const { return value_; }
     double target() const { return target_; }
 
