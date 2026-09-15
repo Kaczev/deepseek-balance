@@ -288,7 +288,11 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     // 文案形态按 §7.4 的两种分支预留：相对时长在前，剩余较短时后面再补一个
     // 绝对时刻（设计原文示例「按当前速度，约 2 小时后归零」+「约 14:32」）。
     // 整行偏长，若排版放不下，先砍掉括号里的绝对时刻。
-    f.zeroTimeText = haveNumber ? "按当前速度，约 X 小时后归零" : "";
+    // ★ 所有者：欠款与为 0 时不显示这一行。
+    //   欠款时说"约 X 小时后归零"是废话（已经欠了），余额为 0 时更荒谬。
+    //   判定用**目标值**而不是动画值：动画途中穿过 0 不该让这行字闪。
+    const bool canEstimate = haveNumber && amount.target() > 0.0;
+    f.zeroTimeText = canEstimate ? "按当前速度，约 X 小时后归零" : "";
 
     // ★ 逐位里程表：把"这一帧的连续金额"交给渲染层，**任何时刻都要给**。
     //

@@ -62,6 +62,7 @@ double g_fixedAmount = 0.0;
 bool g_realGiven = false;
 bool g_lastGiven = false;
 bool g_fixedGiven = false;
+bool g_rollGiven = false;   // 是否真的传了 --roll（默认 g_rollFrames=0 与 --roll=0 无法区分）
 double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
 double g_displayAmount = 0.0;   // 已弃用（所有者改为 --last）
 double g_lastAmount = -1.0;   // --last=L（-1 = 未给）
@@ -275,9 +276,27 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         } else if (wcscmp(argv[i], L"--layout-probe") == 0) {
             g_layoutProbe = true;
         } else if (wcsncmp(argv[i], L"--scenario=", 11) == 0) {
-            const int idx = _wtoi(argv[i] + 11);
-            if (idx >= 0 && idx < static_cast<int>(dshb::Scenario::Count)) {
+            // Accepts a 1-based number (as printed by ScenarioName) or an ASCII alias.
+            // A name that is not recognised USED to be swallowed by _wtoi and silently
+            // select scenario 0 - so "--scenario=NoNetwork" quietly showed scenario 1.
+            // An unknown value is now reported instead of guessed at.
+            const wchar_t* v = argv[i] + 11;
+            static const wchar_t* kAliases[] = {L"steady", L"fast", L"low", L"recharge", L"zero",
+                                               L"unavailable", L"nonetwork", L"stale", L"clockjump"};
+            int idx = -1;
+            const int num = _wtoi(v);
+            if (num >= 1 && num <= static_cast<int>(dshb::Scenario::Count)) {
+                idx = num - 1;                     // 1-based, matching the printed names
+            } else {
+                for (int a = 0; a < static_cast<int>(dshb::Scenario::Count); ++a) {
+                    if (_wcsicmp(v, kAliases[a]) == 0) { idx = a; break; }
+                }
+            }
+            if (idx >= 0) {
                 g_fake.Select(static_cast<dshb::Scenario>(idx));
+            } else {
+                SelfTestLog(L"[argv] --scenario=%ls not recognised (use 1..%d or a name); ignored",
+                            v, static_cast<int>(dshb::Scenario::Count));
             }
         } else if (wcsncmp(argv[i], L"--speed=", 8) == 0) {
             g_fake.SetSpeed(_wtof(argv[i] + 8));
@@ -327,6 +346,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_fixedGiven = true;
         } else if (wcsncmp(argv[i], L"--roll=", 7) == 0) {
             g_rollFrames = 1;                     // 只要出现这个参数就进入滚动抓帧模式
+            g_rollGiven = true;
             if (wcscmp(argv[i] + 7, L"loop") == 0) {
                 g_rollLoop = true;                // 循环跳变，供肉眼观察
             } else {
@@ -545,7 +565,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // --roll=N：把"余额跳变之后第 N/60 秒"这一瞬间单独抓出来。
         // 用途是**看滚动动画**——静态单帧看不出数字是怎么滚过去的，
         // 连拍若干张不同 N 的图才能看出过程（动画也是要人眼判的东西）。
-        if ((g_rollFrames > 0 || g_rollFrames == 0) && !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0) {
+        // 只在真的传了 --roll 时预热：否则连 --scenario 导出都会被预热成 19.90，
+        // 于是"没有值 -> --.--"这条根本没法用像素验证（踩过）。
+        if (g_rollGiven && !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0) {
             // --roll=N：把"余额跳变之后第 N 帧"这一瞬间单独抓出来。
             // 用途是**看滚动动画**——静态单帧看不出数字是怎么滚过去的，
             // 连拍若干张不同 N 的图才能看出过程（动画也是要人眼判的东西）。
