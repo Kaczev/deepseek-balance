@@ -86,7 +86,6 @@ void DumpLayoutProbe() {
 
 namespace {
 
-constexpr float kPanelOpacity = 0.95f;
 
 // 鈽?棰滆壊绾緥锛圓8c锛屽凡鎸夊疄娴嬬籂姝ｈ繃涓€娆★級锛?
 //   **Direct2D 鐢诲埛瑕佺殑鏄洿閫氾紙straight锛夐鑹?*鈥斺€旈涔樻槸 D2D 鎸夌洰鏍?alpha 妯″紡
@@ -104,8 +103,6 @@ struct Rgba {
 };
 
 // #6c89f6锛堝厖瓒虫。鍩哄噯鑹诧級
-constexpr Rgba kBaseColor{108.0f / 255.0f, 137.0f / 255.0f, 246.0f / 255.0f, kPanelOpacity};
-constexpr Rgba kWhite{1.0f, 1.0f, 1.0f, 0.9f};
 
 // ---------------------------------------------------------------------------
 // 棰勪箻鑷鐢ㄧ殑鐢婚潰锛圓8c锛夛細涓€涓?50% 涓嶉€忔槑鐨勭函绾㈡柟鍧椼€?
@@ -155,7 +152,7 @@ void PaintPremulProbe(ID2D1RenderTarget* rt) {
     rt->Clear(D2D1::ColorF(0, 0.0f));
     ID2D1SolidColorBrush* red = nullptr;
     // 鐩撮€氶鑹蹭氦缁?D2D锛涗笉瑕佸湪杩欓噷鍐嶄箻 alpha
-    if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1.0f, 0.0f, 0.0f, 0.5f), &red)) && red) {
+    if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1.0f, 0.0f, 0.0f, kProbeRedAlpha), &red)) && red) {
         rt->FillRectangle(D2D1::RectF(40.0f, 40.0f, 100.0f, 100.0f), red);
         red->Release();
     }
@@ -190,8 +187,6 @@ static float g_numberFontSizeDip = 0.0f;
 // down and the block stays centred -- the layout expands and contracts with the number.
 // Values are appearance parameters: change them to taste, they are the only place the
 // sizes live.
-const float kNumberSizeByDigits[] = {40.0f, 40.0f, 40.0f, 40.0f, 38.0f,
-                                     34.0f, 30.0f, 27.0f, 24.0f};
 const int kNumberSizeCount =
     static_cast<int>(sizeof(kNumberSizeByDigits) / sizeof(kNumberSizeByDigits[0]));
 
@@ -218,11 +213,11 @@ IDWriteTextFormat* TextFormatFor(FontRole role) {
         DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
         if (role == FontRole::NumberFlex) flexSize = g_numberFontSizeDip;
         switch (role) {
-        case FontRole::Title: size = 12.5f; break;   // owner: a little bigger than the 11 it was
-        case FontRole::Number: size = 40.0f; weight = DWRITE_FONT_WEIGHT_SEMI_BOLD; break;
-        case FontRole::Unit: size = 18.0f; break;
-        case FontRole::Estimate: size = 12.0f; break;
-        case FontRole::Debug: size = 13.0f; break;
+        case FontRole::Title: size = kTitleSizeDip; break;
+        case FontRole::Number: size = kNumberFixedSizeDip; weight = DWRITE_FONT_WEIGHT_SEMI_BOLD; break;
+        case FontRole::Unit: size = kCurrencySizeDip; break;
+        case FontRole::Estimate: size = kEstimateSizeDip; break;
+        case FontRole::Debug: size = kDebugSizeDip; break;
         case FontRole::NumberFlex:
             size = (flexSize > 0.0f) ? flexSize : kNumberSizeByDigits[0];
             weight = DWRITE_FONT_WEIGHT_SEMI_BOLD;
@@ -357,7 +352,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
     // 鏍囬鍏肩姸鎬佽锛氬乏涓婅銆傜姸鎬佸彉浜嗘枃瀛楀氨鎹紝涓嶅彧闈犻鑹茬紪鐮併€?
     if (f.statusText && titleFmt) {
         ID2D1SolidColorBrush* b = nullptr;
-        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 0.85f), &b)) && b) {
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, kTitleAlpha), &b)) && b) {
             IDWriteTextLayout* layout = nullptr;
             if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
                     f.statusText, static_cast<UINT32>(wcslen(f.statusText)), titleFmt,
@@ -401,18 +396,18 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
 
         const float digitsW = MeasureTextWidth(measureText, numFmt2);
         const float symbolW = symbol.empty() ? 0.0f : MeasureTextWidth(symbol, unitFmt);
-        const float gap = symbol.empty() ? 0.0f : 2.0f * s;
+        const float gap = symbol.empty() ? 0.0f : kAmountSymbolGapDip * s;
         const float totalW = digitsW + gap + symbolW;
         const float left = cx - totalW * 0.5f;
         const float entityMidY = (kMarginDip + kEntityHeightDip * 0.5f) * s;
-        const float numberTop = entityMidY - 26.5f * s;
+        const float numberTop = entityMidY - kNumberTopOffsetDip * s;
 
         LayoutProbe("number", cx, symbolW, digitsW, left);
-        LayoutProbe("boxes", (kMarginDip + 12.0f) * s, (kMarginDip + 8.0f) * s,
+        LayoutProbe("boxes", (kMarginDip + kTitleInsetXDip) * s, (kMarginDip + kTitleInsetYDip) * s,
                     numberTop, (kMarginDip + kEntityWidthDip) * s);
 
         ID2D1SolidColorBrush* b = nullptr;
-        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 1.0f), &b)) && b) {
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, kAmountAlpha), &b)) && b) {
             // Draw one character at a time, at the origin the string layout reports for
             // it, and centre the block on the measured ink rather than on the layout width.
             // WHY per character: a layout's width includes side bearings, so centring on it
@@ -461,7 +456,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
         // 绗﹀彿鍦ㄥ悗锛堟墍鏈夎€呮寚瀹氾級銆傜鍙峰瓧鍙峰皬锛屽線涓嬪帇涓€鐐硅鍩虹嚎澶ц嚧瀵归綈銆?
         if (!symbol.empty()) {
             ID2D1SolidColorBrush* sb = nullptr;
-            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 0.9f), &sb)) && sb) {
+            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, kCurrencyAlpha), &sb)) && sb) {
                 IDWriteTextLayout* layout = nullptr;
                 if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
                         symbol.c_str(), static_cast<UINT32>(symbol.size()), unitFmt, 256.0f, 64.0f,
@@ -480,14 +475,14 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
     if (!f.zeroTimeText.empty() && estFmt) {
         const std::wstring t(f.zeroTimeText.begin(), f.zeroTimeText.end());
         ID2D1SolidColorBrush* b = nullptr;
-        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 0.75f), &b)) && b) {
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, kEstimateAlpha), &b)) && b) {
             IDWriteTextLayout* layout = nullptr;
             if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
                     t.c_str(), static_cast<UINT32>(t.size()), estFmt, kEntityWidthDip * s, 64.0f,
                     &layout)) &&
                 layout) {
                 const float w = MeasureTextWidth(t, estFmt);
-                rt->DrawTextLayout(D2D1::Point2F(cx - w * 0.5f, (kMarginDip + kEntityHeightDip - 26.0f) * s),
+                rt->DrawTextLayout(D2D1::Point2F(cx - w * 0.5f, (kMarginDip + kEntityHeightDip - kEstimateInsetDip) * s),
                                    layout, b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                 layout->Release();
             }
@@ -510,7 +505,7 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
     const float eh = kEntityHeightDip * s;
     const float radius = kCornerRadiusDip * s;
 
-    const D2D1_COLOR_F base = StraightRgba(kBaseColor.r, kBaseColor.g, kBaseColor.b, kBaseColor.a);
+    const D2D1_COLOR_F base = StraightRgba(kPanelColorR, kPanelColorG, kPanelColorB, kPanelOpacity);
 
     ID2D1SolidColorBrush* brush = nullptr;
     if (SUCCEEDED(rt->CreateSolidColorBrush(base, &brush)) && brush) {
@@ -549,7 +544,7 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
         IDWriteTextFormat* fmt = DebugTextFormat();
         if (dw && fmt) {
             ID2D1SolidColorBrush* textBrush = nullptr;
-            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1.0f, 0.94f, 0.6f, 0.95f),
+            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kWarnR, kWarnG, kWarnB, kWarnAlpha),
                                                     &textBrush)) && textBrush) {
                 // 鈽?璧?鍏堟帓鐗堛€佸啀鐢?杩欐潯姝ｈ矾銆?
                 //   涓嶈鎯崇潃鍦?IDWriteFactory 涓婃壘 DrawText / DrawTextW锛氶偅涓垚鍛樹笉瀛樺湪锛?

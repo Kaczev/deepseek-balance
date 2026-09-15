@@ -15,20 +15,18 @@
 
 #include "widget_display.h"
 
+#include "tuning.h"
+
 #include <cstdint>
 
 namespace dshb {
 
 // 画布尺寸（DIP）：实体视觉区 315x129，四周各 80 的外扩透明余量 → 475x289
-constexpr int kEntityWidthDip = 315;
-constexpr int kEntityHeightDip = 129;
-constexpr int kMarginDip = 80;
+// ★ 所有外观常量集中在 tuning.h（字号/面板尺寸/圆角/颜色/数字落点与间距）。
+//   要调外观就改那一个文件，不要在这个头文件里加新的魔法数字。
+// 画布尺寸由实体区 + 四周外扩余量推出（默认 315x129 + 80×2 = 475x289）。
 constexpr int kCanvasWidthDip = kEntityWidthDip + kMarginDip * 2;
 constexpr int kCanvasHeightDip = kEntityHeightDip + kMarginDip * 2;
-constexpr int kCornerRadiusDip = 12;
-
-// 设计基准色 #6c89f6（充足档）
-constexpr uint32_t kBaseColorBgra = 0xF6896C;  // 0xAABBGGRR 里的 RGB 部分
 
 struct CanvasSize {
     int widthPx = 0;
