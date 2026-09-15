@@ -180,7 +180,22 @@ double FlashPulse(double nowSeconds, double flashStart) {
 }
 
 // 鏂囨湰鏍煎紡鐨勫彇鐢ㄥ彛銆傚瓧鍙烽兘鏄?DIP锛屾墍浠ヨ鎰熶笌 DPI 鏃犲叧銆?
-enum class FontRole { Title, Number, Unit, Estimate, Debug };
+// Current number font size in DIP. The render path sets it from the digit count before
+// asking for the flexible number format; 0 means "not set yet".
+static float g_numberFontSizeDip = 0.0f;
+
+// FONT SIZES (DIP) for the balance number, indexed by how many digits it shows
+// (the currency sign is not counted). The number is deliberately NOT one fixed size:
+// as the balance gains digits the panel would otherwise overflow, so the size steps
+// down and the block stays centred -- the layout expands and contracts with the number.
+// Values are appearance parameters: change them to taste, they are the only place the
+// sizes live.
+const float kNumberSizeByDigits[] = {40.0f, 40.0f, 40.0f, 40.0f, 38.0f,
+                                     34.0f, 30.0f, 27.0f, 24.0f};
+const int kNumberSizeCount =
+    static_cast<int>(sizeof(kNumberSizeByDigits) / sizeof(kNumberSizeByDigits[0]));
+
+enum class FontRole { Title, Number, NumberFlex, Unit, Estimate, Debug };
 
 IDWriteTextFormat* TextFormatFor(FontRole role) {
     IDWriteFactory* dw = DebugWriteFactory();
@@ -190,7 +205,7 @@ IDWriteTextFormat* TextFormatFor(FontRole role) {
         IDWriteTextFormat* fmt = nullptr;
         bool tried = false;
     };
-    static Slot slots[5];
+    static Slot slots[6];
 
     const int idx = static_cast<int>(role);
     Slot& slot = slots[idx];
@@ -198,14 +213,20 @@ IDWriteTextFormat* TextFormatFor(FontRole role) {
         slot.tried = true;
         // 涓枃姝ｆ枃鐢ㄩ泤榛戯紱鏁板瓧鐢ㄥ悓涓€鏃忕殑绛夊鏁板瓧锛坱num锛夐伩鍏嶆粴鍔ㄦ椂宸﹀彸鎶?
         const wchar_t* family = (role == FontRole::Debug) ? L"Consolas" : L"Microsoft YaHei UI";
+        float flexSize = 0.0f;
         float size = 13.0f;
         DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
+        if (role == FontRole::NumberFlex) flexSize = g_numberFontSizeDip;
         switch (role) {
-        case FontRole::Title: size = 11.0f; break;
+        case FontRole::Title: size = 12.5f; break;   // owner: a little bigger than the 11 it was
         case FontRole::Number: size = 40.0f; weight = DWRITE_FONT_WEIGHT_SEMI_BOLD; break;
         case FontRole::Unit: size = 18.0f; break;
         case FontRole::Estimate: size = 12.0f; break;
         case FontRole::Debug: size = 13.0f; break;
+        case FontRole::NumberFlex:
+            size = (flexSize > 0.0f) ? flexSize : kNumberSizeByDigits[0];
+            weight = DWRITE_FONT_WEIGHT_SEMI_BOLD;
+            break;
         }
         if (FAILED(dw->CreateTextFormat(family, nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
                                         DWRITE_FONT_STRETCH_NORMAL, size, L"zh-cn", &slot.fmt))) {
@@ -363,81 +384,78 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             LayoutProbe(buf, 0, 0, 0, 0);
         }
 
-        const float digitsW = MeasureTextWidth(measureText, numFmt);
+        // ADAPTIVE SIZE + CENTRING.
+        //
+        // The number is not drawn at one fixed size: as the balance gains digits it would
+        // otherwise run into the panel edges. The size steps down with the digit count
+        // (kNumberSizeByDigits) and the block stays centred horizontally, so the layout
+        // expands and contracts with the number instead of overflowing.
+        int digitCount = 0;
+        for (wchar_t ch : measureText) {
+            if (ch >= L'0' && ch <= L'9') ++digitCount;
+        }
+        const int sizeIdx = (digitCount < kNumberSizeCount) ? digitCount : (kNumberSizeCount - 1);
+        g_numberFontSizeDip = kNumberSizeByDigits[sizeIdx];
+        IDWriteTextFormat* numFmt2 = TextFormatFor(FontRole::NumberFlex);
+        if (!numFmt2) numFmt2 = numFmt;
+
+        const float digitsW = MeasureTextWidth(measureText, numFmt2);
         const float symbolW = symbol.empty() ? 0.0f : MeasureTextWidth(symbol, unitFmt);
         const float gap = symbol.empty() ? 0.0f : 2.0f * s;
         const float totalW = digitsW + gap + symbolW;
         const float left = cx - totalW * 0.5f;
         const float entityMidY = (kMarginDip + kEntityHeightDip * 0.5f) * s;
-        const float numberTop = entityMidY - 28.0f * s;
+        const float numberTop = entityMidY - 26.5f * s;
 
-        // 璇婃柇锛氭妸杈撳叆涓庣粨鏋滈兘璁颁笅鏉ワ紙鍙湪 --layout-probe 鏃跺啓鏂囦欢锛?
         LayoutProbe("number", cx, symbolW, digitsW, left);
         LayoutProbe("boxes", (kMarginDip + 12.0f) * s, (kMarginDip + 8.0f) * s,
                     numberTop, (kMarginDip + kEntityWidthDip) * s);
 
         ID2D1SolidColorBrush* b = nullptr;
         if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, 1.0f), &b)) && b) {
-            // 鈽呪槄 閫愪綅閲岀▼琛紙鎸夋墍鏈夎€呯粰鍑虹殑妯″瀷閲嶅仛锛?
-            //
-            //   姣忎竴浣嶆槸涓€涓?**0..9 鐨勭珫甯?*锛屽甫瀛愮殑浣嶇疆**鐢辫浣嶇殑杩炵画鍊肩洿鎺ュ喅瀹?*锛?
-            //     璇ヤ綅杩炵画鍊?wheelValue = 閲戦 / 璇ヤ綅浣嶆潈
-            //     绗?d 涓暟瀛楃敾鍦?(d - wheelValue) 琛屽锛岃楂?= 涓€涓瓧鍙风殑琛岀▼
-            //   绐楀彛鍙湶涓€琛岋紝浜庢槸浠讳竴鏃跺埢鍙湅寰楄涓€涓暟瀛楋紱甯﹀瓙鍦ㄧ獥鍙ｉ噷杩炵画婊戝姩銆?
-            //
-            //   杩欐牱鎵嶅锛?
-            //     路 浣欓鍙姩 0.01 -> 鍙湁鏈€鍙抽偅浣嶆尓 1/10 鏍硷紝鍏朵綑绾逛笣涓嶅姩
-            //     路 浣欓澶ц烦    -> 鍚勪綅椋炲揩杞繃鍘伙紝鐒跺悗钀藉畾
-            //
-            //   鈽?涔嬪墠閿欏湪鍝細缁欐瘡涓€浣嶇敾"鏃ф暟瀛楀線涓娿€佹柊鏁板瓧寰€涓?鈥斺€旈偅鏄?*涓ゆ牸鐨?
-            //     鍒囨崲鍔ㄧ敾**锛屽甫瀛愬彧鏈変袱鏍硷紝鏁翠綋鐪嬭捣鏉ュ氨鏄?鏁村潡鎹㈡帀"锛屼笉鏄粴鍔ㄣ€?
-            //   鈽?涔熶笉鐢ㄤ竴鏉?"0\n1\n...\n9" 鐨勫琛屾帓鐗堬細DirectWrite 鐨勮嚜鍔ㄨ璺濅笉鎸?
-            //     鎴戜滑瑕佺殑琛岄珮璧帮紙瀹炴祴鍗佽琚帇鍒扮害 17 鍍忕礌涓€琛岋紝鍗佷綅閮介湶鍚屼竴涓暟瀛楋級銆?
-            //     鍗佷釜鏁板瓧鍚勮嚜瀹氫綅锛屼綅缃畬鍏ㄥ彲鎺с€?
-            // 鐢?*鏁翠覆鏁板瓧鑷繁鐨勬帓鐗?*閲忓嚭閫愬瓧绗︾殑鍘熺偣涓庤楂樸€?
-            // 杩欐牱姣忎竴浣嶇殑鏍煎瓙浣嶇疆銆佷互鍙?鏁板瓧鍦ㄨ閲屼粠鍝紑濮?锛岄兘鏄棶鎺掔増寮曟搸寰楁潵鐨勶紝
-            // 涓嶅啀闈犵寽鈥斺€斾箣鍓嶅嚑鐗堝氨鏄寽鍋忕Щ锛岀粨鏋滄暟瀛楃敾鍒板埆鐨勬牸瀛愰噷銆?
+            // Draw one character at a time, at the origin the string layout reports for
+            // it, and centre the block on the measured ink rather than on the layout width.
+            // WHY per character: a layout's width includes side bearings, so centring on it
+            // leaves the visible digits off-centre (measured: the block sat 6.5 px left of
+            // the panel centre, because a leading "1" carries a wide left side bearing).
             std::vector<float> charXs;
             float lineH = 0.0f;
-            MeasureCharOrigins(measureText, numFmt, &charXs, &lineH);
+            MeasureCharOrigins(measureText, numFmt2, &charXs, &lineH);
 
             const std::wstring& target = measureText;
-            // STATIC DRAW: the whole amount string is laid out once and drawn in a single
-            // call, so the engine positions every character itself. The decimal point then
-            // lands on the digits' baseline, spacing comes from the font, and nothing is
-            // clipped. No wheel, no per-digit tape, no clip window.
-            //
-            // The vertical anchor is derived from the first digit's measured ink inset
-            // (how far its ink starts below the layout origin) instead of being assumed, so
-            // the digits sit centred on the panel midline whatever the font's metrics are.
             size_t firstDigit = 0;
             for (size_t k = 0; k < target.size(); ++k) {
                 if (target[k] >= L'0' && target[k] <= L'9') { firstDigit = k; break; }
             }
 
-            float inkTopDip = 9.863f;
+            // Horizontal centring from measured ink: the first digit's left inset and the
+            // last digit's right edge, so the ink box is centred on cx.
+            float inkInsetDip = 0.0f;
             IDWriteTextLayout* one = nullptr;
             const wchar_t chBuf[2] = {target[firstDigit], 0};
-            if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(chBuf, 1, numFmt, 256.0f, 128.0f,
+            if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(chBuf, 1, numFmt2, 256.0f, 128.0f,
                                                                &one)) &&
                 one) {
                 DWRITE_OVERHANG_METRICS o0{};
                 one->GetOverhangMetrics(&o0);
-                inkTopDip = -o0.top;
+                inkInsetDip = -o0.left;
                 one->Release();
             }
+            const float inkW = MeasureTextWidth(measureText, numFmt2) - inkInsetDip * s;
+            const float inkLeft = cx - (inkW + gap + symbolW) * 0.5f - inkInsetDip * s;
 
-            IDWriteTextLayout* whole = nullptr;
-            if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(measureText.c_str(),
-                                                               static_cast<UINT32>(measureText.size()),
-                                                               numFmt, 4096.0f, 256.0f, &whole)) &&
-                whole) {
-                const float lineTop = numberTop - inkTopDip * s;
-                rt->DrawTextLayout(D2D1::Point2F(left, lineTop), whole, b,
-                                   D2D1_DRAW_TEXT_OPTIONS_NONE);
-                whole->Release();
+            for (size_t i = 0; i < target.size(); ++i) {
+                const float chX = (i < charXs.size()) ? (inkLeft + charXs[i]) : inkLeft;
+                IDWriteTextLayout* li = nullptr;
+                const wchar_t cb[2] = {target[i], 0};
+                if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(cb, 1, numFmt2, 256.0f, 128.0f,
+                                                                   &li)) &&
+                    li) {
+                    rt->DrawTextLayout(D2D1::Point2F(chX, numberTop), li, b,
+                                       D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    li->Release();
+                }
             }
-            b->Release();
         }
 
         // 绗﹀彿鍦ㄥ悗锛堟墍鏈夎€呮寚瀹氾級銆傜鍙峰瓧鍙峰皬锛屽線涓嬪帇涓€鐐硅鍩虹嚎澶ц嚧瀵归綈銆?
