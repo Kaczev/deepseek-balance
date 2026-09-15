@@ -210,6 +210,10 @@ double FlashPulse(double nowSeconds, double flashStart) {
 // Current number font size in DIP. The render path sets it from the digit count before
 // asking for the flexible number format; 0 means "not set yet".
 static float g_numberFontSizeDip = 0.0f;
+// 整块数字（数字 + ¥）的横向位置：列数变化时平滑滑动，而不是瞬移半个字宽。
+// 这是跨帧的量，所以放在进程内；导出路径每帧一个新进程，导出图永远取到位值。
+static float g_numberX = 0.0f;
+static bool g_numberXValid = false;
 
 // FONT SIZES (DIP) for the balance number, indexed by how many digits it shows
 enum class FontRole { Title, Number, NumberFlex, Unit, Estimate, Debug };
@@ -456,7 +460,16 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                 one->Release();
             }
             const float inkW = MeasureTextWidth(measureText, numFmt2) - inkInsetDip * s;
-            const float inkLeft = cx - (inkW + gap + symbolW) * 0.5f - inkInsetDip * s;
+            // 目标位置：按当前列数把整块（数字 + ¥）居中。
+            const float targetX = cx - (inkW + gap + symbolW) * 0.5f - inkInsetDip * s;
+            // ★ 横向缓动：列数一变，目标位置会跳半个字宽；让实际位置追上去，
+            //   于是数字是"滑"过去而不是"瞬移"。风格与滚动一致：每帧把残差乘上 rate。
+            if (!g_numberXValid) { g_numberX = targetX; g_numberXValid = true; }
+            else {
+                g_numberX = targetX + (g_numberX - targetX) * kNumberShiftRate;
+                if (std::fabs(g_numberX - targetX) < kNumberShiftSnapDip) g_numberX = targetX;
+            }
+            const float inkLeft = g_numberX;
 
             // 两条路二选一：整串一次画完（默认）或逐位按坐标画。
             // ★ 曾经写成"逐位接在整串之后"，于是同一个字被画了两遍——墨迹位置一模一样，
