@@ -396,6 +396,25 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             b->Release();
         }
     }
+    // 右上角：刷新倒计时。一个纯数字，每秒变一次，**不做滚动动画**。
+    // 字号与标题同一档（15 号），位置是标题的镜像：右对齐、同样的边距。
+    if (f.countdownText && f.countdownText[0] != L'\0' && titleFmt) {
+        const float cw = MeasureTextWidth(f.countdownText, titleFmt);
+        const float cx2 = (kMarginDip + kEntityWidthDip - kTitleInsetXDip) * s - cw;
+        const float cy2 = (kMarginDip + kTitleInsetYDip) * s;
+        ID2D1SolidColorBrush* cb = nullptr;
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, kTitleAlpha), &cb)) && cb) {
+            IDWriteTextLayout* cl = nullptr;
+            if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
+                    f.countdownText, static_cast<UINT32>(wcslen(f.countdownText)), titleFmt,
+                    256.0f, 64.0f, &cl)) &&
+                cl) {
+                rt->DrawTextLayout(D2D1::Point2F(cx2, cy2), cl, cb, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                cl->Release();
+            }
+            cb->Release();
+        }
+    }
 
     // 浣欓鏁板瓧锛氬眳涓€傛暟瀛椾笌绗﹀彿涓€璧烽噺瀹藉害锛屼繚璇?鏁翠綋"灞呬腑鑰屼笉鏄?鏁板瓧"灞呬腑銆?
     {
@@ -470,13 +489,17 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             // ★ 横向缓动：列数一变，目标位置会跳半个字宽；让实际位置追上去，
             //   于是数字是"滑"过去而不是"瞬移"。风格与滚动一致：每帧把残差乘上 rate。
             g_symbolValid = false;   // 每帧先作废；真的画了符号才置回 true
-            g_blockShift = g_numberX - targetX;   // 符号与数字一起滑
+            // 符号与数字必须用**同一个坐标系**：数字画在 g_numberX + charXs[i]，
+            // 所以符号的起点就是"数字墨迹宽 + 间距"，不能再用外层的 left（实测会跑到左边）
             if (!g_numberXValid) { g_numberX = targetX; g_numberXValid = true; }
             else {
                 g_numberX = targetX + (g_numberX - targetX) * kNumberShiftRate;
                 if (std::fabs(g_numberX - targetX) < kNumberShiftSnapDip) g_numberX = targetX;
             }
             const float inkLeft = g_numberX;
+            // ★ 位移必须在**缓动之后**算：放在初始化之前时，第一帧 g_numberX 还是 0，
+            //   位移会算成 -targetX，符号被推到数字左边（实测就是这么错的）。
+            g_blockShift = g_numberX - targetX;
 
             // 两条路二选一：整串一次画完（默认）或逐位按坐标画。
             // ★ 曾经写成"逐位接在整串之后"，于是同一个字被画了两遍——墨迹位置一模一样，

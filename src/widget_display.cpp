@@ -303,6 +303,20 @@ double DisplayedAmount::Update(double dtSeconds) {
 }
 
 
+// 右上角倒计时：模块级文本。**不做任何动画**——它就是一个每秒变一次的数字。
+namespace {
+std::wstring& CountdownStorage() {
+    static std::wstring s;
+    return s;
+}
+}  // namespace
+
+void SetCountdownText(const wchar_t* text) {
+    CountdownStorage() = (text ? text : L"");
+}
+
+const wchar_t* CountdownText() { return CountdownStorage().c_str(); }
+
 std::string DisplayedAmount::TextToShow() const {
     if (!hasValue_) return "--.--";
     // 文本只由目标值决定：滚动期间冻结在目标上，落位后 value_ == target_，
@@ -322,6 +336,7 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     WidgetFrame f{};
     f.state = state;
     f.statusText = StatusTextFor(state);
+    f.countdownText = CountdownText();
 
     // ★ 这里就是设计要防的第一个错：**"查不到"和"余额为 0"必须分开**。
     //   只有拿到了真实数值才显示数字；读不到时显示占位符，绝不显示 0.00。

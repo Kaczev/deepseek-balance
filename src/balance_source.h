@@ -45,11 +45,14 @@ public:
     bool PollLog(std::string* out);
     // 连续失败次数。所有者定的规则：失败时先"当作没变"，连续 5 次才显示 --.--
     int consecutiveFailures() const { return failures_.load(); }
+    // 距离下一次请求还有多少毫秒（给右上角倒计时用）。没有排定则 0。
+    int msUntilNextFetch() const;
     bool started() const { return started_; }
 
 private:
     void Run(BalanceSourceConfig cfg);
     int currentIntervalMs() const { return intervalMs_.load(); }
+
 
     std::thread worker_;
     std::mutex mu_;
@@ -59,6 +62,7 @@ private:
     std::atomic<int> failures_{0};
     std::atomic<bool> stop_{false};
     std::atomic<int> intervalMs_{10000};   // 当前生效的间隔（自适应）
+    std::atomic<long long> nextDueMs_{0};    // 下一次请求的到期时刻（steady 毫秒）
     Sample prev_{};                          // 上一次成功样本（比"有没有变化"用）
     bool havePrev_ = false;
     bool started_ = false;

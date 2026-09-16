@@ -111,11 +111,16 @@ void BalanceSource::Run(BalanceSourceConfig cfg) {
         if (!first) {
             std::unique_lock<std::mutex> lk(mu_);
             // 用条件变量睡：Stop() 能立刻把它叫醒，不会卡在一个周期上。
+            // 排定下一次到期时刻（倒计时读它）
+            nextDueMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count() +
+                             intervalMs_.load());
             cv_.wait_for(lk, std::chrono::milliseconds(intervalMs_.load()),
                          [this] { return stop_.load(); });
             if (stop_.load()) break;
         }
         first = false;
+        nextDueMs_.store(0);   // 正在请求：倒计时归零
 
         api::Endpoint ep{};
         ep.host = cfg.host;
@@ -163,6 +168,14 @@ void BalanceSource::Run(BalanceSourceConfig cfg) {
 
         if (cfg.once) break;
     }
+}
+
+int BalanceSource::msUntilNextFetch() const {
+    const long long due = nextDueMs_.load();
+    if (due <= 0) return 0;
+    const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()).count();
+    return due > now ? static_cast<int>(due - now) : 0;
 }
 
 bool BalanceSource::Poll(Sample* out) {

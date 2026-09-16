@@ -84,6 +84,8 @@ bool g_pressValid = false;
 bool g_currenciesGiven = false;   // --currencies=：合成一条多币种样本（验证切换用）
 std::string g_currenciesSpec;   // 形如 "CNY:19.20,USD:2.70"
 bool g_realApiPlanned = false;  // 进循环之前就定下"本次要不要用真接口"
+bool g_countdownGiven = false;  // --countdown=N：导帧时给倒计时一个固定值（导帧不取样）
+int g_countdownSeconds = 0;
 std::string g_apiKey;           // 只在内存里，绝不写日志
 bool g_clickTest = false;         // --click-test：注入三次手势
 double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
@@ -390,6 +392,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_selftestB = true;
         } else if (wcscmp(argv[i], L"--layout-probe") == 0) {
             g_layoutProbe = true;
+        } else if (wcsncmp(argv[i], L"--countdown=", 12) == 0) {
+            // 导帧夹具：导出路径不取样，所以倒计时没有真实来源，靠它给一个值。
+            g_countdownGiven = true;
+            g_countdownSeconds = _wtoi(argv[i] + 12);
         } else if (wcscmp(argv[i], L"--click-test") == 0) {
             g_clickTest = true;
         } else if (wcsncmp(argv[i], L"--currencies=", 13) == 0) {
@@ -771,6 +777,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         } else {
             SelfTestLog(L"[api] 本次不用真接口（--api=off 或手动/演示参数）");
         }
+    }
+
+    if (g_countdownGiven) {
+        dshb::SetCountdownText(std::to_wstring(g_countdownSeconds).c_str());
     }
 
     // ---- 离屏导帧模式：渲一帧到 PNG 就退出 ----
@@ -1308,6 +1318,14 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 gaveUp = false;
                 SelfTestLog(L"[api] 采样恢复成功：显示恢复实时余额");
             }
+        }
+
+        // 右上角刷新倒计时：每秒变一次，纯数字，不做滚动动画。
+        // 只有真接口开着才有意义——假数据源没有"下一次请求"。
+        if (g_realApiOn) {
+            const int msLeft = g_apiSource.msUntilNextFetch();
+            const int secsLeft = (msLeft + 999) / 1000;
+            dshb::SetCountdownText(std::to_wstring(secsLeft).c_str());
         }
 
         if (!manualMode) g_display.OnSample(g_states.lastGood());

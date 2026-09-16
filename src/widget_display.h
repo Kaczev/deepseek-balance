@@ -185,6 +185,7 @@ struct WidgetFrame {
     std::string amountText;         // 已格式化的两位小数
     const wchar_t* currencySymbol = L"";   // 空串 = 币种未知，**不默认 ¥**
     const wchar_t* statusText = L"";       // 标题行/状态文案
+    const wchar_t* countdownText = L"";    // 右上角刷新倒计时（空串 = 不画）
     std::string zeroTimeText;       // 清零预估（C9 填；现在留占位）
     // 每一位当前的纵坐标（渲染层按它画数字）。空 = 渲染层退回整串绘制。
     std::vector<axis::PlaceCoord> places;
@@ -198,5 +199,11 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
 // 状态文案行（C6）。标题兼状态行：紧急状态除了颜色变化，文字也要跟着换，
 // 否则只靠颜色编码状态——色觉障碍、屏幕反光、截图转述三种情况下都会失效。
 const wchar_t* StatusTextFor(ConnState state);
+
+// 右上角的刷新倒计时：一个**纯数字**，每秒变一次，不做滚动动画。
+// 用模块级的设置/读取，是为了让渲染层与导出路径都能拿到同一个值
+// （导出路径不取样，所以它靠 --countdown=N 夹具提供）。
+void SetCountdownText(const wchar_t* text);
+const wchar_t* CountdownText();
 
 }  // namespace dshb
