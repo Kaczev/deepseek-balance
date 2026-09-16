@@ -1,7 +1,9 @@
 #include "widget_display.h"
 
 #include "amount.h"        // Amount / ParseAmount：纵坐标从十进制原文解析，不用二进制浮点
-#include "curve_store.h"   // CurveStore：12 点环形、只记变化、curve.json（规格 §2）
+#include "curve_store.h"
+
+#include <windows.h>   // WideCharToMultiByte（把宽路径转成数据层要的 UTF-8）   // CurveStore：12 点环形、只记变化、curve.json（规格 §2）
 
 #include <algorithm>
 #include <cmath>
@@ -145,6 +147,8 @@ bool SamePoints(const std::vector<CurveStorePoint>& a, const std::vector<CurveSt
 
 // 一条取样喂给数据层（§2.1 / §2.3 的规则全在那里），并观察"是不是追加了一个点"。
 // 只有追加才启动滚动——值不变时曲线**静止**（规格 §2.1 的推论，这条是刻意的）。
+// 记录文件的路径（main 启动时给一次）。为空 = 不落盘（导帧路径就是这样）。
+
 void FeedCurve(const Sample& s) {
     std::vector<CurveStorePoint> before = g_curveStore.Points();
     std::vector<double> beforeValues;
@@ -171,6 +175,10 @@ void FeedCurve(const Sample& s) {
     const std::vector<CurveStorePoint> after = g_curveStore.Points();
     const bool appended = !SamePoints(before, after);
     if (!appended) return;
+
+    // 落盘：只在"真的追加了一个点"之后写（12 个点，代价极小；崩溃最多丢最后一次）
+    const std::string& cp = dshb::CurveStorePath();
+    if (!cp.empty()) (void)g_curveStore.Save(cp);
 
     // 追加了：计时器归零，并记下"旧极值"= 刚才屏幕上那 11 个点的极值（规格 §3 第 6 条）。
     // 新点入场时也按这套旧极值算 L，于是它不会凭空跳进来，而是从旧刻度滑过去。
@@ -708,6 +716,25 @@ std::string CurveStateLine() {
                   g_curveScrolling ? "yes" : "no", g_curveFrozen ? "yes" : "no", g_curveOldLo,
                   g_curveOldHi, values.c_str());
     return buf;
+}
+
+
+// 记录文件路径（函数内 static，避免模块级变量与匿名命名空间的可见性纠缠）
+static std::string s_path;   // 记录文件路径（UTF-8）；空 = 不落盘
+
+const std::string& dshb::CurveStorePath() { return s_path; }
+
+
+void dshb::SetCurveStorePath(const std::wstring& path) {
+    s_path.clear();
+    if (path.empty()) return;
+    const int n = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return;
+    std::string utf8(static_cast<size_t>(n - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, utf8.data(), n, nullptr, nullptr);
+    s_path = utf8;
+    // 启动即加载：加载失败/文件不存在/数据过期都由数据层自己决定（规格 §2.4 / 验收 8）
+    (void)g_curveStore.Load(s_path);
 }
 
 WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, bool currencyKnown,

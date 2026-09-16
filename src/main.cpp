@@ -775,6 +775,14 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         SelfTestLog(L"[paths] 采样=%ls", paths.samples.c_str());
         SelfTestLog(L"[paths] 日志=%ls", paths.log.c_str());
         SelfTestLog(L"[paths] 设置=%ls", paths.config.c_str());
+        // 曲线记录文件：给了路径就顺手加载（重启后曲线接上，规格验收 8）
+        {
+            std::wstring curvePath = paths.dataDir;
+            if (!curvePath.empty() && curvePath.back() != L'\\') curvePath += L'\\';
+            curvePath += L"curve.json";
+            dshb::SetCurveStorePath(curvePath);
+            SelfTestLog(L"[paths] 曲线=%ls", curvePath.c_str());
+        }
         if (!paths.writable) {
             SelfTestLog(L"[paths] 降级：目录不可写（%ls），采样只留在内存，重启后没有历史",
                         paths.unwritableReason.c_str());

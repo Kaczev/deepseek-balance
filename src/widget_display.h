@@ -231,6 +231,10 @@ void SetCountdownText(const wchar_t* text);
 // ★ 规格 §2 之后它喂的是**曲线存储**（Append，只记变化那一条规则照旧生效），
 //   不是旧的 SampleHistory；N=12 时正好得到"11 个点在看 + 第 12 个刚进来"的滚动起点。
 void PrimeHistoryForDemo(int points);
+
+// 曲线记录文件路径（main 启动时给一次）。空 = 不落盘；给了就顺手加载一次。
+void SetCurveStorePath(const std::wstring& path);
+const std::string& CurveStorePath();
 const wchar_t* CountdownText();
 
 // ---- 曲线的滚动计时（规格 §3，导帧口子）----
