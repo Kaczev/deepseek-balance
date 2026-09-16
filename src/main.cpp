@@ -1524,23 +1524,29 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             static int ctStage = 0;
             static double ctAt = 1.0;
 
-            if (ctStage < 3 && elapsed >= ctAt) {
+            if (ctStage < 4 && elapsed >= ctAt) {
                 const dshb::SymbolRect sr = dshb::CurrencySymbolRect();
                 if (sr.valid) {
                     const int cx = static_cast<int>((sr.l + sr.r) * 0.5f);
                     const int cy = static_cast<int>((sr.t + sr.b) * 0.5f);
                     if (ctStage == 0) {
-                        SelfTestLog(L"[click-test] 手势 1：干净的单击（应当切换）");
+                        SelfTestLog(L"[click-test] 手势 1：干净的单击（现在【不应】切换——要双击）");
                         g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
                         FinishLeftGesture(cx, cy);
                     } else if (ctStage == 1) {
                         SelfTestLog(L"[click-test] 手势 2：从符号拖出 40px（不应切换）");
                         g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
                         FinishLeftGesture(cx + 40, cy);
-                    } else {
+                    } else if (ctStage == 2) {
                         SelfTestLog(L"[click-test] 手势 3：按住 900ms 再松（不应切换）");
                         g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64() - 900; g_pressValid = true;
                         FinishLeftGesture(cx, cy);
+                    } else {
+                        SelfTestLog(L"[click-test] 手势 4：双击符号（应当切换）");
+                        g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
+                        FinishLeftGesture(cx, cy);   // 第一次：只记时间
+                        g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
+                        FinishLeftGesture(cx, cy);   // 第二次：双击确认 -> 切换
                     }
                     ++ctStage;
                     ctAt = elapsed + 1.5;
