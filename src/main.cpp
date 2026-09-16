@@ -19,6 +19,7 @@
 #include <windows.h>
 #include <objbase.h>    // CoInitializeEx / COINIT_APARTMENTTHREADED
 #include <shellapi.h>   // CommandLineToArgvW
+#include <wtsapi32.h>   // 锁屏/解锁通知（J4）
 
 #include <cmath>
 #include <cstdint>
@@ -41,6 +42,7 @@ HWND g_hwnd = nullptr;
 
 // Defined further down; declared here because WndProc (which runs before them) calls them.
 void InstallEscHook();
+
 void RemoveEscHook();
 bool g_running = true;
 dshb::Renderer* g_renderer = nullptr;
@@ -89,6 +91,7 @@ bool g_countdownGiven = false;  // --countdown=N：导帧时给倒计时一个�
 int g_countdownSeconds = 0;
 std::string g_apiKey;           // 只在内存里，绝不写日志
 bool g_clickTest = false;         // --click-test：注入三次手势
+bool g_pauseTest = false;         // --pause-test：注入"锁屏/解锁"，验证 J4（不用真锁屏）
 double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
 double g_displayAmount = 0.0;   // 已弃用（所有者改为 --last）
 double g_lastAmount = -1.0;   // --last=L（-1 = 未给）
@@ -223,6 +226,29 @@ static void FinishLeftGesture(int x, int y) {
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    // ---- 暂停与唤醒（J4）----
+    // 暂停期间：不发请求，且**显示当作没有值**（所有者：暂停期间当成值无值）。
+    // 唤醒：立刻补一次。
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMSUSPEND) {
+            if (g_apiSource.started()) g_apiSource.Pause();
+            g_display.MarkUnreadable();
+            SelfTestLog(L"[pause] 系统休眠：暂停轮询，显示当作无值");
+        } else if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
+            if (g_apiSource.started()) g_apiSource.ResumeNow();
+            SelfTestLog(L"[pause] 系统唤醒：立刻补一次取样");
+        }
+        return TRUE;
+    case WM_WTSSESSION_CHANGE:
+        if (wp == WTS_SESSION_LOCK) {
+            if (g_apiSource.started()) g_apiSource.Pause();
+            g_display.MarkUnreadable();
+            SelfTestLog(L"[pause] 锁屏：暂停轮询，显示当作无值");
+        } else if (wp == WTS_SESSION_UNLOCK) {
+            if (g_apiSource.started()) g_apiSource.ResumeNow();
+            SelfTestLog(L"[pause] 解锁：立刻补一次取样");
+        }
+        return 0;
     case WM_LBUTTONDOWN:
         g_pressX = static_cast<int>(static_cast<short>(LOWORD(lp)));
         g_pressY = static_cast<int>(static_cast<short>(HIWORD(lp)));
@@ -409,6 +435,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // 导帧夹具：导出路径不取样，所以倒计时没有真实来源，靠它给一个值。
             g_countdownGiven = true;
             g_countdownSeconds = _wtoi(argv[i] + 12);
+        } else if (wcscmp(argv[i], L"--pause-test") == 0) {
+            g_pauseTest = true;
         } else if (wcscmp(argv[i], L"--click-test") == 0) {
             g_clickTest = true;
         } else if (wcsncmp(argv[i], L"--currencies=", 13) == 0) {
@@ -652,6 +680,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         SelfTestLog(L"[main] CreateWindowExW 失败: %lu", GetLastError());
         return 2;
     }
+
+    // 注册锁屏/解锁通知（J4）：不注册就收不到 WM_WTSSESSION_CHANGE
+    if (g_hwnd) WTSRegisterSessionNotification(g_hwnd, NOTIFY_FOR_THIS_SESSION);
 
     const UINT dpi = GetDpiForWindow(g_hwnd);
     const int clientW = dshb::kEntityWidthDip;    // 屏幕像素，不乘缩放
@@ -1334,7 +1365,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 if (rs.amountsOk) g_display.OnSample(g_states.lastGood());
             }
             std::string apiLine;
-            while (g_apiSource.PollLog(&apiLine)) SelfTestLog(L"[api] %hs", apiLine.c_str());
+            // 带时间戳（设计 §10.5 的日志要求）：这样"暂停期间没请求""唤醒立刻补一次"可验证
+            while (g_apiSource.PollLog(&apiLine)) SelfTestLog(L"[api t=%.1fs] %hs", elapsed, apiLine.c_str());
             // 连续失败到第 5 次才显示 --.--（阈值在 tuning.h）。
             // 跨过阈值/恢复各记一行：J6 要求日志能还原"为什么显示成这样"。
             static bool gaveUp = false;
@@ -1363,6 +1395,17 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         //   只剩突变。（假数据源与真接口现在都在"新样本到达"处分发。）
         // --click-test：注入三次手势，验证"只有单击才切换"这条规则。
         // 走的是和真实鼠标**同一个**判定函数，不是旁路。
+        // --pause-test：注入"锁屏 -> 解锁"，走的是与真实系统通知**同一个** WndProc 分支
+        if (g_pauseTest) {
+            static int ps = 0;
+            if (ps == 0 && elapsed >= 3.0) {
+                ps = 1;
+                PostMessageW(g_hwnd, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, 0);
+            } else if (ps == 1 && elapsed >= 9.0) {
+                ps = 2;
+                PostMessageW(g_hwnd, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK, 0);
+            }
+        }
         if (g_clickTest) {
             static int ctStage = 0;
             static double ctAt = 1.0;

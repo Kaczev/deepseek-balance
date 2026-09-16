@@ -96,6 +96,17 @@ void BalanceSource::Start(const BalanceSourceConfig& cfg) {
     worker_ = std::thread(&BalanceSource::Run, this, cfg);
 }
 
+void BalanceSource::Pause() {
+    paused_.store(true);
+    cv_.notify_all();   // 把正在睡的循环叫醒，让它进暂停等待
+}
+
+void BalanceSource::ResumeNow() {
+    paused_.store(false);
+    nextDueMs_.store(0);   // 立刻到期 -> 马上取一次
+    cv_.notify_all();
+}
+
 void BalanceSource::Stop() {
     if (!started_) return;
     stop_.store(true);
@@ -108,6 +119,14 @@ void BalanceSource::Run(BalanceSourceConfig cfg) {
     // 设计 §4.1：启动后立即采一次，不等第一个 10 秒。
     bool first = true;
     while (!stop_.load()) {
+        // 暂停（睡眠/锁屏）：不排期、不发请求，等唤醒
+        if (paused_.load()) {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait(lk, [this] { return stop_.load() || !paused_.load(); });
+            if (stop_.load()) break;
+            first = true;   // 唤醒后立刻补一次
+            continue;
+        }
         if (!first) {
             std::unique_lock<std::mutex> lk(mu_);
             // 用条件变量睡：Stop() 能立刻把它叫醒，不会卡在一个周期上。
@@ -115,9 +134,20 @@ void BalanceSource::Run(BalanceSourceConfig cfg) {
             nextDueMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
                                  std::chrono::steady_clock::now().time_since_epoch()).count() +
                              intervalMs_.load());
+            // ★ 谓词必须把"暂停"和"唤醒补一次"也算进去，否则 notify 会被忽略：
+            //   带谓词的 wait_for 即使被叫醒，只要谓词为假就继续睡到超时——
+            //   实测后果是"解锁后 1.3 秒才取"，不是立刻（时间戳看出来的）。
             cv_.wait_for(lk, std::chrono::milliseconds(intervalMs_.load()),
-                         [this] { return stop_.load(); });
+                         [this] {
+                             return stop_.load() || paused_.load() || nextDueMs_.load() == 0;
+                         });
             if (stop_.load()) break;
+            // ★ 睡醒后必须**重新检查暂停**：否则锁屏那一刻正好睡醒，会多取一次
+            //   （实测：锁屏 3.0s，3.1s 就冒出一个请求）。
+            if (paused_.load()) {
+                first = true;   // 恢复后立刻补一次
+                continue;
+            }
         }
         first = false;
         nextDueMs_.store(0);   // 正在请求：倒计时归零

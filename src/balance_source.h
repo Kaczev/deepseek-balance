@@ -39,6 +39,13 @@ public:
     void Start(const BalanceSourceConfig& cfg);
     void Stop();
 
+    // ---- 暂停与唤醒（J4）----
+    // 暂停期间**不发任何请求**（睡眠/锁屏时没人看，白烧请求没有意义）。
+    // 唤醒时 ResumeNow() -> 立刻补一次，不等下一个周期。
+    void Pause();
+    void ResumeNow();
+    bool paused() const { return paused_.load(); }
+
     // UI 线程：取走一条待处理样本。有新样本返回 true。
     bool Poll(Sample* out);
     // UI 线程：取走一行日志（J6）。行内不含 Key。
@@ -61,6 +68,7 @@ private:
     std::vector<std::string> logs_;
     std::atomic<int> failures_{0};
     std::atomic<bool> stop_{false};
+    std::atomic<bool> paused_{false};   // 暂停中：不发请求
     std::atomic<int> intervalMs_{10000};   // 当前生效的间隔（自适应）
     std::atomic<long long> nextDueMs_{0};    // 下一次请求的到期时刻（steady 毫秒）
     Sample prev_{};                          // 上一次成功样本（比"有没有变化"用）
