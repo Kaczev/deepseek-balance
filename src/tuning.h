@@ -176,11 +176,17 @@ inline constexpr float kCurveSmoothSnapFrac = 0.002f;
 inline constexpr int64_t kCurveWindowMs = 5 * 60 * 1000;
 inline constexpr int64_t kCurveNominalStepMs = 30 * 1000;
 
-// 纵向刻度的保护：窗口内极值差小于"当前值的这个比例"时，视为**没有有意义的变化**，
-// 曲线画成带子正中的平线。
-// 为什么需要：刻度按极值铺满整条带子，若 5 分钟里只差 0.01 元，也会被拉成整条带子的
-// 大起大落（而且重复出现的那个值会贴住带子上/下沿，看着"平但偏下"）。
-inline constexpr double kCurveMinSpanFrac = 0.002;   // 0.2%：19.50 元时约 0.04 元
+// ---- 曲线的滚动动画（规格 §3；所有者给的公式）----
+// 第 k 帧每点纵坐标：P = L + (N − L) × (1 − rate^k)^c
+//   L = 用旧极值算出的实际纵坐标，N = 用新极值算出的实际纵坐标
+// 横向同理：每点横坐标 = 基准横坐标 − 进度 × 一格，进度同样是帧号 k 的纯函数。
+// 初始值与数字滚动一致（同一套手感），之后你可以分别调。
+// ★ 必须是帧号 k 的纯函数（不要改成"每帧自乘的增量状态"）——否则导帧逐帧量不了。
+inline constexpr float kCurveRollRate = 0.975f;
+inline constexpr float kCurveRollC = 10.0f;
+
+// （所有者决定保留"极值铺满"：微小变化被放大是可以接受的，因此**不做**最小跨度保护。）
+
 inline constexpr float kCurveSmoothSnap = 0.002f;
 
 // ★ 状态主色：原来那支蓝 #6C89F6。**保留**，后面演示各种状态时用；
