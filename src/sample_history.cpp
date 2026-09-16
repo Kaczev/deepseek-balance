@@ -5,6 +5,13 @@ namespace dshb {
 void SampleHistory::Add(const Sample& s) {
     if (s.wallMs <= 0) return;
 
+    // 同一时刻同一币种只留一条：单调插值要求 x 严格递增，
+    // 重复时间戳会让整条曲线被拒绝（宁可这里挡住，也不要画不出来）。
+    if (count_ > 0) {
+        const size_t lastIdx = (next_ + kCapacity - 1) % kCapacity;
+        if (buf_[lastIdx].wallMs == s.wallMs) return;
+    }
+
     // 一条采样可能有多个币种条目（CNY + USD 并列）；全都留下，
     // 查询时再按币种过滤——这样切换币种也能看到那个币种自己的历史。
     if (!s.entries.empty()) {

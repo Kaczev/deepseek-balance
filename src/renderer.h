@@ -116,6 +116,7 @@ void SetLayoutProbe(bool on);
 
     // 氛围曲线开关（--no-curve：关掉后文字位置必须逐像素不变，用于 A/B 对比）
     void SetCurveEnabled(bool on);
+    void SetCurveMode(int mode);   // 0 = 历史数据，1 = 假正弦（对照）
 void DumpLayoutProbe();
 
 }  // namespace dshb

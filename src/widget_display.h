@@ -183,6 +183,14 @@ private:
 };
 
 
+// 曲线上的一个点：x、y 都归一化到实体区 [0,1]。
+// 由**显示层之外**（main）按采样历史算好再塞进帧里——渲染层不该知道余额从哪来，
+// 只负责把点连成线（连法用单调三次，见 curve.h）。
+struct CurvePoint {
+    float x = 0.0f;
+    float y = 0.0f;   // 0 = 带子顶部，1 = 底部
+};
+
 struct WidgetFrame {
     ConnState state = ConnState::ColdStart;
     bool showAmount = false;        // 数字该不该显示（无数据时显示占位符）
@@ -190,6 +198,11 @@ struct WidgetFrame {
     const wchar_t* currencySymbol = L"";   // 空串 = 币种未知，**不默认 ¥**
     const wchar_t* statusText = L"";       // 标题行/状态文案
     const wchar_t* countdownText = L"";    // 右上角刷新倒计时（空串 = 不画）
+
+    // 氛围曲线（D3）：空 = 没有数据（渲染层画平线）；1 个点 = 平线；
+    // >=2 个点 = 用单调三次连成曲线（curve.h）。x、y 都归一化到实体区 [0,1]。
+    std::vector<CurvePoint> curve;
+    bool curveHasData = false;   // false 时一律按平线画
     std::string zeroTimeText;       // 清零预估（C9 填；现在留占位）
     // 每一位当前的纵坐标（渲染层按它画数字）。空 = 渲染层退回整串绘制。
     std::vector<axis::PlaceCoord> places;
@@ -208,6 +221,9 @@ const wchar_t* StatusTextFor(ConnState state);
 // 用模块级的设置/读取，是为了让渲染层与导出路径都能拿到同一个值
 // （导出路径不取样，所以它靠 --countdown=N 夹具提供）。
 void SetCountdownText(const wchar_t* text);
+
+// 合成一段历史（--history-demo=N）：导帧时没有真实历史，用它验证曲线画得对。
+void PrimeHistoryForDemo(int points);
 const wchar_t* CountdownText();
 
 }  // namespace dshb

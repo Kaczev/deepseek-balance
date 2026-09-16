@@ -1,5 +1,15 @@
 #include "widget_display.h"
 
+#include "sample_history.h"
+
+#include <ctime>
+
+namespace {
+// 采样历史（D3）：显示层自己记——每一个帧组装点都自动带上曲线，
+// 不会再犯"同形代码有两份、只改了一份"那类错。
+dshb::SampleHistory g_hist;
+}  // namespace
+
 #include "amount.h"
 
 #include <cmath>
@@ -164,6 +174,7 @@ void DisplayedAmount::OnSample(const Sample& s) {
     frames_ = 0;                               // k = 0：本次变化还没运算过
     animating_ = true;
     tripsDirty_ = true;                        // 下一帧重建每一位的行程
+        g_hist.Add(s);   // 历史：氛围曲线要用（本文件上方的 g_hist）
     if (!hasValue_) {
         // 第一次拿到值就直接落位：从 0 滚上去会让人以为余额在涨
         value_ = yuan;
@@ -377,6 +388,30 @@ std::string DisplayedAmount::TextToShow() const {
     return s;
 }
 
+
+// --history-demo=N：合成一段历史（从 20.00 缓慢降到 19.50，最后四分之一不动），
+// 供导帧验证。真实历史在导帧路径里不存在（一个进程只画一帧），所以必须能合成。
+void PrimeHistoryForDemo(int points) {
+    if (points < 2) return;
+    const int64_t now = static_cast<int64_t>(std::time(nullptr)) * 1000;
+    const int64_t windowMs = 10 * 60 * 1000;
+    for (int i = 0; i < points; ++i) {
+        dshb::Sample s{};
+        s.wallMs = now - windowMs + (windowMs * i) / (points - 1);
+        s.amountsOk = true;
+        s.currency = "CNY";
+        const double u = static_cast<double>(i) / static_cast<double>(points - 1);
+        const double v = (u < 0.75) ? (20.00 - 0.50 * (u / 0.75)) : 19.50;
+        s.total = dshb::Amount::FromYuanDouble(v);
+        dshb::CurrencyAmount e{};
+        e.currency = "CNY";
+        e.total = s.total;
+        e.ok = true;
+        s.entries.push_back(e);
+        g_hist.Add(s);
+    }
+}
+
 WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, bool currencyKnown,
                              const wchar_t* currencySymbol) {
     WidgetFrame f{};
@@ -392,6 +427,54 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
         f.amountText = amount.TextToShow();
     } else {
         f.amountText = "--.--";                // 占位符，不是 0.00
+    }
+    // 氛围曲线（D3）：从采样历史装配归一化点。规则：
+    //   * 横向 10 分钟窗口，铺满实体区
+    //   * 纵向按**该币种**本窗口内的极值铺满带子 -> 换币种带子位置不变
+    //   * 没有数据 / 只有 1 点 / 极值相同 -> 平线（curveHasData = false）
+    //   * 两端补"保持点"（值等于端点值）-> 单调三次在等值相邻点切线为 0，
+    //     于是曲线**平滑收平成水平**，不会在数据边界出现折角
+    {
+        const std::string& cur = amount.shownCurrency();
+        const int64_t now = static_cast<int64_t>(std::time(nullptr)) * 1000;
+        const int64_t winMs = 10 * 60 * 1000;
+        std::vector<dshb::HistoryPoint> hp =
+            (cur.empty() || !haveNumber) ? std::vector<dshb::HistoryPoint>{}
+                                            : g_hist.Window(cur, now, winMs, 120);
+        if (hp.size() >= 2) {
+            double lo = hp.front().total.ToDouble();
+            double hi = lo;
+            for (const dshb::HistoryPoint& p : hp) {
+                const double v = p.total.ToDouble();
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            const double span = hi - lo;
+            if (span > 0.0) {
+                f.curve.clear();
+                // ★ 保持点只在**严格早于**第一个样本时才补：
+                //   两者 x 相同会让单调插值拒绝整条曲线（x 必须严格递增），
+                //   表现为曲线变成带子顶部的一条平线（实测踩过）。
+                const double xFirst =
+                    static_cast<double>(hp.front().wallMs - (now - winMs)) / static_cast<double>(winMs);
+                const double xLast =
+                    static_cast<double>(hp.back().wallMs - (now - winMs)) / static_cast<double>(winMs);
+                if (xFirst > 0.002) {
+                    f.curve.push_back({0.0f, static_cast<float>(1.0 - (hp.front().total.ToDouble() - lo) / span)});
+                }
+                for (const dshb::HistoryPoint& p : hp) {
+                    double x = static_cast<double>(p.wallMs - (now - winMs)) / static_cast<double>(winMs);
+                    if (x < 0.0) x = 0.0;
+                    if (x > 1.0) x = 1.0;
+                    const double yn = 1.0 - (p.total.ToDouble() - lo) / span;
+                    f.curve.push_back({static_cast<float>(x), static_cast<float>(yn)});
+                }
+                if (xLast < 0.998) {
+                    f.curve.push_back({1.0f, static_cast<float>(1.0 - (hp.back().total.ToDouble() - lo) / span)});
+                }
+                f.curveHasData = true;
+            }
+        }
     }
     // ★ 符号与数字**分开决定**（所有者）：只要币种是确定的，即使没有数字也要显示符号，
     //   否则切到没数据的币种时看不出自己在看哪个币种。

@@ -4,6 +4,7 @@
 // 鏁板瓧銆佹洸绾裤€侀鑹层€佸績璺抽兘鏄悗闈㈡楠ょ殑浜嬶紙瀹炴柦姝ラ C/D/E锛夈€?
 
 #include "renderer.h"
+#include "curve.h"   // 单调三次插值（氛围曲线）
 #include "roll_axis.h"
 
 #include <d2d1.h>
@@ -67,6 +68,7 @@ int g_digitDrawMode = 0;
 
 // 氛围曲线开关：--no-curve 关掉它，用于 A/B 对比（关掉后文字位置必须逐像素不变）
 bool g_curveEnabled = true;
+int g_curveMode = 0;   // 0 = 用采样历史画（默认）；1 = D1 的假正弦（--curve=sine，对照用）
 
 // 氛围曲线（D1）：一条与数据无关的正弦线，画在**所有文字之前** = 数字后面。
 // 采样密度 1 像素一个点，所以肉眼看到的是连续曲线，不会出现折角
@@ -74,6 +76,7 @@ namespace { float g_lastLinePitch = 0.0f; }
 float LastLinePitchDip() { return g_lastLinePitch; }
 
 void SetCurveEnabled(bool on) { g_curveEnabled = on; }
+void SetCurveMode(int mode) { g_curveMode = mode; }
 
 void SetLayoutProbe(bool on) {
     g_layoutProbe = on;
@@ -377,13 +380,49 @@ void DrawCentered(ID2D1RenderTarget* rt, const std::wstring& text, IDWriteTextFo
 //   鏁板瓧鏄富瑙掞紝鎵€浠ュ畠鏈€澶э紱鏍囬灏忋€佹斁宸︿笂锛涙竻闆堕浼版斁搴曢儴銆?
 //   甯佺绗﹀彿**鏀惧悗缂€**锛?00.00楼锛夆€斺€旀墍鏈夎€呮槑纭寚瀹氾紝涓嶆敼銆?
 //   鏇茬嚎鏄?*姘涘洿**锛屼笌鏁板瓧鍙犲姞鍦ㄥ悓涓€涓尯鍩燂紙D 闃舵锛夛紝涓嶆槸"鍏堝湪鏇茬嚎涓婃柟鍐嶆斁鏁板瓧"銆?
-void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas) {
+void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const WidgetFrame& f) {
     if (!g_curveEnabled) return;
     const float s = canvas.scale;
     const float x0 = kMarginDip * s;
     const float x1 = (kMarginDip + kEntityWidthDip) * s;
     const float cy = (kMarginDip + kCurveCenterYDip) * s;
     const float amp = kCurveAmplitudeDip * s;
+
+    // 归一化坐标 -> 画布坐标：x 横跨实体区，y 从带子顶(0)到底(1)。
+    // ★ 带子位置只由常量决定，**与币种无关**：换币种不重新布局，
+    //   每个币种各自铺满同一条带子（所有者：切币种时曲线位置不变）。
+    auto px = [&](float xn) { return x0 + xn * (x1 - x0); };
+    auto py = [&](float yn) { return (cy - amp) + yn * (2.0f * amp); };
+
+    // 要画的点列（归一化）。渲染层只管连线，不知道余额从哪来。
+    std::vector<std::pair<float, float>> pts;
+    if (g_curveMode == 1) {
+        // 对照用：D1 那条与数据无关的假正弦（--curve=sine）
+        for (int i = 0; i <= 200; ++i) {
+            const float u = static_cast<float>(i) / 200.0f;
+            pts.push_back({u, 0.5f - 0.5f * std::sin(2.0f * 3.14159265f * kCurvePeriods * u)});
+        }
+    } else if (!f.curveHasData || f.curve.size() < 2) {
+        // 没有数据 = 平的（所有者规则），画在带子中线。
+        pts.push_back({0.0f, 0.5f});
+        pts.push_back({1.0f, 0.5f});
+    } else {
+        // 单调三次插值（curve.h）：我们只在采样时刻知道余额，区间内的形状是插出来的；
+        // 单调插值保证不过冲（普通样条会画出从未出现过的余额）。
+        std::vector<double> xs;
+        std::vector<double> ys;
+        for (const CurvePoint& p : f.curve) {
+            xs.push_back(static_cast<double>(p.x));
+            ys.push_back(static_cast<double>(p.y));
+        }
+        dshb::MonotoneCurve mc;
+        mc.Build(xs, ys);
+        const int steps = 300;
+        for (int i = 0; i <= steps; ++i) {
+            const float u = static_cast<float>(i) / static_cast<float>(steps);
+            pts.push_back({u, static_cast<float>(mc.Eval(static_cast<double>(u)))});
+        }
+    }
 
     ID2D1Factory* fac = nullptr;
     rt->GetFactory(&fac);
@@ -399,16 +438,15 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas) {
         fac->Release();
         return;
     }
-    const float span = (x1 > x0) ? (x1 - x0) : 1.0f;
     bool first = true;
-    for (float x = x0; x <= x1; x += 1.0f) {
-        const float u = (x - x0) / span;
-        const float y = cy - amp * std::sin(2.0f * 3.14159265f * kCurvePeriods * u);
+    for (const std::pair<float, float>& pt : pts) {
+        const float X = px(pt.first);
+        const float Y = py(pt.second);
         if (first) {
-            sink->BeginFigure(D2D1::Point2F(x, y), D2D1_FIGURE_BEGIN_HOLLOW);
+            sink->BeginFigure(D2D1::Point2F(X, Y), D2D1_FIGURE_BEGIN_HOLLOW);
             first = false;
         } else {
-            sink->AddLine(D2D1::Point2F(x, y));
+            sink->AddLine(D2D1::Point2F(X, Y));
         }
     }
     sink->EndFigure(D2D1_FIGURE_END_OPEN);
@@ -792,7 +830,7 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
 
     // 姝ｆ枃锛圕 闃舵锛夛細鏍囬銆佹暟瀛椼€佺鍙枫€佹竻闆堕浼?
     // 氛围曲线：必须在文字之前画（= 数字后面）
-    PaintAmbientCurve(rt, canvas);
+    PaintAmbientCurve(rt, canvas, g_widgetFrame);
 
     PaintWidgetText(rt, canvas, g_widgetFrame);
 

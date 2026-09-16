@@ -20,6 +20,7 @@
 #include <objbase.h>    // CoInitializeEx / COINIT_APARTMENTTHREADED
 #include <shellapi.h>   // CommandLineToArgvW
 #include "curve.h"       // --curve-selftest
+#include "sample_history.h"   // 采样历史（氛围曲线用）
 #include <wtsapi32.h>   // 锁屏/解锁通知（J4）
 
 #include <cmath>
@@ -93,7 +94,10 @@ int g_countdownSeconds = 0;
 std::string g_apiKey;           // 只在内存里，绝不写日志
 bool g_clickTest = false;         // --click-test：注入三次手势
 bool g_pauseTest = false;
-bool g_noCurve = false;           // --no-curve：关掉氛围曲线（A/B 对比用）         // --pause-test：注入"锁屏/解锁"，验证 J4（不用真锁屏）
+bool g_noCurve = false;           // --no-curve：关掉氛围曲线（A/B 对比用）
+bool g_curveSine = false;         // --curve=sine：画 D1 那条假正弦（对照）
+int  g_historyDemo = 0;           // --history-demo=N：合成 N 个历史点（导帧验证用）
+         // --pause-test：注入"锁屏/解锁"，验证 J4（不用真锁屏）
 double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
 double g_displayAmount = 0.0;   // 已弃用（所有者改为 --last）
 double g_lastAmount = -1.0;   // --last=L（-1 = 未给）
@@ -437,6 +441,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // 导帧夹具：导出路径不取样，所以倒计时没有真实来源，靠它给一个值。
             g_countdownGiven = true;
             g_countdownSeconds = _wtoi(argv[i] + 12);
+        } else if (wcscmp(argv[i], L"--curve=sine") == 0) {
+            g_curveSine = true;
+        } else if (wcsncmp(argv[i], L"--history-demo=", 15) == 0) {
+            g_historyDemo = _wtoi(argv[i] + 15);
         } else if (wcscmp(argv[i], L"--curve-selftest") == 0) {
             // Numeric self-test for the monotone interpolation (D3/D6).
             // No pixels involved: exactness + no-overshoot are pure properties.
@@ -857,6 +865,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         if (g_layoutProbe) dshb::SetLayoutProbe(true);
         // 氛围曲线默认开；--no-curve 关掉它，用于确认"关掉后文字位置逐像素不变"
         dshb::SetCurveEnabled(!g_noCurve);
+        if (g_curveSine) dshb::SetCurveMode(1);   // 对照：D1 的假正弦
+        if (g_historyDemo > 0) dshb::PrimeHistoryForDemo(g_historyDemo);
 
         // 让模拟数据源在"虚拟时间"里跑起来：否则导出的图没有数据，浮层也是空的。
         // 虚拟时间按 1/60 秒一步推进，所以导出是确定的、可重复的。
