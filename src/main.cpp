@@ -84,6 +84,7 @@ bool g_pressValid = false;
 bool g_currenciesGiven = false;   // --currencies=：合成一条多币种样本（验证切换用）
 std::string g_currenciesSpec;   // 形如 "CNY:19.20,USD:2.70"
 bool g_realApiPlanned = false;  // 进循环之前就定下"本次要不要用真接口"
+bool g_clickDemo = false;       // --click-demo：自动每 2 秒点一次符号（演示用，不是测试）
 bool g_countdownGiven = false;  // --countdown=N：导帧时给倒计时一个固定值（导帧不取样）
 int g_countdownSeconds = 0;
 std::string g_apiKey;           // 只在内存里，绝不写日志
@@ -392,6 +393,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_selftestB = true;
         } else if (wcscmp(argv[i], L"--layout-probe") == 0) {
             g_layoutProbe = true;
+        } else if (wcscmp(argv[i], L"--click-demo") == 0) {
+            g_clickDemo = true;
         } else if (wcsncmp(argv[i], L"--countdown=", 12) == 0) {
             // 导帧夹具：导出路径不取样，所以倒计时没有真实来源，靠它给一个值。
             g_countdownGiven = true;
@@ -1331,9 +1334,20 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         if (!manualMode) g_display.OnSample(g_states.lastGood());
         // --click-test：注入三次手势，验证"只有单击才切换"这条规则。
         // 走的是和真实鼠标**同一个**判定函数，不是旁路。
-        if (g_clickTest) {
+        if (g_clickTest || g_clickDemo) {
             static int ctStage = 0;
             static double ctAt = 1.0;
+            // --click-demo：三次手势之后，继续每 2 秒来一次干净单击，便于肉眼看切换
+            if (g_clickDemo && ctStage >= 3 && elapsed >= ctAt) {
+                const dshb::SymbolRect sr2 = dshb::CurrencySymbolRect();
+                if (sr2.valid) {
+                    const int mx = static_cast<int>((sr2.l + sr2.r) * 0.5f);
+                    const int my = static_cast<int>((sr2.t + sr2.b) * 0.5f);
+                    g_pressX = mx; g_pressY = my; g_pressTick = GetTickCount64(); g_pressValid = true;
+                    FinishLeftGesture(mx, my);
+                    ctAt = elapsed + 2.0;
+                }
+            }
             if (ctStage < 3 && elapsed >= ctAt) {
                 const dshb::SymbolRect sr = dshb::CurrencySymbolRect();
                 if (sr.valid) {
