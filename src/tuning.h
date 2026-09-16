@@ -109,6 +109,12 @@ inline constexpr float kRollSnapGrid = 0.01f;
 //   连续失败到第 5 次才显示 --.--。
 inline constexpr int kUnreadableAfterFailures = 5;
 
+// ★ 所有者定的自适应节奏：取值**有变化**就把间隔缩短 1 秒（最快 3 秒），
+//   **没变化**就延长 1 秒（最慢 10 秒）。
+inline constexpr int kApiIntervalMaxMs = 10000;
+inline constexpr int kApiIntervalMinMs = 3000;
+inline constexpr int kApiIntervalStepMs = 1000;
+
 inline constexpr float kNumberShiftRate = 0.90f;   // 整块数字横向滑动：每帧把残差乘上它（同 kRollRate 的风格）
 inline constexpr float kNumberShiftSnapDip = 0.05f;   // 横向残差 < 它就直接吸附（免得永远差一点点）
 inline constexpr float kRollCurveC = 10.0f;

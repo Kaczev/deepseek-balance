@@ -2,10 +2,13 @@
 
 #include "amount.h"
 #include "api_client.h"
+#include "tuning.h"
 
 #include <windows.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
 
 namespace dshb {
 
@@ -65,6 +68,21 @@ Sample MakeSample(const api::BalanceResult& r) {
     return s;
 }
 
+// 两条样本的取值是否相同：币种与金额逐条比。
+// 用它决定间隔是缩短还是延长（所有者：有变化就缩短，没变化就延长）。
+bool SameAmounts(const Sample& a, const Sample& b) {
+    if (a.entries.size() != b.entries.size()) return false;
+    for (size_t i = 0; i < a.entries.size(); ++i) {
+        if (a.entries[i].currency != b.entries[i].currency) return false;
+        if (a.entries[i].total.raw != b.entries[i].total.raw) return false;
+        if (a.entries[i].ok != b.entries[i].ok) return false;
+    }
+    if (a.entries.empty()) {
+        return a.total.raw == b.total.raw && a.currency == b.currency;
+    }
+    return true;
+}
+
 }  // namespace
 
 BalanceSource::~BalanceSource() { Stop(); }
@@ -73,6 +91,7 @@ void BalanceSource::Start(const BalanceSourceConfig& cfg) {
     if (started_) return;
     stop_.store(false);
     failures_.store(0);
+    intervalMs_.store(cfg.intervalMs);
     started_ = true;
     worker_ = std::thread(&BalanceSource::Run, this, cfg);
 }
@@ -92,7 +111,7 @@ void BalanceSource::Run(BalanceSourceConfig cfg) {
         if (!first) {
             std::unique_lock<std::mutex> lk(mu_);
             // 用条件变量睡：Stop() 能立刻把它叫醒，不会卡在一个周期上。
-            cv_.wait_for(lk, std::chrono::milliseconds(cfg.intervalMs),
+            cv_.wait_for(lk, std::chrono::milliseconds(intervalMs_.load()),
                          [this] { return stop_.load(); });
             if (stop_.load()) break;
         }
@@ -112,6 +131,26 @@ void BalanceSource::Run(BalanceSourceConfig cfg) {
             std::lock_guard<std::mutex> lk(mu_);
             pending_.push_back(s);
             logs_.push_back(api::LogLine(r));   // J6：行内绝不含 Key
+        }
+        // ---- 自适应节奏（所有者定的规则）----
+        // 有变化 -> 缩短 1 秒（最快 kApiIntervalMinMs）；没变化 -> 延长 1 秒（最慢 intervalMs）。
+        if (r.status == api::Status::Ok) {
+            const bool changed = !havePrev_ || !SameAmounts(prev_, s);
+            if (havePrev_) {
+                int cur = intervalMs_.load();
+                if (changed) cur = std::max(dshb::kApiIntervalMinMs, cur - dshb::kApiIntervalStepMs);
+                else         cur = std::min(cfg.intervalMs, cur + dshb::kApiIntervalStepMs);
+                intervalMs_.store(cur);
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                char ib[96];
+                std::snprintf(ib, sizeof(ib), "interval -> %dms (%s)", intervalMs_.load(),
+                              changed ? "value changed, shorter" : "unchanged, longer");
+                logs_.push_back(ib);
+            }
+            prev_ = s;
+            havePrev_ = true;
         }
         if (r.status == api::Status::Ok) failures_.store(0);
         else failures_.fetch_add(1);
