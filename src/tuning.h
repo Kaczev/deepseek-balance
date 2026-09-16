@@ -175,6 +175,12 @@ inline constexpr float kCurveSmoothSnapFrac = 0.002f;
 //     于是曲线以恒定速度向左移动——30 秒正好走一个点的间距（所有者：曲线要一直动）。
 inline constexpr int64_t kCurveWindowMs = 5 * 60 * 1000;
 inline constexpr int64_t kCurveNominalStepMs = 30 * 1000;
+
+// 纵向刻度的保护：窗口内极值差小于"当前值的这个比例"时，视为**没有有意义的变化**，
+// 曲线画成带子正中的平线。
+// 为什么需要：刻度按极值铺满整条带子，若 5 分钟里只差 0.01 元，也会被拉成整条带子的
+// 大起大落（而且重复出现的那个值会贴住带子上/下沿，看着"平但偏下"）。
+inline constexpr double kCurveMinSpanFrac = 0.002;   // 0.2%：19.50 元时约 0.04 元
 inline constexpr float kCurveSmoothSnap = 0.002f;
 
 // ★ 状态主色：原来那支蓝 #6C89F6。**保留**，后面演示各种状态时用；
