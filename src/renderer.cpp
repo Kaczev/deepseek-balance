@@ -383,7 +383,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
     // 鏍囬鍏肩姸鎬佽锛氬乏涓婅銆傜姸鎬佸彉浜嗘枃瀛楀氨鎹紝涓嶅彧闈犻鑹茬紪鐮併€?
     if (f.statusText && titleFmt) {
         ID2D1SolidColorBrush* b = nullptr;
-        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kTextColorR, kTextColorG, kTextColorB, kTitleAlpha), &b)) && b) {
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kEdgeTextColorR, kEdgeTextColorG, kEdgeTextColorB, kTitleAlpha), &b)) && b) {
             IDWriteTextLayout* layout = nullptr;
             if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
                     f.statusText, static_cast<UINT32>(wcslen(f.statusText)), titleFmt,
@@ -403,7 +403,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
         const float cx2 = (kMarginDip + kEntityWidthDip - kTitleInsetXDip) * s - cw;
         const float cy2 = (kMarginDip + kTitleInsetYDip) * s;
         ID2D1SolidColorBrush* cb = nullptr;
-        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kTextColorR, kTextColorG, kTextColorB, kTitleAlpha), &cb)) && cb) {
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kEdgeTextColorR, kEdgeTextColorG, kEdgeTextColorB, kTitleAlpha), &cb)) && cb) {
             IDWriteTextLayout* cl = nullptr;
             if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
                     f.countdownText, static_cast<UINT32>(wcslen(f.countdownText)), titleFmt,
@@ -659,7 +659,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
     if (!f.zeroTimeText.empty() && estFmt) {
         const std::wstring t = Widen(f.zeroTimeText);
         ID2D1SolidColorBrush* b = nullptr;
-        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kTextColorR, kTextColorG, kTextColorB, kEstimateAlpha), &b)) && b) {
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kEdgeTextColorR, kEdgeTextColorG, kEdgeTextColorB, kEstimateAlpha), &b)) && b) {
             IDWriteTextLayout* layout = nullptr;
             if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
                     t.c_str(), static_cast<UINT32>(t.size()), estFmt, kEntityWidthDip * s, 64.0f,
@@ -700,6 +700,18 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
             D2D1::RoundedRect(D2D1::RectF(cx, cy, cx + ew, cy + eh), radius, radius);
         rt->FillRoundedRectangle(rr, brush);
         brush->Release();
+    }
+
+    // 面板边框：颜色 #afb2b7、线宽 2 DIP（常量在 tuning.h）
+    {
+        ID2D1SolidColorBrush* bb = nullptr;
+        if (SUCCEEDED(rt->CreateSolidColorBrush(
+                StraightRgba(kBorderColorR, kBorderColorG, kBorderColorB, 1.0f), &bb)) && bb) {
+            const D2D1_ROUNDED_RECT rb =
+                D2D1::RoundedRect(D2D1::RectF(cx, cy, cx + ew, cy + eh), radius, radius);
+            rt->DrawRoundedRectangle(rb, bb, kBorderWidthDip * s);
+            bb->Release();
+        }
     }
 
     // 杩欓噷鍘熸潵鏈変竴涓?璺熺潃鏃堕棿璧扮殑鐧借壊鏂瑰潡"锛岀敤閫斿彧鏄瘉鏄庡抚寰幆鍦ㄨ窇銆?

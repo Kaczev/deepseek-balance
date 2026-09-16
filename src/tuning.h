@@ -139,6 +139,17 @@ inline constexpr float kTextColorR = 0xf9 / 255.0f;
 inline constexpr float kTextColorG = 0xfa / 255.0f;
 inline constexpr float kTextColorB = 0xfb / 255.0f;
 
+// 边缘（标题 / 倒计时 / 底部文案）文字色 #afb2b7
+inline constexpr float kEdgeTextColorR = 0xaf / 255.0f;
+inline constexpr float kEdgeTextColorG = 0xb2 / 255.0f;
+inline constexpr float kEdgeTextColorB = 0xb7 / 255.0f;
+
+// 面板边框：颜色 #afb2b7，线宽 2 DIP
+inline constexpr float kBorderColorR = 0xaf / 255.0f;
+inline constexpr float kBorderColorG = 0xb2 / 255.0f;
+inline constexpr float kBorderColorB = 0xb7 / 255.0f;
+inline constexpr float kBorderWidthDip = 2.0f;
+
 // ★ 状态主色：原来那支蓝 #6C89F6。**保留**，后面演示各种状态时用；
 //   面板与文字已改成上面的中性色，所以它现在不参与面板底色。
 inline constexpr float kStatePrimaryR = 108.0f / 255.0f;
@@ -150,10 +161,10 @@ inline constexpr float kPanelOpacity = 0.95f;
 
 
 // 各处文字的透明度（文字一律白色，只有透明度不同）。
-inline constexpr float kTitleAlpha = 0.85f;      // 右上角标题
+inline constexpr float kTitleAlpha = 1.00f;      // 边缘文字：设为 1.0 才能渲染成 #afb2b7 本身
 inline constexpr float kAmountAlpha = 1.00f;     // 数字本身
-inline constexpr float kCurrencyAlpha = 0.90f;   // ¥ 符号
-inline constexpr float kEstimateAlpha = 0.75f;   // 底部预估文案
+inline constexpr float kCurrencyAlpha = 1.00f;   // ¥ 符号：要精确等于 #f9fafb
+inline constexpr float kEstimateAlpha = 1.00f;   // 边缘文字：同标题，渲染成 #afb2b7
 
 // 调试浮层里用的几个颜色（正常运行时看不到）。
 inline constexpr float kProbeRedAlpha = 0.50f;   // 预乘自检用的纯红方块
