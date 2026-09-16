@@ -68,7 +68,12 @@ int g_digitDrawMode = 0;
 
 // 氛围曲线开关：--no-curve 关掉它，用于 A/B 对比（关掉后文字位置必须逐像素不变）
 bool g_curveEnabled = true;
-int g_curveMode = 0;   // 0 = 用采样历史画（默认）；1 = D1 的假正弦（--curve=sine，对照用）
+int g_curveMode = 0;
+
+// 曲线的平滑状态：上一帧真正画出去的点（归一化）。列数变化时把旧曲线重采样到
+// 新的 x 网格上再逐点逼近——于是"横向平移"也变成了动画，而不是瞬移。
+std::vector<std::pair<float, float>> g_curveDrawn;
+bool g_curveDrawnValid = false;   // 0 = 用采样历史画（默认）；1 = D1 的假正弦（--curve=sine，对照用）
 
 // 氛围曲线（D1）：一条与数据无关的正弦线，画在**所有文字之前** = 数字后面。
 // 采样密度 1 像素一个点，所以肉眼看到的是连续曲线，不会出现折角
@@ -438,8 +443,55 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
         fac->Release();
         return;
     }
+    // ---- 平滑：把上一帧的点朝这一帧的目标点逼近 ----
+    // 目标点数与上一帧不同时（端点点进出），先在**旧曲线上按新 x 重采样**，
+    // 这样"整条平移"表现为逐点的 y 差，被同一个缓动吃掉。
+    if (g_curveMode == 0) {
+        if (!g_curveDrawnValid || g_curveDrawn.size() != pts.size()) {
+            std::vector<std::pair<float, float>> resampled;
+            resampled.reserve(pts.size());
+            for (const std::pair<float, float>& tp : pts) {
+                float y = tp.second;   // 没有旧曲线时直接用目标值（首帧、或刚切换）
+                if (g_curveDrawnValid && g_curveDrawn.size() >= 2) {
+                    const float xq = tp.first;
+                    if (xq <= g_curveDrawn.front().first) {
+                        y = g_curveDrawn.front().second;
+                    } else if (xq >= g_curveDrawn.back().first) {
+                        y = g_curveDrawn.back().second;
+                    } else {
+                        for (size_t i = 0; i + 1 < g_curveDrawn.size(); ++i) {
+                            const float x0 = g_curveDrawn[i].first;
+                            const float x1 = g_curveDrawn[i + 1].first;
+                            if (xq >= x0 && xq <= x1 && x1 > x0) {
+                                const float u = (xq - x0) / (x1 - x0);
+                                y = g_curveDrawn[i].second +
+                                    u * (g_curveDrawn[i + 1].second - g_curveDrawn[i].second);
+                                break;
+                            }
+                        }
+                    }
+                }
+                resampled.push_back({tp.first, y});
+            }
+            g_curveDrawn.swap(resampled);
+        }
+        for (size_t i = 0; i < pts.size() && i < g_curveDrawn.size(); ++i) {
+            const float d = pts[i].second - g_curveDrawn[i].second;
+            if (std::fabs(d) < kCurveSmoothSnap) {
+                g_curveDrawn[i].second = pts[i].second;
+            } else {
+                g_curveDrawn[i].second += d * kCurveSmoothRate;
+            }
+            g_curveDrawn[i].first = pts[i].first;
+        }
+        g_curveDrawnValid = true;
+    } else {
+        g_curveDrawn = pts;          // 对照模式（假正弦）不平滑，保持原样
+        g_curveDrawnValid = true;
+    }
+
     bool first = true;
-    for (const std::pair<float, float>& pt : pts) {
+    for (const std::pair<float, float>& pt : g_curveDrawn) {
         const float X = px(pt.first);
         const float Y = py(pt.second);
         if (first) {

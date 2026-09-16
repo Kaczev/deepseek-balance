@@ -190,7 +190,34 @@ const char* ConnStateNameUtf8(dshb::ConnState s) {
 //   移动超过 4px  -> 算拖动，不切换
 //   按住超过 600ms -> 算长按，不切换
 // 命中测试用渲染层每帧发布的符号矩形（像素坐标）。
-static void FinishLeftGesture(int x, int y) {
+static // 提交延迟（所有者的一计）：显示（数字 + 曲线右端）用**上一次确认的采样**，
+// 最新那次先压着，等下一个点到来时再提交。
+//
+// 为什么：不等的话，曲线右端只能是"现在"，可我们并不知道现在的余额——于是要画一段
+// 假平尾，而且每来一个点整条曲线都会滑一下（±1 帧内的瞬时位移 = 肉眼看到的"突变"）。
+// 压一拍之后，每个线段的两端都是**真观测值**，数字滚动与曲线都在两个已知状态之间过渡。
+//
+// 代价（所有者已确认接受）：显示晚一个采样周期（3~10 秒）。
+// 第一次采样没有"上一个"可等，所以**立刻提交**（曲线此时是平的）。
+dshb::Sample g_stash{};
+bool g_haveStash = false;
+
+void CommitDelayed() {
+    const dshb::Sample& s = g_states.lastGood();
+    if (!g_haveStash) {
+        g_haveStash = true;
+        g_stash = s;
+        g_display.OnSample(s);   // 第一次：立刻显示，不拖
+        SelfTestLog(L"[commit] t=%.1fs 首个采样直接显示：%.2f", g_elapsed, s.total.ToDouble());
+        return;
+    }
+    g_display.OnSample(g_stash);  // 提交上一次压着的
+    SelfTestLog(L"[commit] t=%.1fs 提交上一个采样 %.2f（最新 %.2f 已收到，压着等下一点）",
+                g_elapsed, g_stash.total.ToDouble(), s.total.ToDouble());
+    g_stash = s;
+}
+
+void FinishLeftGesture(int x, int y) {
     if (!g_pressValid) return;
     g_pressValid = false;
     const int dx = x - g_pressX;
@@ -1393,7 +1420,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             while (g_apiSource.Poll(&rs)) {
                 g_states.OnSample(rs, rs.wallMs);
                 // 只有成功的样本才动显示值；失败时保持原样（所有者："先当作没变"）
-                if (rs.amountsOk) g_display.OnSample(g_states.lastGood());
+                if (rs.amountsOk) CommitDelayed();   // 延迟一拍提交（见 CommitDelayed）
             }
             std::string apiLine;
             // 带时间戳（设计 §10.5 的日志要求）：这样"暂停期间没请求""唤醒立刻补一次"可验证

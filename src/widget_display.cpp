@@ -102,6 +102,7 @@ std::string DisplayedAmount::NextCurrency() const {
 
 void DisplayedAmount::OnSample(const Sample& s) {
     if (!s.amountsOk) return;                 // 读不到的样本不参与显示
+    lastSampleWallMs_ = s.wallMs;   // 曲线横轴锚点（见 widget_display.h）
 
     // ---- 币种选择 ----
     // 清单来自样本；没选中（或选中的这个币种这次没出现）就用接口给的优先条目。
@@ -436,7 +437,10 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     //     于是曲线**平滑收平成水平**，不会在数据边界出现折角
     {
         const std::string& cur = amount.shownCurrency();
-        const int64_t now = static_cast<int64_t>(std::time(nullptr)) * 1000;
+        // 横轴锚在**最近一次已确认的采样**上（所有者：曲线最右端就是上一个采样值）。
+        // 用"现在"做锚会多出一段假平尾——我们并不知道"现在"的余额。
+        const int64_t anchor = amount.lastSampleWallMs();
+        const int64_t now = (anchor > 0) ? anchor : (static_cast<int64_t>(std::time(nullptr)) * 1000);
         const int64_t winMs = 10 * 60 * 1000;
         std::vector<dshb::HistoryPoint> hp =
             (cur.empty() || !haveNumber) ? std::vector<dshb::HistoryPoint>{}

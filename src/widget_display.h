@@ -110,6 +110,9 @@ public:
     std::vector<std::string> availableCurrencies() const { return availableCurrencies_; }
     // 下一个币种（在当前清单里循环）。清单不足 2 个时返回空串。
     std::string NextCurrency() const;
+    // 最近一次**已提交**采样的墙钟毫秒：曲线的横轴锚在它上面（右端 = 最近一次确认的值）。
+    int64_t lastSampleWallMs() const { return lastSampleWallMs_; }
+
     double value() const { return value_; }
     double target() const { return target_; }
 
@@ -133,6 +136,7 @@ public:
 
 private:
     bool hasValue_ = false;
+    int64_t lastSampleWallMs_ = 0;   // 最近一次提交的采样时刻（曲线横轴锚点）
     double value_ = 0.0;      // 当前显示值：连续函数追着 target_ 走
     double target_ = 0.0;     // 目标值：每次采样直接改写（可以突变）
     bool zeroPending_ = false;

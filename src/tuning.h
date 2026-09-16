@@ -163,6 +163,12 @@ inline constexpr float kCurveAmplitudeDip = 14.0f;
 inline constexpr float kCurveCenterYDip = 65.0f;   // 实体区内的中线 y（65 = 绝对 145 = 数字墨迹中线）
 inline constexpr float kCurvePeriods = 2.5f;
 
+// 曲线的平滑：每帧把"当前画出来的点"朝"目标点"逼近（与 kRollRate / kNumberShiftRate 同风格）。
+// 这一套同时解决三种跳变：刻度重算导致的上下跳、端点点进出导致的横向滑、以及"过渡到平线"。
+// 刻度**不改**：每个币种照样按自己窗口内的极值铺满整条带子（所有者：线要完美铺在带子里）。
+inline constexpr float kCurveSmoothRate = 0.88f;
+inline constexpr float kCurveSmoothSnap = 0.002f;
+
 // ★ 状态主色：原来那支蓝 #6C89F6。**保留**，后面演示各种状态时用；
 //   面板与文字已改成上面的中性色，所以它现在不参与面板底色。
 inline constexpr float kStatePrimaryR = 108.0f / 255.0f;
