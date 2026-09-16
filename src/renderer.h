@@ -152,6 +152,11 @@ struct InnerGlowBakeCounters {
 };
 const InnerGlowBakeCounters& InnerGlowBakeStats();
 
+// 临时诊断（曲线塌到左边那次排查）：曲线采样点的实测范围。绘制期间只往内存里写，
+// 由 main 在绘制**之后**落盘（绘制路径里做文件 I/O 会让进程崩，本项目已踩过两次）。
+// 默认空字符串；只有 DSHB_CURVE_DEBUG 时才有内容。
+const std::string& CurveDebugText();
+
 // 单次调用到底重烘了没有（探针用：它按帧重放一次滑行，需要区分"贴缓存"与"重烘"）。
 // 实现读的是和 Pick 同一个计数器，所以它不会说谎。
 bool GlowTintBakedOnLastPick();

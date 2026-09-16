@@ -47,6 +47,7 @@ namespace dshb {
 // ---------------------------------------------------------------------------
 // --- 重烘计数与耗时（renderer.h 的 InnerGlowBakeStats 是它的只读出口）---
 InnerGlowBakeCounters g_glowBake;
+std::string g_curveDebug;   // 临时：DSHB_CURVE_DEBUG 诊断
 
 void PaintInnerGlow(ID2D1RenderTarget* rt, const WidgetFrame& f, ID2D1Bitmap* tinted);
 float InnerGlowAlphaAt(float xDip, float yDip);
@@ -567,18 +568,91 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
         fac->Release();
         return;
     }
-    for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
-        ID2D1GeometrySink* sink = nullptr;
-        if (FAILED(geo->Open(&sink)) || !sink) break;   // 空几何：这一帧余下的段都不画
-        sink->BeginFigure(D2D1::Point2F(px(pts[i].first), py(pts[i].second)),
-                          D2D1_FIGURE_BEGIN_HOLLOW);
-        sink->AddLine(D2D1::Point2F(px(pts[i + 1].first), py(pts[i + 1].second)));
-        sink->EndFigure(D2D1_FIGURE_END_OPEN);
-        sink->Close();
-        sink->Release();
-        cb->SetColor(StraightRgba(colOf[i].r, colOf[i].g, colOf[i].b, kCurveAlpha));
-        rt->DrawGeometry(geo, cb, kCurveWidthDip * s);
+    // 诊断（临时，只在 DSHB_CURVE_DEBUG 时写一次文件；**不在绘制路径里做 I/O**——
+    // 这里只是把一段文字塞进内存，写文件由 main 在绘制之后调用 DumpCurveDebug 完成）。
+    {
+        static bool dumped = false;
+        if (!dumped && GetEnvironmentVariableA("DSHB_CURVE_DEBUG", nullptr, 0) > 0) {
+            dumped = true;
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                          "control=%llu pts=%llu  xRange=[%.1f..%.1f]  yBand=[%.1f..%.1f]  "
+                          "first=(%.1f,%.1f) mid=(%.1f,%.1f) last=(%.1f,%.1f)",
+                          static_cast<unsigned long long>(f.curve.size()),
+                          static_cast<unsigned long long>(pts.size()),
+                          static_cast<double>(px(pts.front().first)),
+                          static_cast<double>(px(pts.back().first)),
+                          static_cast<double>(py(0.0f)), static_cast<double>(py(1.0f)),
+                          static_cast<double>(px(pts.front().first)),
+                          static_cast<double>(py(pts.front().second)),
+                          static_cast<double>(px(pts[pts.size() / 2].first)),
+                          static_cast<double>(py(pts[pts.size() / 2].second)),
+                          static_cast<double>(px(pts.back().first)),
+                          static_cast<double>(py(pts.back().second)));
+            g_curveDebug = buf;
+            for (std::size_t k = 0; k < f.curve.size() && k < 13; ++k) {
+                char line[128];
+                std::snprintf(line, sizeof(line), "\n  ctrl[%llu] x=%.4f y=%.4f hasColor=%d",
+                              static_cast<unsigned long long>(k),
+                              static_cast<double>(f.curve[k].x),
+                              static_cast<double>(f.curve[k].y),
+                              f.curve[k].hasColor ? 1 : 0);
+                g_curveDebug += line;
+            }
+        }
     }
+
+    // ★ 一次 Open / 一次 Close：**这是唯一能用的写法**。
+    //   回归的根因就是这里被写成"每段重开一次同一个几何"：`ID2D1PathGeometry` 不允许多次
+    //   Open/Close（第二次 Open 返回 D2DERR_WRONG_STATE 0x88990001），于是循环在第一次
+    //   之后就 break，全曲线只有**最左边那一段**被画出来 —— 实测 x[78..82]、20 个像素，
+    //   而它本该横跨实体区 x=80..395。
+    //   ★ 逐点颜色（"E 蒙光.md" §3.1）与这个限制冲突：一个几何只能被一种画笔画一次。
+    //     目前的做法是退回"单色整条"，**逐点颜色重新变成待办**（不能再用重开几何那条路，
+    //     见 .dsh\scratch\amb\report 里的说明）。宁可要一条正确的单色曲线，
+    //     不要一条只有左端 20 个像素的彩色曲线。
+    ID2D1GeometrySink* sink = nullptr;
+    if (FAILED(geo->Open(&sink)) || !sink) {
+        cb->Release();
+        geo->Release();
+        fac->Release();
+        return;
+    }
+    sink->BeginFigure(D2D1::Point2F(px(pts[0].first), py(pts[0].second)),
+                      D2D1_FIGURE_BEGIN_HOLLOW);
+    for (std::size_t i = 1; i < pts.size(); ++i) {
+        sink->AddLine(D2D1::Point2F(px(pts[i].first), py(pts[i].second)));
+    }
+    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+    sink->Close();
+    sink->Release();
+    cb->SetColor(StraightRgba(kCurveColorR, kCurveColorG, kCurveColorB, kCurveAlpha));
+    rt->DrawGeometry(geo, cb, kCurveWidthDip * s);
+
+    if (!pts.empty()) {
+        // 回归排查（曲线塌到左边缘）留下的唯一痕迹：把这条几何的**实测范围**留在
+        // 内存里，只写一次。它当初就是这么被找出来的（`geo->GetBounds` 报 inf，
+        // 因为几何是空的 —— 每段重开一次 Open/Close 是错的）。
+        // 默认空字符串；只有 DSHB_CURVE_DEBUG 时才有内容，由 main 在绘制之后落盘。
+        static bool dumped = false;
+        if (!dumped && GetEnvironmentVariableA("DSHB_CURVE_DEBUG", nullptr, 0) > 0) {
+            dumped = true;
+            D2D1_RECT_F bounds = D2D1::RectF(0, 0, 0, 0);
+            geo->GetBounds(nullptr, &bounds);
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                          "control=%llu pts=%llu xRange=[%.1f..%.1f] "
+                          "geoBounds=[%.1f..%.1f]x[%.1f..%.1f]",
+                          static_cast<unsigned long long>(f.curve.size()),
+                          static_cast<unsigned long long>(pts.size()),
+                          static_cast<double>(px(pts.front().first)),
+                          static_cast<double>(px(pts.back().first)),
+                          static_cast<double>(bounds.left), static_cast<double>(bounds.right),
+                          static_cast<double>(bounds.top), static_cast<double>(bounds.bottom));
+            g_curveDebug = buf;
+        }
+    }
+
     cb->Release();
     geo->Release();
     fac->Release();
@@ -1260,6 +1334,9 @@ void PaintInnerGlow(ID2D1RenderTarget* rt, const WidgetFrame& f, ID2D1Bitmap* ti
     const D2D1_RECT_F dest = D2D1::RectF(0.0f, 0.0f, size.width, size.height);
     rt->DrawBitmap(tinted, &dest, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
 }
+
+// 临时诊断：曲线采样点的实测范围（只在 DSHB_CURVE_DEBUG 时非空）。
+const std::string& CurveDebugText() { return g_curveDebug; }
 
 const InnerGlowBakeCounters& InnerGlowBakeStats() { return g_glowBake; }
 

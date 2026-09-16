@@ -91,6 +91,9 @@ bool g_curveStoreGiven = false; // --curve-store=：把曲线记录文件改到�
 std::wstring g_curveStorePath;
 bool g_logGlowStats = false;    // TEMPORARY (task 2): --log-glow-stats
 int g_ambienceGlide = 0;        // TEMPORARY (task 2): --ambience-glide=N
+int g_realFrames = 0;           // TEMPORARY: --real-frames=N (bounded real-loop run)
+int g_realFrameCount = 0;       // TEMPORARY
+bool g_forceNewInstance = false; // TEMPORARY: --force-new-instance (run beside the live widget)
 std::string g_currenciesSpec;   // 形如 "CNY:19.20,USD:2.70"
 bool g_realApiPlanned = false;  // 进循环之前就定下"本次要不要用真接口"
 
@@ -643,6 +646,13 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_ambienceGlide = _wtoi(argv[i] + 17);
             SelfTestLog(L"[argv] --ambience-glide=%d（跑 %d 帧真实氛围推进，量重烘代价）",
                         g_ambienceGlide, g_ambienceGlide);
+        } else if (wcsncmp(argv[i], L"--real-frames=", 14) == 0) {
+            g_realFrames = _wtoi(argv[i] + 14);
+            SelfTestLog(L"[argv] --real-frames=%d（真实循环跑这么多帧就退出并记 [glow]）",
+                        g_realFrames);
+        } else if (wcscmp(argv[i], L"--force-new-instance") == 0) {
+            g_forceNewInstance = true;
+            SelfTestLog(L"[argv] --force-new-instance：跳过单实例检查（测真实路径时用）");
         // ===== END TEMPORARY: task 2 =====
             } else if (wcsncmp(argv[i], L"--dpi=", 6) == 0) {
             g_dpiOverride = _wtoi(argv[i] + 6);
@@ -786,7 +796,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     // 注意导帧/自检这类离屏模式也不该受单实例限制（它们不显示窗口），
     // 所以只在"要显示窗口"的路径上做这个检查。
     const bool offscreenMode = g_exportFrame || g_premulProbe;
-    if (!offscreenMode && !dshb::AcquireSingleInstance()) {
+    if (!offscreenMode && !g_forceNewInstance && !dshb::AcquireSingleInstance()) {
         SelfTestLog(L"[single] 已有实例在运行，本进程退出（已通知它闪一次）");
         CoUninitialize();
         return 0;
@@ -1673,6 +1683,17 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         }
 
         if (g_selfTest && elapsed >= g_selfTestSeconds) break;
+        // ===== TEMPORARY: bounded real-loop run so the glow accounting can be logged =====
+        if (g_realFrames > 0 && ++g_realFrameCount >= g_realFrames) {
+            const dshb::InnerGlowBakeCounters& g = dshb::InnerGlowBakeStats();
+            SelfTestLog(L"[glow] REAL SCREEN PATH  coverageBakes=%d coverageWorstMs=%.3f "
+                        L"tintBakes=%d tintWorstMs=%.3f tintTotalMs=%.3f frames=%d",
+                        g.coverageBakes, g.coverageWorstMs, g.tintBakes, g.tintWorstMs,
+                        g.tintTotalMs, g.frames);
+            SelfTestLog(L"[glow] real-path frames=%d（--real-frames 到了就退出）", g_realFrameCount);
+            break;
+        }
+        // ===== END TEMPORARY =====
         if (!g_selfTest && g_runSeconds > 0.0 && elapsed >= g_runSeconds) break;
 
         // Present 已经等过垂直空白，这里只需要把消息收干净
