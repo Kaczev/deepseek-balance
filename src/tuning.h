@@ -130,9 +130,20 @@ inline constexpr bool kRollDDiffFloor = false;  // 默认 B：floor(R/n) − flo
 // ---------------------------------------------------------------------------
 
 // 面板底色 #6c89f6（"充足"档的基准色），分量为 0..1。
-inline constexpr float kPanelColorR = 108.0f / 255.0f;
-inline constexpr float kPanelColorG = 137.0f / 255.0f;
-inline constexpr float kPanelColorB = 246.0f / 255.0f;
+// ---- 面板与文字（所有者 2026-09-16 定）----
+// 背景 #1b1b1c、文字 #f9fafb
+inline constexpr float kPanelColorR = 0x1b / 255.0f;
+inline constexpr float kPanelColorG = 0x1b / 255.0f;
+inline constexpr float kPanelColorB = 0x1c / 255.0f;
+inline constexpr float kTextColorR = 0xf9 / 255.0f;
+inline constexpr float kTextColorG = 0xfa / 255.0f;
+inline constexpr float kTextColorB = 0xfb / 255.0f;
+
+// ★ 状态主色：原来那支蓝 #6C89F6。**保留**，后面演示各种状态时用；
+//   面板与文字已改成上面的中性色，所以它现在不参与面板底色。
+inline constexpr float kStatePrimaryR = 108.0f / 255.0f;
+inline constexpr float kStatePrimaryG = 137.0f / 255.0f;
+inline constexpr float kStatePrimaryB = 246.0f / 255.0f;
 
 // 面板整体不透明度（0 = 全透明，1 = 不透明）。
 inline constexpr float kPanelOpacity = 0.95f;

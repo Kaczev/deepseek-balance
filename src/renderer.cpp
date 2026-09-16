@@ -383,7 +383,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
     // 鏍囬鍏肩姸鎬佽锛氬乏涓婅銆傜姸鎬佸彉浜嗘枃瀛楀氨鎹紝涓嶅彧闈犻鑹茬紪鐮併€?
     if (f.statusText && titleFmt) {
         ID2D1SolidColorBrush* b = nullptr;
-        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, kTitleAlpha), &b)) && b) {
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kTextColorR, kTextColorG, kTextColorB, kTitleAlpha), &b)) && b) {
             IDWriteTextLayout* layout = nullptr;
             if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
                     f.statusText, static_cast<UINT32>(wcslen(f.statusText)), titleFmt,
@@ -403,7 +403,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
         const float cx2 = (kMarginDip + kEntityWidthDip - kTitleInsetXDip) * s - cw;
         const float cy2 = (kMarginDip + kTitleInsetYDip) * s;
         ID2D1SolidColorBrush* cb = nullptr;
-        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, kTitleAlpha), &cb)) && cb) {
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kTextColorR, kTextColorG, kTextColorB, kTitleAlpha), &cb)) && cb) {
             IDWriteTextLayout* cl = nullptr;
             if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
                     f.countdownText, static_cast<UINT32>(wcslen(f.countdownText)), titleFmt,
@@ -450,7 +450,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                     numberTop, (kMarginDip + kEntityWidthDip) * s);
 
         ID2D1SolidColorBrush* b = nullptr;
-        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, kAmountAlpha), &b)) && b) {
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kTextColorR, kTextColorG, kTextColorB, kAmountAlpha), &b)) && b) {
             // Draw one character at a time, at the origin the string layout reports for
             // it, and centre the block on the measured ink rather than on the layout width.
             // WHY per character: a layout's width includes side bearings, so centring on it
@@ -633,7 +633,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
         // 绗﹀彿鍦ㄥ悗锛堟墍鏈夎€呮寚瀹氾級銆傜鍙峰瓧鍙峰皬锛屽線涓嬪帇涓€鐐硅鍩虹嚎澶ц嚧瀵归綈銆?
         if (!symbol.empty()) {
             ID2D1SolidColorBrush* sb = nullptr;
-            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, kCurrencyAlpha), &sb)) && sb) {
+            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kTextColorR, kTextColorG, kTextColorB, kCurrencyAlpha), &sb)) && sb) {
                 IDWriteTextLayout* layout = nullptr;
                 if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
                         symbol.c_str(), static_cast<UINT32>(symbol.size()), unitFmt, 256.0f, 64.0f,
@@ -659,7 +659,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
     if (!f.zeroTimeText.empty() && estFmt) {
         const std::wstring t = Widen(f.zeroTimeText);
         ID2D1SolidColorBrush* b = nullptr;
-        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(1, 1, 1, kEstimateAlpha), &b)) && b) {
+        if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kTextColorR, kTextColorG, kTextColorB, kEstimateAlpha), &b)) && b) {
             IDWriteTextLayout* layout = nullptr;
             if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
                     t.c_str(), static_cast<UINT32>(t.size()), estFmt, kEntityWidthDip * s, 64.0f,
