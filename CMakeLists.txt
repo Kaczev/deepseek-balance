@@ -65,3 +65,11 @@ target_link_libraries(apiprobe PRIVATE winhttp)
 add_executable(storeprobe tools/storeprobe.cpp src/curve_store.cpp src/amount.cpp src/json_min.cpp)
 target_compile_definitions(storeprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(storeprobe PRIVATE src)
+
+# rate probe: the consumption-rate estimator and the "time to zero" wording
+# (src/rate_estimator.h/.cpp). Offline, pure: the estimator takes no clock and no file,
+# so this target needs only the estimator and the tuning table -- no store, no network,
+# no widget, and its own main() so the widget's argument parsing stays untouched.
+add_executable(rateprobe tools/rateprobe.cpp src/rate_estimator.cpp src/amount.cpp)
+target_compile_definitions(rateprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_include_directories(rateprobe PRIVATE src)

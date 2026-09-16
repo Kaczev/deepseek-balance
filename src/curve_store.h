@@ -55,11 +55,39 @@
 //   "improve" it.
 //
 // ---------------------------------------------------------------------------
+// §2.3b ★ Each point carries its OWN timestamp ("at", epoch SECONDS)
+// ---------------------------------------------------------------------------
+//   `update_at` alone cannot time a point: these points are CHANGES, so two
+//   consecutive ones can be 10 seconds apart or three hours apart -- when the
+//   balance did not move, nothing was appended and only update_at crept forward.
+//   Every calculation that divides an amount by a time (the consumption rate,
+//   §7.2/§7.3 of the design) is a lie without the per-point time, so each point
+//   stores the moment of ITS OWN append:
+//     { "CNY": "15.43", "at": 1789561662 }
+//
+//   ★ NEVER assume the sampling interval. 10 s is the *poll* interval (§4.1),
+//     not the point spacing: a point exists only where a change was seen.
+//
+//   ★ UNDATED POINTS ARE A REAL STATE, AND THEY STAY UNDATED. A `curve.json`
+//     written before this field existed has no "at" on any point. Those points
+//     must not silently inherit the file's global `update_at`: that would claim
+//     every one of them was measured at the same instant, which is exactly the
+//     fabrication this field removes -- and it would make a rate estimate out of
+//     times nobody ever measured. They load as `atValid == false` ("undated"),
+//     they are written back as `"at": null`, and the estimator refuses to fit
+//     them (rate_estimator.cpp). The global `update_at` keeps its own job
+//     (§2.3, fresh-or-stale) and is not a per-point time.
+//   A point appended now always carries a usable `at`, so an all-undated file
+//   heals itself as soon as the next change arrives (that point is dated; the
+//   older ones stay undated, which is the honest record of them).
+//
+// ---------------------------------------------------------------------------
 // §2.4 One file, not two
 // ---------------------------------------------------------------------------
 //   `curve.json` holds the last-update timestamp AND the points, so no state can
 //   be lost between two files:
-//     { "update_at": 1789537189, "points": [ {"CNY": "18.80", "USD": null}, ... ] }
+//     { "update_at": 1789537189,
+//       "points": [ {"CNY": "18.80", "USD": null, "at": 1789537189}, ... ] }
 //   Currencies are the API's own codes (CNY / USD). A currency the response did
 //   not carry is null. The newest point is the LAST element.
 //   【判读】the spec's example prints 18.80 as a bare JSON number; this store
@@ -110,6 +138,14 @@ struct CurveStorePoint {
     };
 
     std::vector<Entry> entries;
+
+    // ★ §2.3b: the moment THIS point was appended, in epoch seconds. `atValid ==
+    //   false` means "undated" -- a point read from a file written before the field
+    //   existed, or one whose "at" was null/unusable. `at` is 0 and meaningless then;
+    //   read it only when `atValid` says it can be read. Nothing may substitute the
+    //   store's global update_at for a missing per-point time.
+    int64_t at = 0;
+    bool atValid = false;
 
     // nullptr when this point has no such currency.
     const Entry* Find(const std::string& currency) const;
@@ -196,6 +232,9 @@ public:
     //   v == l (primary text, compare-as-number)      -> no point, refresh time
     //   v != l and D >  86400                         -> stored data discarded
     //   v != l and D <= 86400                         -> point appended, time set
+    //
+    // An appended point records the same `nowSeconds` as its own `at` (§2.3b), which
+    // is why a point only ever has one time and the two can never disagree.
     bool Append(const CurveObservation& obs, int64_t nowSeconds);
 
     void Clear();

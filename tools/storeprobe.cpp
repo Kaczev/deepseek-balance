@@ -839,6 +839,129 @@ void RunChecks(Harness* h, const ProbeDir& probe, bool verbose) {
                ok);
         RemoveFile(file);
     }
+
+    // -----------------------------------------------------------------------
+    // (7) ★ per-point timestamps (curve_store §2.3b): a point appended now carries its
+    //     OWN `at`, an OLD file with no `at` loads as UNDATED (**it must not inherit the
+    //     file's global update_at**), and an undated point survives a round trip as
+    //     undated. The estimator refuses undated points, so this is the half of that
+    //     guarantee that lives in the store.
+    // -----------------------------------------------------------------------
+    {
+        // Counts occurrences of `"at": <digits>` (a real per-point time).
+        const auto countDatedAt = [](const std::string& text) {
+            int found = 0;
+            const std::string needle = "\"at\": ";
+            std::size_t at = 0;
+            while ((at = text.find(needle, at)) != std::string::npos) {
+                const std::size_t digit = at + needle.size();
+                if (digit < text.size() && text[digit] >= '0' && text[digit] <= '9') ++found;
+                at = digit;
+            }
+            return found;
+        };
+        const auto countWhere = [](const std::string& text, const std::string& needle) {
+            int found = 0;
+            std::size_t at = 0;
+            while ((at = text.find(needle, at)) != std::string::npos) {
+                ++found;
+                at += needle.size();
+            }
+            return found;
+        };
+
+        // (a) An OLD file: `update_at` present, not a single `at` on any point. Both
+        //     points must load UNDATED -- stamping them with update_at would claim both
+        //     were measured at the same instant, which is the fabrication `at` exists to
+        //     remove, and it would feed a rate estimate times nobody ever measured.
+        const std::string atFile = PathOf(probe, "at.json");
+        const int64_t fileStamp = static_cast<int64_t>(::time(nullptr)) - 30;
+        WriteBytes(atFile, "{\"update_at\": " + Num(fileStamp) +
+                               ", \"points\": [{\"CNY\": \"18.80\"}, {\"CNY\": \"18.60\"}]}");
+
+        CurveStore oldFile;
+        const CurveLoadResult oldResult = oldFile.Load(atFile);
+        const std::vector<CurveStorePoint> oldPoints = oldFile.Points();
+        const bool oldLoaded = oldResult.status == CurveLoadResult::Status::Loaded &&
+                               oldResult.pointsLoaded == 2 && oldPoints.size() == 2;
+        const bool oldBothUndated = oldLoaded && !oldPoints[0].atValid && !oldPoints[1].atValid &&
+                                    oldPoints[0].at == 0 && oldPoints[1].at == 0;
+        // ...and the global timestamp keeps its own job: the store is still FRESH.
+        const bool globalStampKept = oldFile.lastUpdate() == fileStamp;
+
+        // (b) Round trip: those undated points must come back undated, without any help
+        //     from the global timestamp.
+        const bool resaved = oldFile.Save(atFile);
+        bool readOk = false;
+        const std::string raw = ReadBytes(atFile, &readOk);
+        CurveStore roundTrip;
+        const CurveLoadResult roundResult = roundTrip.Load(atFile);
+        const std::vector<CurveStorePoint> roundPoints = roundTrip.Points();
+        const bool survived = roundResult.status == CurveLoadResult::Status::Loaded &&
+                              roundPoints.size() == 2 && !roundPoints[0].atValid &&
+                              !roundPoints[1].atValid &&
+                              AllTexts(roundPoints, "CNY") == AllTexts(oldPoints, "CNY");
+        // The file says so explicitly: one `"at": null` per point, and no dated `at`.
+        const bool fileSaysUndated = readOk && countWhere(raw, "\"at\": null") == 2 &&
+                                     countDatedAt(raw) == 0;
+
+        // (c) A point appended right now is DATED with the clock it was given, and that
+        //     time survives both reloads. (The append happens on the round-tripped store,
+        //     so this also proves an undated file heals from the next point on.)
+        const int64_t appendAt = fileStamp + 20;
+        const bool appended = roundTrip.Append(Cny("18.55"), appendAt);
+        const std::vector<CurveStorePoint> afterAppend = roundTrip.Points();
+        const bool newPointDated = appended && afterAppend.size() == 3 &&
+                                   afterAppend.back().atValid && afterAppend.back().at == appendAt &&
+                                   !afterAppend[0].atValid && !afterAppend[1].atValid;
+        const bool savedAgain = roundTrip.Save(atFile);
+        CurveStore finalStore;
+        const CurveLoadResult finalResult = finalStore.Load(atFile);
+        const std::vector<CurveStorePoint> finalPoints = finalStore.Points();
+        const bool finalOk = savedAgain && finalResult.status == CurveLoadResult::Status::Loaded &&
+                             finalPoints.size() == 3 && !finalPoints[0].atValid &&
+                             !finalPoints[1].atValid && finalPoints[2].atValid &&
+                             finalPoints[2].at == appendAt &&
+                             AllTexts(finalPoints, "CNY") == "[18.80,18.60,18.55]";
+
+        // (d) A point whose "at" is present but is not whole seconds: refuse to guess a
+        //     time (undated), rather than invent one from the digits.
+        const std::string oddFile = PathOf(probe, "odd-at.json");
+        WriteBytes(oddFile, "{\"update_at\": " + Num(fileStamp) +
+                                ", \"points\": [{\"CNY\": \"5.00\", \"at\": 1.5},"
+                                " {\"CNY\": \"4.00\", \"at\": \"x\"}]}");
+        CurveStore oddStore;
+        const CurveLoadResult oddResult = oddStore.Load(oddFile);
+        const std::vector<CurveStorePoint> oddPoints = oddStore.Points();
+        const bool oddUndated = oddResult.status == CurveLoadResult::Status::Loaded &&
+                                oddPoints.size() == 2 && !oddPoints[0].atValid && !oddPoints[1].atValid;
+        RemoveFile(oddFile);
+
+        const bool ok = oldBothUndated && globalStampKept && resaved && fileSaysUndated &&
+                        survived && newPointDated && finalOk && oddUndated;
+        h->Req("case7", "per-point \"at\": an old file loads undated and stays undated",
+               "old file (update_at only): loaded=" + std::string(oldLoaded ? "yes" : "NO") +
+                   ", both points undated=" + std::string(oldBothUndated ? "yes" : "NO") +
+                   ", global update_at kept=" + std::string(globalStampKept ? "yes" : "NO") +
+                   " (" + Num(oldFile.lastUpdate()) + " == " + Num(fileStamp) + ")" +
+                   ", round trip kept them undated=" + std::string(survived ? "yes" : "NO") +
+                   ", file has \"at\": null x" + Num(countWhere(raw, "\"at\": null")) +
+                   " and dated \"at\" x" + Num(countDatedAt(raw)) +
+                   ", appended now -> at=" +
+                   (afterAppend.empty() || !afterAppend.back().atValid
+                        ? std::string("UNDATED(bug)")
+                        : Num(static_cast<long long>(afterAppend.back().at))) +
+                   " (== " + Num(appendAt) + ")=" + std::string(newPointDated ? "yes" : "NO") +
+                   ", after save+load: " + AllTexts(finalPoints, "CNY") + " with dated flags " +
+                   [&finalPoints] {
+                       std::string flags;
+                       for (const CurveStorePoint& point : finalPoints) flags += point.atValid ? "D" : "u";
+                       return flags.empty() ? std::string("(none)") : flags;
+                   }() +
+                   ", odd \"at\" (1.5 and \"x\") -> undated=" + std::string(oddUndated ? "yes" : "NO"),
+               ok);
+        RemoveFile(atFile);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -170,7 +170,25 @@ std::string Serialize(int64_t updateAt, bool updateAtValid, const std::vector<Cu
                 AppendJsonString(out, entry.text);
             }
         }
-        out += points[i].entries.empty() ? "}" : " }";
+        // ★ §2.3b: the point's OWN time, in epoch seconds. An UNDATED point is written
+        //   as an explicit null rather than being stamped with the global update_at:
+        //   the round trip has to remember "nobody measured when this happened", and
+        //   a bare omission could not be told apart from a point whose sole currency
+        //   failed to parse. Null is also what makes an all-undated file reload as
+        //   undated instead of as a set of points that all share one instant.
+        // The separator before the timestamp member is unconditional: an object always
+        // carries "at", so the member before it is never the last one.
+        out += ", ";
+        if (points[i].atValid) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(points[i].at));
+            out += "\"at\": ";
+            out += buf;
+        } else {
+            out += "\"at\": null";
+        }
+        if (!points[i].entries.empty()) out += " ";
+        out += "}";
     }
     out += points.empty() ? "]\n}\n" : "\n  ]\n}\n";
     return out;
@@ -278,6 +296,24 @@ CurveLoadResult CurveStore::Load(const std::string& path) {
                 }
                 CurveStorePoint point;
                 for (const auto& member : element.members) {
+                    // ★ §2.3b: "at" is the point's OWN time, not a currency. It is read
+                    //   before the currency loop's checks can misread it as one.
+                    if (member.first == "at") {
+                        if (member.second.IsNumber() && ParseWholeSeconds(member.second.text, &point.at)) {
+                            // A usable instant is a POSITIVE epoch second. 0 / negative is
+                            // not a time anyone measured at, and treating it as a real one
+                            // would put 1970 into a rate calculation.
+                            point.atValid = point.at > 0;
+                        } else if (member.second.IsNull()) {
+                            point.atValid = false;   // explicitly undated -- stays undated
+                        } else {
+                            // "at" present but not whole seconds: never guess a time for a
+                            // point. It loads as UNDATED, which the estimator already
+                            // refuses to use, rather than as a fabricated timestamp.
+                            point.atValid = false;
+                        }
+                        continue;
+                    }
                     if (member.first.empty()) {
                         ok = false;
                         problem = "a point has an empty currency name";
@@ -522,6 +558,10 @@ bool CurveStore::Append(const CurveObservation& obs, int64_t nowSeconds) {
     }
 
     CurveStorePoint point;
+    // §2.3b: the point's own time. `nowSeconds` is trustworthy here -- the guard at the
+    // top of this function returns before reaching this line when it is not.
+    point.at = nowSeconds;
+    point.atValid = true;
     for (const CurveObservation::Item& item : obs.observations) {
         if (item.currency.empty()) continue;   // a nameless entry cannot be written down
         point.entries.push_back(CurveStorePoint::Entry{
