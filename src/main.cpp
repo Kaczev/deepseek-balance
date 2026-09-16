@@ -95,6 +95,8 @@ int g_countdownSeconds = 0;
 std::string g_apiKey;           // 只在内存里，绝不写日志
 bool g_clickTest = false;         // --click-test：注入三次手势
 int64_t g_lastSymClickMs = 0;      // 上次点击符号的墙钟毫秒（双击判定用）
+bool g_symbolHoverOn = false;       // 当前鼠标是否悬停在符号上
+bool g_symbolHoverTest = false;     // --symbol-hover：强制悬停（导出对比用）
 bool g_pauseTest = false;
 bool g_noCurve = false;           // --no-curve：关掉氛围曲线（A/B 对比用）
 int  g_historyDemo = 0;           // --history-demo=N：合成 N 个曲线点（导帧验证用）
@@ -270,6 +272,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_apiSource.started()) g_apiSource.ResumeNow();
             SelfTestLog(L"[pause] 解锁：立刻补一次取样");
         }
+        return 0;
+    // 悬停高亮：光标进到币种符号的范围（含 6px 余量）就让符号变暗一档，离开复位。
+    // 用 TrackMouseEvent 申请 WM_MOUSELEAVE——不申请的话窗口收不到"离开"消息，
+    // 高亮会一直亮着（这类"少了配对消息"的坑很难看出来）。
+    case WM_MOUSEMOVE: {
+        const int mx = static_cast<int>(static_cast<short>(LOWORD(lp)));
+        const int my = static_cast<int>(static_cast<short>(HIWORD(lp)));
+        const dshb::SymbolRect sr = dshb::CurrencySymbolRect();
+        const bool hit = sr.valid && mx >= sr.l - 6.0f && mx <= sr.r + 6.0f &&
+                         my >= sr.t - 6.0f && my <= sr.b + 6.0f;
+        if (hit != g_symbolHoverOn) {
+            g_symbolHoverOn = hit;
+            dshb::SetSymbolHover(hit);
+        }
+        TRACKMOUSEEVENT tme{};
+        tme.cbSize = sizeof(tme);
+        tme.dwFlags = TME_LEAVE;
+        tme.hwndTrack = g_hwnd;
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_symbolHoverOn = false;
+        dshb::SetSymbolHover(false);
         return 0;
     case WM_LBUTTONDOWN:
         g_pressX = static_cast<int>(static_cast<short>(LOWORD(lp)));
@@ -498,6 +524,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             }
             SelfTestLog(ok ? L"[curve] RESULT: all properties hold" : L"[curve] RESULT: FAILED");
             g_runSeconds = 0.2;   // 跑完就退
+        } else if (wcscmp(argv[i], L"--symbol-hover") == 0) {
+            g_symbolHoverTest = true;
         } else if (wcscmp(argv[i], L"--no-curve") == 0) {
             g_noCurve = true;
         } else if (wcscmp(argv[i], L"--pause-test") == 0) {
@@ -911,6 +939,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         if (g_layoutProbe) dshb::SetLayoutProbe(true);
         // 氛围曲线默认开；--no-curve 关掉它，用于确认"关掉后文字位置逐像素不变"
         dshb::SetCurveEnabled(!g_noCurve);
+        if (g_symbolHoverTest) dshb::SetSymbolHover(true);   // --symbol-hover：导出对比用
         if (g_historyDemo > 0) dshb::PrimeHistoryForDemo(g_historyDemo);
 
         // 让模拟数据源在"虚拟时间"里跑起来：否则导出的图没有数据，浮层也是空的。

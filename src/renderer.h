@@ -116,6 +116,9 @@ void SetLayoutProbe(bool on);
 
     // 氛围曲线开关（--no-curve：关掉后文字位置必须逐像素不变，用于 A/B 对比）
     void SetCurveEnabled(bool on);
+
+    // 鼠标是否悬停在币种符号上（悬停时符号变暗一档，提示可点击）
+    void SetSymbolHover(bool on);
 void DumpLayoutProbe();
 
 }  // namespace dshb

@@ -68,6 +68,8 @@ int g_digitDrawMode = 0;
 
 // 氛围曲线开关：--no-curve 关掉它，用于 A/B 对比（关掉后文字位置必须逐像素不变）
 bool g_curveEnabled = true;
+bool g_symbolHover = false;   // 鼠标悬停在币种符号上
+void SetSymbolHover(bool on) { g_symbolHover = on; }
 
 // 氛围曲线：点由显示层算好（规格 §3），渲染层只连线——
 // 采样密度 1 像素一个点，所以肉眼看到的是连续曲线，不会出现折角。
@@ -730,7 +732,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
         // 绗﹀彿鍦ㄥ悗锛堟墍鏈夎€呮寚瀹氾級銆傜鍙峰瓧鍙峰皬锛屽線涓嬪帇涓€鐐硅鍩虹嚎澶ц嚧瀵归綈銆?
         if (!symbol.empty()) {
             ID2D1SolidColorBrush* sb = nullptr;
-            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kTextColorR, kTextColorG, kTextColorB, kCurrencyAlpha), &sb)) && sb) {
+            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kTextColorR, kTextColorG, kTextColorB, (g_symbolHover ? kCurrencyHoverAlpha : kCurrencyAlpha)), &sb)) && sb) {
                 IDWriteTextLayout* layout = nullptr;
                 if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
                         symbol.c_str(), static_cast<UINT32>(symbol.size()), unitFmt, 256.0f, 64.0f,
