@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "heartbeat.h"        // 心跳位移（E 段）：纯函数，状态由本层保管
 #include "rate_estimator.h"
 #include "roll_axis.h"
 #include "state_machine.h"
@@ -22,6 +23,69 @@
 #include <vector>
 
 namespace dshb {
+
+// ===========================================================================
+// 氛围：剧烈程度 R、死态程度 D、颜色管线（"E 重新设计.md"、"E 蒙光.md" §3）
+// ===========================================================================
+//  这一节全是**纯函数**：没有时钟、没有全局状态、没有文件。于是它们既能被
+//  渲染层每帧调用，也能被探针离线逐值核对（这是本项目唯一的验证方式）。
+
+// 一个 0..1 的 RGB 三元组（**直通**分量，不是预乘）。
+struct AmbienceColor {
+    float r = 0.0f;
+    float g = 0.0f;
+    float b = 0.0f;
+};
+
+// ---- 剧烈程度 R ----
+//   R = min{ max(每分钟步长, B*2), 0 } / (B*2)      B = kAmbienceBaselineYuanPerMinute
+//  "每分钟步长"是**最近一步**的余额差 ÷ 该步自己的间隔秒数 × 60。
+//  ★ 为什么是"最近一步"而不是那条平滑过的速率（§7.3 的 rate_display）：
+//    R 要回答的是"刚刚有多陡"。弹簧平滑正是为了把单步噪声抹平，用它算 R
+//    会把"刚刚发生的一次陡降"平均掉——而那恰恰是 R 唯一想表达的东西。
+//  ★ 为什么分母是 B*2（施工单的修正一）：除以 B 时 R 能到 2，
+//    会把心跳频率推过 F_max 上限。
+//  结果夹在 [0,1]：余额回升（正步长）时 R = 0（回升不是"剧烈消耗"）。
+//  stepPerMinute >= 0 或 B >= 0（基线不可信）时返回 0。
+double SeverityRatio(double stepPerMinute);
+
+// 把"两个相邻点的余额差 + 它们的间隔"折成每分钟步长（= R 的输入）。
+// dtSeconds <= 0 或任一点不可用 -> 返回 0（"算不出来"，不是"没在消耗"）。
+// ★ 只有**下降**才是消耗：回升（正差）原样返回正数，由 SeverityRatio 夹成 0 ——
+//   这一层不做判断，免得两个地方各判一次、口径不一致。
+double StepPerMinute(double previousYuan, double currentYuan, double dtSeconds);
+
+// ---- 死态程度 D ----
+//   D = min{ max(G - 余额, 0) / G , 1 }
+//  ★ 修正（施工单的修正二）：他原来把**分子**夹成 1 元，于是 D 最大只有 0.1。
+//    夹的应该是**结果**，不是分子。
+//  G <= 0 -> 返回 0（不做除法，"E 蒙光.md" §3.3）。
+//  余额为 0 或负 -> 饱和到 1。
+double BalanceDepth(double balanceYuan);
+
+// ---- 颜色管线 ----
+// 第一步：氛围初色 C_0 —— 两段 RGB 线性插值（不动饱和度）。
+//   R <= 0.5: lerp(#6c89f6, #f6aa6c, R/0.5)
+//   R >  0.5: lerp(#f6aa6c, #f66c6c, (R-0.5)/0.5)
+// 这是"未降饱和"的那个颜色。**任何一帧的最终颜色都必须从它算起。**
+AmbienceColor AmbienceBase(double ratio);
+
+// 第二步 + 第三步：把 C_0 的**饱和度**乘 (1 - depth)，R=G=B 不变（色相与明度不动）。
+// ★★ 这是本模块最容易做错的一处：饱和度必须**永远从本帧未降饱和的 C_0** 算。
+//     若从上一帧已经降过饱和的颜色再降一次，D 会在每帧自我累积，
+//     几秒内整条曲线褪成灰色（施工单特别点名）。
+//  depth >= 1 时得到的是 (v,v,v)，v = C_0 的明度；此时按 kGlowInD1Warm
+//  朝基准蓝混一点点，免得纯中性灰在近黑底上读成"玻璃上的灰"（"E 蒙光.md" §5）。
+AmbienceColor DesaturateTowards(const AmbienceColor& base, double depth);
+
+// 两步合起来：目标颜色 = DesaturateTowards(AmbienceBase(ratio), depth)。
+AmbienceColor AmbienceTargetColor(double ratio, double depth);
+
+// 颜色管线的一句自检（不需要窗口、不需要渲染）：把 (ratio, depth) 算成颜色，
+// 并断言两条不变式 —— (a) depth=0 时结果**恰好**等于 AmbienceBase(ratio)；
+// (b) 反复调用同一个 (ratio, depth) 结果恒定（没有"自我累积"的可能）。
+// 返回 true = 全部成立。细节写进 report（UTF-8，一行一条）。
+bool AmbienceSelfTest(std::string* report);
 
 // 余额数字的显示状态
 //
@@ -101,6 +165,43 @@ public:
     //   dt 把它平滑成 rateDisplay，两者都留在成员里，BuildWidgetFrame 拿来算底部那行字。
     const RateEstimate& rateEstimate() const { return rateEstimate_; }
     double rateDisplay() const { return rateDisplay_; }
+
+    // ---- 氛围（"E 蒙光.md" §3）：R / D / 最终颜色 ----
+    // ★ R 与 D 是**纯函数**（SeverityRatio / BalanceDepth）的逐帧求值结果：
+    //   输入是曲线存储里"当前显示币种"的最近两个点、以及当前显示的余额。
+    //   它们每帧重算，不缓存、不递推 —— 于是不存在"脏了忘了刷"的状态。
+    double ambienceRatio() const { return ambienceRatio_; }
+    double ambienceDepth() const { return ambienceDepth_; }
+    // 本帧**应当显示**的低余额程度（含"读不到余额按 D=1"这条状态规则）。
+    double ambienceDepthShown() const { return depthShown_; }
+    // 本帧**应当显示**的 R（读不到余额时为 0，"E 蒙光.md" §3.3）。
+    double ambienceRatioShown() const { return ratioShown_; }
+    // 逐通道缓动之后、真正画上去的颜色（0..1 直通分量）。
+    const AmbienceColor& ambienceColor() const { return ambienceColor_; }
+    // 本帧的颜色目标（未缓动）。导出/探针要对账时用它。
+    const AmbienceColor& ambienceTargetColor() const { return ambienceTarget_; }
+    // 蒙光强度倍率 k(R,D)，范围 (0, 1.0]。
+    float ambienceIntensity() const { return glowIntensity_; }
+    // 本帧心跳位移（DIP，> 0 = 往下）。纯函数 BeatOffsetPx 的输出，本层不做任何平滑。
+    double beatOffsetDip() const { return beatOffsetDip_; }
+    // 心跳的仿真时刻（秒）。暂停冻结时**不推进**，于是位移自然停住。
+    double beatSimSeconds() const { return beatSimSeconds_; }
+    // 已经记下几次"余额变化"（诊断用：正常只会用到最后一条）。
+    std::size_t beatChangeCount() const { return beatHistory_.size(); }
+    // 导出夹具：把心跳的仿真时刻直接放到 k/60 秒，于是"第 k 帧的位移"可单独导出。
+    //  与 SetCurveScrollFrame 同一套惯例（帧状态是 k 的纯函数，不必连跑 k 帧）。
+    void SetBeatSimFrame(int frame);
+    // 余额读不到（= 按 D=1 且取"甲"）—— 供诊断与验收断言用。
+    bool ambienceUnreadable() const { return ambientUnreadable_; }
+
+    // ★ 测试口子（导帧夹具）：**这一帧**用给定的 (R, D) 画，并跳过缓动与
+    //   "读不到 -> D=1"那条状态规则。存在的理由只有一个：验收要求从真机导出
+    //   (R,D) = (0,0)、(0.5,0)、(1,0)、(0,1) 四帧并量像素。R 由"最近一步 ÷ 基线"
+    //   天然决定，靠夹具数据凑不出任意值；没有这个口子，"R=0.5 那一帧"就只能靠
+    //   仿真数据碰巧落在 0.5，那是不可复现的证据。
+    //   默认（没调用过）完全不生效。命令行接线见 widget_display.h 末尾的
+    //   dshb::SetAmbienceGiven。
+    void SetAmbienceGiven(double ratio, double depth);
 
     bool hasValue() const { return hasValue_; }
     // 连续失败到达阈值后调用：显示回到"没有值"（即 --.--）。
@@ -197,6 +298,48 @@ private:
     // 速率：每帧从曲线存储重算一次，再按帧的 dt 走一步弹簧（见头文件上面那一段）。
     void AdvanceRate(double dtSeconds);
 
+    // 氛围：每帧重算 (R, D) 与目标颜色，再逐通道缓动一步（见下面的 ★ 段）。
+    void AdvanceAmbience(double dtSeconds);
+
+    // 曲线存储里"当前显示币种"的最近一步（元/分钟）。没有可用的两步时返回 0。
+    double LastStepPerMinute() const;
+
+    // 测试口子（SetAmbienceGiven 的实现体）：given_ 为真时 (R,D) 直接用给定值。
+    bool ambienceGiven_ = false;
+    double ambienceGivenRatio_ = 0.0;
+    double ambienceGivenDepth_ = 0.0;
+
+    // --- 氛围的逐帧状态 ---
+    // ambienceRatio_ / ambienceDepth_ 是"从数据算出来的"（纯函数输出，只读）；
+    // ratioShown_ / depthShown_ 是"按状态规则该显示的"（读不到 -> R=0, D=1）。
+    double ambienceRatio_ = 0.0;
+    double ambienceDepth_ = 0.0;
+    double ratioShown_ = 0.0;
+    double depthShown_ = 0.0;
+    bool ambientUnreadable_ = false;
+    AmbienceColor ambienceTarget_{};    // 本帧目标（未缓动）
+    AmbienceColor ambienceColor_{};     // 本帧实际画上去的
+    bool ambienceSeeded_ = false;       // 有没有起点（没有时第一次直接落位到目标）
+    float glowIntensity_ = kGlowInK0;   // k(R,D)
+    bool glowSeeded_ = false;           // 强度有没有起点（同上）
+    // 每个通道一条"每帧自乘的残差"：与自己上一帧的值相乘 = rate^k。
+    // ★ 与数字滚动同一套手感（kRollRate / kRollCurveC），但它只属于颜色。
+    float ambDcR_ = 0.0f;               // 逐通道颜色残差（**故意不叫 D**：
+    float ambDcG_ = 0.0f;               // 全局的 D 是死态程度，两者绝不能混）
+    float ambDcB_ = 0.0f;
+    int ambienceFrames_ = 0;            // k：颜色缓动的帧号（幂的指数）
+
+    // --- 心跳的逐帧状态（模块本身无状态，状态全在这里）---
+    //  simSeconds：单调仿真时间（暂停时不推进）；history：每次余额变化追加一条。
+    std::vector<BeatChange> beatHistory_;
+    double beatSimSeconds_ = 0.0;
+    double beatOffsetDip_ = 0.0;
+    bool beatSeeded_ = false;
+    double beatLastRatio_ = 0.0;    // 上次追加时的 R/D，用来判断"又变化了一次"
+    double beatLastDepth_ = 0.0;
+    // 每帧推进心跳：推进仿真时间（冻结时不动）、必要时追加一条变化、再求位移。
+    void AdvanceBeat(double dtSeconds);
+
     RateEstimate rateEstimate_;   // 最近一次 EstimateRate 的结果（纯函数输出）
     double rateDisplay_ = 0.0;    // rate_display：被弹簧平滑过的速率，元/分钟
     bool rateSeeded_ = false;     // 弹簧有没有一个起点（没有时第一次直接落位）
@@ -210,6 +353,18 @@ private:
 struct CurvePoint {
     float x = 0.0f;
     float y = 0.0f;   // 0 = 带子顶部，1 = 底部
+
+    // ★ 这个点**自己那一刻**的氛围颜色（"E 蒙光.md" §3.1 末句：节点恰好就是那个
+    //   时刻的氛围颜色，节点之间渐变过去）。由显示层从存储点里的颜色字段算出来，
+    //   渲染层只负责在相邻两点之间插值。
+    // ★ hasColor == false 表示"这个点没有颜色"——来源有两种，两种都不许编造：
+    //     1) 老文件里的点（写颜色字段之前存的）：没有就是没有；
+    //     2) 老点的**补位点**（把最左那段拉平的那个），它不对应任何存储点。
+    //   渲染层见到 false 时用**当前 C** 画那一段（见 renderer.cpp 的注释）。
+    float cr = 0.0f;
+    float cg = 0.0f;
+    float cb = 0.0f;
+    bool hasColor = false;
 };
 
 struct WidgetFrame {
@@ -227,6 +382,20 @@ struct WidgetFrame {
     std::string zeroTimeText;       // 清零预估（C9）：由估算速率与当前余额算出的那行字（UTF-8）
     // 每一位当前的纵坐标（渲染层按它画数字）。空 = 渲染层退回整串绘制。
     std::vector<axis::PlaceCoord> places;
+
+    // ---- 氛围蒙光（"E 蒙光.md" §3、§6）----
+    // 渲染层只认这两个数：颜色（已逐通道缓动）与强度倍率 k。它不知道 R、D、
+    // 余额、基线、阈值 —— 那些是显示层的事（和"余额为 0 与查不到有什么区别"
+    // 同一条分工）。剖面（内唇/底部/底噪的形状）属于渲染层，在 tuning.h 里。
+    AmbienceColor ambientColor{};      // 直通分量 0..1
+    float ambientIntensity = 0.0f;     // k(R,D)，0 = 不画蒙光
+
+    // ---- 心跳位移（"E 心跳波形.md"）----
+    //  ★ 这是"窗口真实位置"之外**唯一**会让画面动的东西：它只平移画布内部内容，
+    //    窗口自身位置一帧都不改 —— 所以"移动窗口触发系统贴边吸附"结构上不可能发生。
+    //  ★ 单位是 DIP；> 0 = 往下。渲染层乘上 scale 之后必须**同时**用在绘制变换与
+    //    命中矩形上，否则点击会差这么多像素。
+    float beatOffsetDip = 0.0f;
 };
 
 // 把状态 + 显示值组装成一帧。放在这里而不是渲染层，是为了让"显示什么"
@@ -262,5 +431,52 @@ void SetCurveScrollFrame(int frame);
 // 一行诊断：存储里有几个点、滚动计时器停在哪一帧、进度多少。
 // 这一层不写日志（约定：显示层只返回文本，写文件由 main 做），所以返回字符串给 main。
 std::string CurveStateLine();
+
+// ---- 命令行接线（--ambience=R,D / --no-text / --pause-ambience）----
+// ★ 为什么是这几个自由函数而不是环境变量（所有者 2026-09-17 的要求）：
+//   环境变量在日志里看不见，而本项目的全部验证都靠日志与导帧留痕。
+//   命令行参数会出现在 SelfTestLog 的 `[argv]` 与自检输出里，事后可复查。
+//
+// --ambience=R,D：把这一帧的氛围钉在给定的 (R, D) 上（测试专用）。
+//   R、D 都会被夹到 [0,1]。返回 false = 文本格式不对（main 应当记一条日志）。
+//   默认（没调用过）完全不生效，生产路径不受影响。
+bool SetAmbienceGiven(const char* text);
+
+// 夹具的存放处（定义在 widget_display.cpp 的匿名 namespace 里，通过函数取用）。
+// 放在头文件是为了让两个自由函数与 AdvanceAmbience 用同一份状态。
+struct AmbienceOverrideState {
+    bool given = false;
+    double ratio = 0.0;
+    double depth = 0.0;
+};
+
+// --no-text：正文（标题/数字/预估）一层都不画，其余（面板、边框、蒙光、曲线）照旧。
+//   存在的理由：要量"白字对它自己那层底色的对比度"，必须先知道底色是多少，
+//   而整帧里文字墨迹正好盖在要量的那些像素上（第一次量就量到了字形本身，
+//   得到 1.00:1 —— 那是"白字对白字"，不是对比度）。
+void SetTextEnabled(bool on);
+bool TextEnabled();
+
+// --pause-ambience：暂停期间氛围**冻结**（颜色与光强一步都不推进）。
+//   与显式传入的 --pause-ambience=0/1 配对，用来证明"暂停中连导两帧逐位相同、
+//   恢复后再导一帧不同"。
+void SetAmbienceFrozen(bool on);
+bool AmbienceFrozen();
+
+// --ambience-glide=N：跑 N 帧**真实的**氛围推进（每帧 1/60 秒），其间 R 走一条
+//   真实会发生的轨迹：0 -> 1（余额突然掉一截，剧烈程度拉满）-> 再回落到 0。
+//   D 固定为 0。
+//  ★ 为什么需要它：光强是烘进彩色层的，所以 k 每跨过 1/255 就可能重烘一整张
+//    475x289 的位图。要量"一次颜色滑行到底重烘几次、最坏单帧多贵"，就必须真的把
+//    那一串帧跑出来 —— 单帧导出看不出这件事。
+//  ★ 它只喂氛围，不动余额：所以与 --fixed-amount 并存时也不会改变画面上的数字。
+//  ★ 需要先把 main 那个显示层实例挂进来（见下面的 g_ambienceGlideTarget）。
+void RunAmbienceGlide(int frames);
+
+// 滑行要推的那个显示层实例。main 在拿到自己的 g_display 之后立即赋值一次：
+//     dshb::g_ambienceGlideTarget = &g_display;
+// 为什么不是引用来引用去：显示层实例属于 main（它在那里是全局的），这一层不该
+// 反过来持有它；一个显式的测试用指针最省事，也最容易被看见和删掉。
+extern DisplayedAmount* g_ambienceGlideTarget;
 
 }  // namespace dshb

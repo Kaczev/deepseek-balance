@@ -13,7 +13,144 @@
 #include <vector>
 
 namespace dshb {
-namespace {
+
+// ===========================================================================
+// 氛围的纯函数层（"E 重新设计.md"、"E 蒙光.md" §3、"E 施工单.md" 甲.2/3）
+// ===========================================================================
+//  这一节没有全局状态、没有时钟、没有文件 —— 所以它既能在每帧被调用，也能被
+//  探针离线逐值核对。所有夹取（clamp）都写在这里，调用方一律不再夹一次。
+
+double StepPerMinute(double previousYuan, double currentYuan, double dtSeconds) {
+    if (!(dtSeconds > 0.0)) return 0.0;          // 没有间隔 = 算不出来（不是 0 消耗）
+    return (currentYuan - previousYuan) / dtSeconds * 60.0;
+}
+
+double SeverityRatio(double stepPerMinute) {
+    const double b = kAmbienceBaselineYuanPerMinute;
+    // ★ 基线必须为负才有意义（"基线是消耗速率"）。基线不合法时 R 恒为 0，
+    //   而不是产生一个随手的方向 —— 那会让心跳频率凭空跳起来。
+    if (!(b < 0.0)) return 0.0;
+    const double twice = b * 2.0;                // 施工单修正一：分母是 2*|基线|
+    // min{ max(步长, 2B), 0 } / (2B)：步长 >= 0（余额没降）-> 0；
+    // 步长 <= 2B（比两倍基线还陡）-> 1。
+    const double capped = (stepPerMinute < twice) ? twice : stepPerMinute;
+    const double limited = (capped > 0.0) ? 0.0 : capped;
+    const double r = limited / twice;
+    return (r < 0.0) ? 0.0 : ((r > 1.0) ? 1.0 : r);
+}
+
+double BalanceDepth(double balanceYuan) {
+    const double g = kLowBalanceThresholdYuan;
+    if (!(g > 0.0)) return 0.0;                  // G 未设 -> D = 0，不做除法
+    const double over = g - balanceYuan;         // 超出 G 多少
+    // ★ 施工单修正二：夹的是**结果**，不是分子。原来把分子夹成 1 元，
+    //   于是 D 最大只有 1/G = 0.1，整条"枯竭"曲线被压扁。
+    const double d = (over < 0.0) ? 0.0 : (over / g);
+    return (d > 1.0) ? 1.0 : d;                  // 余额为 0 或负 -> 饱和到 1
+}
+
+AmbienceColor AmbienceBase(double ratio) {
+    const double r = (ratio < 0.0) ? 0.0 : ((ratio > 1.0) ? 1.0 : ratio);
+    const double mid = kAmbienceMidRatio;
+    AmbienceColor out;
+    if (r <= mid) {
+        const double t = (mid > 0.0) ? (r / mid) : 0.0;
+        out.r = static_cast<float>(kAmbienceAnchor0R + (kAmbienceAnchor1R - kAmbienceAnchor0R) * t);
+        out.g = static_cast<float>(kAmbienceAnchor0G + (kAmbienceAnchor1G - kAmbienceAnchor0G) * t);
+        out.b = static_cast<float>(kAmbienceAnchor0B + (kAmbienceAnchor1B - kAmbienceAnchor0B) * t);
+    } else {
+        const double t = (mid < 1.0) ? ((r - mid) / (1.0 - mid)) : 1.0;
+        out.r = static_cast<float>(kAmbienceAnchor1R + (kAmbienceAnchor2R - kAmbienceAnchor1R) * t);
+        out.g = static_cast<float>(kAmbienceAnchor1G + (kAmbienceAnchor2G - kAmbienceAnchor1G) * t);
+        out.b = static_cast<float>(kAmbienceAnchor1B + (kAmbienceAnchor2B - kAmbienceAnchor1B) * t);
+    }
+    return out;
+}
+
+AmbienceColor DesaturateTowards(const AmbienceColor& base, double depth) {
+    const double d = (depth < 0.0) ? 0.0 : ((depth > 1.0) ? 1.0 : depth);
+    // 饱和度 x (1-D)：色相与明度（v = max 分量）不动，所以先把 v 记住。
+    const float v = (base.r > base.g) ? ((base.r > base.b) ? base.r : base.b)
+                                      : ((base.g > base.b) ? base.g : base.b);
+    const double s = 1.0 - d;
+    AmbienceColor out;
+    out.r = static_cast<float>(v + (base.r - v) * s);
+    out.g = static_cast<float>(v + (base.g - v) * s);
+    out.b = static_cast<float>(v + (base.b - v) * s);
+    if (d >= 1.0 && kGlowInD1Warm > 0.0f) {
+        // 完全退饱和 = 一根中性灰。近黑底上的中性浅灰容易读成"玻璃上的灰"，
+        // 所以朝基准蓝混一点点，让它读成"冷光"（"E 蒙光.md" §5）。
+        const float w = kGlowInD1Warm;
+        out.r += (kAmbienceAnchor0R - out.r) * w;
+        out.g += (kAmbienceAnchor0G - out.g) * w;
+        out.b += (kAmbienceAnchor0B - out.b) * w;
+    }
+    return out;
+}
+
+AmbienceColor AmbienceTargetColor(double ratio, double depth) {
+    return DesaturateTowards(AmbienceBase(ratio), depth);
+}
+
+bool AmbienceSelfTest(std::string* report) {
+    std::string text;
+    bool ok = true;
+    auto line = [&](const char* fmt, double a, double b) {
+        char buf[192];
+        std::snprintf(buf, sizeof(buf), fmt, a, b);
+        text += buf;
+        text += '\n';
+    };
+
+    // (a) depth = 0 时，结果必须**恰好**等于未降饱和的 C_0（不是"接近"）。
+    //     这一条正是"绝不从上一帧已降饱和的颜色算"的可执行形式。
+    const double ratios[] = {0.0, 0.25, 0.5, 0.75, 1.0};
+    for (const double r : ratios) {
+        const AmbienceColor base = AmbienceBase(r);
+        const AmbienceColor got = AmbienceTargetColor(r, 0.0);
+        const bool same = (got.r == base.r && got.g == base.g && got.b == base.b);
+        line("  [%s] depth=0 时 C == C_0 恰好相等 (R=%.2f)", same ? 1.0 : 0.0, r);
+        if (!same) ok = false;
+    }
+
+    // (b) 幂等：同一个 (R,D) 反复求值结果恒定 —— 于是"自我累积"在结构上不可能。
+    for (const double r : ratios) {
+        const AmbienceColor first = AmbienceTargetColor(r, 0.6);
+        bool stable = true;
+        for (int i = 0; i < 100; ++i) {
+            const AmbienceColor again = AmbienceTargetColor(r, 0.6);
+            if (again.r != first.r || again.g != first.g || again.b != first.b) stable = false;
+        }
+        line("  [%s] 同一 (R,D) 求值 101 次恒定 (R=%.2f)", stable ? 1.0 : 0.0, r);
+        if (!stable) ok = false;
+    }
+
+    // (c) 两条修正的边界值：分母是 2B（所以"恰好两倍基线"= R=1），
+    //     以及 D 能真的到 1（施工单修正二）。
+    const double rAtTwoB = SeverityRatio(kAmbienceBaselineYuanPerMinute * 2.0);
+    const double rAtB = SeverityRatio(kAmbienceBaselineYuanPerMinute);
+    const double rRise = SeverityRatio(0.5);
+    const double dZeroBal = BalanceDepth(0.0);
+    line("  [%s] R(2B)=%.4f 必须 = 1.0", (std::fabs(rAtTwoB - 1.0) < 1e-9) ? 1.0 : 0.0, rAtTwoB);
+    line("  [%s] R(B)=%.4f 必须 = 0.5（分母是 2B，不是 B）", (std::fabs(rAtB - 0.5) < 1e-9) ? 1.0 : 0.0, rAtB);
+    line("  [%s] R(回升 +0.5 元/分)=%.4f 必须 = 0", (rRise == 0.0) ? 1.0 : 0.0, rRise);
+    line("  [%s] D(余额 0)=%.4f 必须 = 1.0（分子不夹）", (std::fabs(dZeroBal - 1.0) < 1e-9) ? 1.0 : 0.0, dZeroBal);
+    if (std::fabs(rAtTwoB - 1.0) >= 1e-9 || std::fabs(rAtB - 0.5) >= 1e-9 || rRise != 0.0 ||
+        std::fabs(dZeroBal - 1.0) >= 1e-9) {
+        ok = false;
+    }
+
+    // (d) 一条**故意失败**的检查：确认这套自检真的会报错（探针纪律）。
+    {
+        const bool deliberatelyWrong = (std::fabs(SeverityRatio(0.0) - 1.0) < 1e-9);
+        line("  [%s] 故意失败的检查（R(0) 必须 != 1.0）—— 这一行应当是 0",
+             deliberatelyWrong ? 1.0 : 0.0, 0.0);
+        if (deliberatelyWrong) ok = false;
+    }
+
+    if (report) *report = text;
+    return ok;
+}
 
 // ===========================================================================
 // 氛围曲线的显示状态（规格 §3）
@@ -24,7 +161,57 @@ namespace {
 //
 // ★ 全部状态 = 存储内容 + 滚动计时器（"旧极值"本身也是存储内容的纯函数）。
 //   没有任何"每帧自乘的增量状态"，所以第 k 帧可以单独构造、单独导出、单独量。
+namespace {
+
 CurveStore g_curveStore;
+
+// ---------------------------------------------------------------------------
+// 余额 -> 氛围颜色（"E 蒙光.md" §3）：D 用**当时**的余额算
+// ---------------------------------------------------------------------------
+//  ★ 为什么"存点的颜色"在这里自己算一次、而不是直接读 ambienceColor_：
+//    接口**只有余额**，而 D 是余额的纯函数，所以"那一刻的颜色"可以精确复原 ——
+//    存点时把余额喂进来就得到那一刻的颜色，不依赖任何渲染状态。
+//    R 那一半是"当时刚刚有多陡"，它不在余额里，所以这里取 R = 0；
+//    也就是说存下来的颜色是"D 的精确值 + R 取常态"。这个取舍写进了报告。
+//  ★ 声明必须在使用它的 FeedCurve 之前（C++ 的名字要先声明后使用）。
+AmbienceColor BalanceColorAt(double balanceYuan) {
+    const double depth = BalanceDepth((balanceYuan < 0.0) ? 0.0 : balanceYuan);
+    return AmbienceTargetColor(0.0, depth);
+}
+
+std::string HexOf(const AmbienceColor& c) {
+    auto byte = [](float x) {
+        const float v = (x < 0.0f) ? 0.0f : ((x > 1.0f) ? 1.0f : x);
+        return static_cast<int>(v * 255.0f + 0.5f);
+    };
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "#%02x%02x%02x", byte(c.r), byte(c.g), byte(c.b));
+    return buf;
+}
+
+// 把一个存储点带的 "#rrggbb" 解析回分量。形状只有这一种（curve_store 的
+// IsHexColor 保证），这里仍然按"解析失败 = 没有颜色"处理，绝不猜。
+bool ParseHexColor(const std::string& hex, AmbienceColor* out) {
+    if (hex.size() != 7 || hex[0] != '#') return false;
+    int v[3] = {0, 0, 0};
+    for (int i = 0; i < 3; ++i) {
+        int byte = 0;
+        for (int k = 0; k < 2; ++k) {
+            const char c = hex[1 + i * 2 + k];
+            int digit = -1;
+            if (c >= '0' && c <= '9') digit = c - '0';
+            else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+            if (digit < 0) return false;
+            byte = byte * 16 + digit;
+        }
+        v[i] = byte;
+    }
+    out->r = static_cast<float>(v[0] / 255.0);
+    out->g = static_cast<float>(v[1] / 255.0);
+    out->b = static_cast<float>(v[2] / 255.0);
+    return true;
+}
 
 // 滚动计时器（秒）：追加一个点就归零，之后由每帧的 dt 推进（DisplayedAmount::Update）。
 double g_curveSeconds = 0.0;
@@ -120,6 +307,21 @@ double NormY(double v, const CurveSpan& span) {
 // 逐位相同的 float，否则"滚动终点帧 == 静止帧"的逐像素比较会败在最后一位的舍入上。
 float SlotX(double slot) { return static_cast<float>(slot * 0.1); }
 
+// 一个存储点的**第一个可用条目**（与 CurveValueOf 同一口径，但返回 Amount）。
+// 为什么与曲线取值用同一个口径：R 是"这条曲线刚刚有多陡"，
+// 曲线画的是哪条序列，R 就必须量哪条序列 —— 否则屏幕上那条线和那个颜色
+// 讲的是两件事。条目为 null / 解析失败时返回 false（不编造数值）。
+bool CurveValueOfEntry(const CurveStorePoint& point, Amount* out) {
+    for (const CurveStorePoint::Entry& entry : point.entries) {
+        if (entry.missing || entry.text.empty()) continue;
+        Amount amount;
+        if (!ParseAmount(entry.text, &amount)) continue;
+        *out = amount;
+        return true;
+    }
+    return false;
+}
+
 // 纵向缓动：P = L + (N − L) × (1 − rate^k)^c（规格 §3 第 6 条，k = 帧号）。
 // ★ 走到终点（第 600 帧，整 10 秒）时直接取 N：公式在 k=600 处还剩 0.975^600 ≈ 2.5e-7
 //   的残量（折算约 7e-5 像素），而"动画结束在数据自己给出的位置上"正是验收项 2 要逐
@@ -167,7 +369,10 @@ void FeedCurve(const Sample& s) {
             obs.primaryCurrency, s.total.ToString2(), true});
     }
     // 样本的**墙钟秒**就是数据层的时间戳（规格 §2.3）。
-    g_curveStore.Append(obs, s.wallMs / 1000);
+    // ★ 同时把这个点**自己那一刻**的氛围颜色存下去（"E 蒙光.md" §3.1）：
+    //   颜色由余额的纯函数给出（BalanceColorAt），所以"那一刻的颜色"是可复原的
+    //   —— 存下来的不是"当前渲染状态"，而是"这条数据在那一刻对应的颜色"。
+    g_curveStore.Append(obs, s.wallMs / 1000, HexOf(BalanceColorAt(s.total.ToDouble())));
 
     // ★ 判定"追加了一个点"看的是**存储自己的状态**，不是 Append() 返回值的含义：
     //   点数变了，或者环里的内容变了（容量 12 到顶时 size() 不动，但最老的点会被挤掉）。
@@ -239,6 +444,12 @@ void BuildFrameCurve(WidgetFrame* f) {
     std::vector<double> ys;
     xs.reserve(n + 1);
     ys.reserve(n + 1);
+    // ★ 与 ys 一一对应的"该点自己那一刻的颜色"（"E 蒙光.md" §3.1 末句）。
+    //   点没有颜色（老文件）时填 hasColor = false —— 不补、不猜。
+    std::vector<AmbienceColor> colors;
+    std::vector<bool> hasColors;
+    colors.reserve(n + 1);
+    hasColors.reserve(n + 1);
     for (std::size_t p = first; p < n; ++p) {
         const double slot = static_cast<double>(p) - slotBase;
         double x = SlotX(slot);
@@ -248,6 +459,10 @@ void BuildFrameCurve(WidgetFrame* f) {
                                    : NormY(values[p], newSpan);
         xs.push_back(x);
         ys.push_back(y);
+        AmbienceColor stored{};
+        const bool have = ParseHexColor(points[p].color, &stored);
+        colors.push_back(stored);
+        hasColors.push_back(have);
     }
     if (xs.size() < 2) return;                  // 一个点：渲染层画平线（curveHasData = false）
 
@@ -263,9 +478,24 @@ void BuildFrameCurve(WidgetFrame* f) {
 
     // 左侧拉平（规格 §2.2、验收 3）：显示的点还不够 11 个时，最早那个点左边的区间
     // "看做与它同值"。滚动中同理——最左那个点滑出画面后，左端由次左点拉平。
-    if (xs[from] > 0.0) f->curve.push_back({0.0f, static_cast<float>(ys[from])});
+    // ★ 这个补位点不对应任何存储点，所以它**没有**自己的颜色（hasColor = false）：
+    //   渲染层会用当前 C 画它左边那一段。给它硬套一个颜色等于发明一个测量值。
+    if (xs[from] > 0.0) {
+        CurvePoint lead{};
+        lead.x = 0.0f;
+        lead.y = static_cast<float>(ys[from]);
+        lead.hasColor = false;
+        f->curve.push_back(lead);
+    }
     for (std::size_t i = from; i < to; ++i) {
-        f->curve.push_back({static_cast<float>(xs[i]), static_cast<float>(ys[i])});
+        CurvePoint cp{};
+        cp.x = static_cast<float>(xs[i]);
+        cp.y = static_cast<float>(ys[i]);
+        cp.hasColor = hasColors[i];
+        cp.cr = colors[i].r;
+        cp.cg = colors[i].g;
+        cp.cb = colors[i].b;
+        f->curve.push_back(cp);
     }
     // 极值两边都退化（没有数据 / 只有一个点 / 全都一样）= 平线，按老规矩交给渲染层画。
     f->curveHasData = (f->curve.size() >= 2) && !(newSpan.degenerate() && oldSpan.degenerate());
@@ -666,6 +896,40 @@ void DisplayedAmount::SyncValueFromTrips() {
     value_ = target_;
 }
 
+// ---------------------------------------------------------------------------
+// 导帧用的氛围夹具：把 (R, D) 直接钉住
+// ---------------------------------------------------------------------------
+//  ★ 为什么需要它：验收要求从真机导出 (R,D) = (0,0)、(0.5,0)、(1,0)、(0,1) 四帧并
+//    量像素。R 由"最近一步 ÷ 基线"天然决定，靠仿真数据**凑不出**任意值
+//    （--history-demo 那串演示数据的最后一次跳变恰好让 R=1），所以没有这个口子，
+//    "R=0.5 那一帧"就只能靠数据碰巧落在 0.5 —— 那不是可复现的证据。
+//
+//  ★ 走命令行开关 `--ambience=R,D`（所有者 2026-09-17 的要求）：环境变量在日志里
+//    看不见，而本项目的验证全靠日志与导帧留痕。main.cpp 里两行接线：
+//        else if (wcsncmp(argv[i], L"--ambience=", 11) == 0) {
+//            if (!dshb::SetAmbienceGiven(<utf8 of argv[i]+11>)) { 记一条日志 }
+//        }
+//    这一层只提供 dshb::SetAmbienceGiven(text)（头文件里已声明）。
+//  ★ 默认不生效，对生产路径零影响。
+bool& AmbienceFrozenFlag() {
+    // 默认 false：正常运行时氛围照走。--pause-ambience 是测试口子。
+    static bool frozen = false;
+    return frozen;
+}
+
+bool& TextLayerEnabled() {
+    // 默认 true：正常运行时正文照画。--no-text 是测试口子（量底色用的）。
+    // 渲染层通过 dshb::TextEnabled() 读它（renderer.cpp 与这里必须看同一个标志）。
+    static bool enabled = true;
+    return enabled;
+}
+
+AmbienceOverrideState& AmbienceOverride() {
+    // 默认 given = false：正常运行时用算出来的 R/D，不用夹具。
+    static AmbienceOverrideState state;
+    return state;
+}
+
 // 对外只有一个 Update：先推进显示值，再按行程刷新每一位的坐标。
 // 这样"值"和"轮子"永远在同一帧里一起走，调用方不需要记得多调一次。
 // 曲线的滚动计时器也在这里推进（规格 §3：由帧 dt 推进，追加时归零）。
@@ -674,7 +938,143 @@ double DisplayedAmount::Update(double dtSeconds) {
     AdvanceRate(dtSeconds);       // 消耗速率（§7.3）：每帧重算 + 走一步弹簧
     const double shown = UpdateValue(dtSeconds);
     AdvancePlaces(dtSeconds, TextToShow());
+    // 氛围放在**显示值之后**：D 用的是"这一刻屏幕上那个数字"，而文字/轮子
+    // 刚刚在本帧落位；先算氛围会用上一帧的余额，D 就慢半拍。
+    AdvanceAmbience(dtSeconds);
     return shown;
+}
+
+// ---------------------------------------------------------------------------
+// 氛围：R、D 与颜色（"E 蒙光.md" §3、"E 施工单.md" 甲.2/3/5）
+// ---------------------------------------------------------------------------
+//  每帧重算，不缓存、不递推。三个输入：曲线存储里当前显示币种的最近两步、
+//  当前显示的余额、以及"数字是不是读不到"。
+//
+//  ★ 为什么"最近一步"取自曲线存储而不是另记一份：存储里每个点都带**自己的**
+//    时间戳（curve_store §2.3b），"这一步有多陡"就是拿最后两个可用点算的。
+//    另记一份增量状态就会多出一个可以忘记刷新的地方。
+double DisplayedAmount::LastStepPerMinute() const {
+    const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
+    if (points.size() < 2) return 0.0;
+
+    // 从最新往回找一对"两个点都有值、都有时间、时间递增"的相邻点。
+    // 中间夹着没有时间的老点（老文件）是常态，所以这里要往后走而不是直接放弃。
+    for (std::size_t i = points.size(); i-- > 1;) {
+        const CurveStorePoint& cur = points[i];
+        const CurveStorePoint& prev = points[i - 1];
+        if (!cur.atValid || !prev.atValid) continue;
+        const double dt = static_cast<double>(cur.at - prev.at);
+        if (!(dt > 0.0)) continue;
+
+        Amount curAmount;
+        Amount prevAmount;
+        if (!CurveValueOfEntry(cur, &curAmount)) continue;
+        if (!CurveValueOfEntry(prev, &prevAmount)) continue;
+        return StepPerMinute(prevAmount.ToDouble(), curAmount.ToDouble(), dt);
+    }
+    return 0.0;   // 没有可用的一步 = R = 0（"算不出来"，不是"在剧烈消耗"）
+}
+
+void DisplayedAmount::AdvanceAmbience(double dtSeconds) {
+    // ---- 0) 暂停 = 冻结（"E 蒙光.md" §9.6 的连续性要求、施工单 甲.5）----
+    //  ★ 冻结的含义是"**不再推进**"，不是"不画"：颜色与光强停在当前值上，一步都不走。
+    //    所以第一帧（还没有起点时）仍然要**落位**到当前状态 —— 否则暂停期间启动
+    //    会画出一个没有蒙光的面板（实测：彩色层颜色为 (0,0,0)，32% 的黑盖在
+    //    #1b1b1c 上，整个光晕等于不存在）。这一条是量出来的，不是想出来的。
+    if (AmbienceFrozenFlag() && ambienceSeeded_) return;
+
+    // ---- 1) 两个纯函数的输出 ----
+    ambienceRatio_ = SeverityRatio(LastStepPerMinute());
+    const double shownYuan = (value_ < 0.0) ? 0.0 : value_;
+    ambienceDepth_ = BalanceDepth(shownYuan);
+
+    // ---- 2) 状态规则（"E 蒙光.md" §3.3、施工单 甲.5）----
+    //  读不到余额（数字显示 --.--）：R 与 D 都喂极端值，而不是"保留上一帧"。
+    //  保留上一帧会让"网络断了"冻在血红色上 —— 那是对用户撒谎（§7.1）。
+    //  ★ 读不到时 D = 1 且观感取**甲**：C 退饱和后的那道冷白光**仍在**。
+    //    取"乙"（连光一起褪尽）会让面板变成一块没有任何光的死板子，
+    //    而"死板子"本身就是"出事了"的信号 —— 正是 §7.1 禁止的那件事。
+    //    "甲"由 DesaturateTowards 在 depth >= 1 时按 kGlowInD1Warm 保温实现。
+    ambientUnreadable_ = !hasValue_;
+    ratioShown_ = ambientUnreadable_ ? 0.0 : ambienceRatio_;
+    depthShown_ = ambientUnreadable_ ? 1.0 : ambienceDepth_;
+    if (ambienceGiven_) {            // 程序内夹具（DisplayedAmount::SetAmbienceGiven）
+        ratioShown_ = ambienceGivenRatio_;
+        depthShown_ = ambienceGivenDepth_;
+    // 命令行夹具（--ambience=R,D）：跳过上面两条状态规则，只影响导出/验收。
+    } else if (AmbienceOverride().given) {
+        ratioShown_ = AmbienceOverride().ratio;
+        depthShown_ = AmbienceOverride().depth;
+    }
+
+    // ---- 3) 目标颜色：**永远从本帧未降饱和的 C_0 算** ----
+    const AmbienceColor target = AmbienceTargetColor(ratioShown_, depthShown_);
+
+    // ---- 4) 逐通道缓动（与数字滚动同一套"帧号 k 的纯函数"手感）----
+    //  残差 dC = 老目标 − 新目标；每帧乘一次 rate^c。显示值 = 目标 + 残差：
+    //  于是它是 k 的纯函数，导帧逐帧可复现，且**不会**因为"从上一帧的颜色再算
+    //  一次饱和度"而自我累积（那种写法会让整条曲线在几秒内褪成灰）。
+    const bool retarget = !ambienceSeeded_ ||
+                          (target.r != ambienceTarget_.r || target.g != ambienceTarget_.g ||
+                           target.b != ambienceTarget_.b);
+    if (retarget) {
+        ambDcR_ = ambienceColor_.r - target.r;   // 逐通道，故意**不叫 D**
+        ambDcG_ = ambienceColor_.g - target.g;
+        ambDcB_ = ambienceColor_.b - target.b;
+        if (!ambienceSeeded_) {
+            ambDcR_ = ambDcG_ = ambDcB_ = 0.0f;  // 第一次：直接落位，不做入场动画
+            ambienceFrames_ = 0;
+        }
+        ambienceTarget_ = target;
+    }
+
+    const double dt = (dtSeconds < 0.0) ? 0.0
+                     : ((dtSeconds > kAmbienceMaxDtSeconds) ? kAmbienceMaxDtSeconds : dtSeconds);
+    // 逐通道残差每帧自乘 rate^c（k = 已经走了多少帧）。
+    const float decay = std::pow(kAmbienceColorRate, kAmbienceColorC);
+    if (ambienceSeeded_ && !AmbienceFrozenFlag()) {
+        ambDcR_ *= decay;
+        ambDcG_ *= decay;
+        ambDcB_ *= decay;
+        if (std::fabs(ambDcR_) < kAmbienceColorSnap) ambDcR_ = 0.0f;
+        if (std::fabs(ambDcG_) < kAmbienceColorSnap) ambDcG_ = 0.0f;
+        if (std::fabs(ambDcB_) < kAmbienceColorSnap) ambDcB_ = 0.0f;
+    }
+    ambienceColor_.r = ambienceTarget_.r + ambDcR_;
+    ambienceColor_.g = ambienceTarget_.g + ambDcG_;
+    ambienceColor_.b = ambienceTarget_.b + ambDcB_;
+    // 夹回合法范围：残差一定是朝老值的方向，越界只可能来自浮点噪声。
+    auto clamp01 = [](float x) { return (x < 0.0f) ? 0.0f : ((x > 1.0f) ? 1.0f : x); };
+    ambienceColor_.r = clamp01(ambienceColor_.r);
+    ambienceColor_.g = clamp01(ambienceColor_.g);
+    ambienceColor_.b = clamp01(ambienceColor_.b);
+    ambienceSeeded_ = true;
+    ++ambienceFrames_;
+
+    // ---- 心跳位移（E 段）：放在这里是因为它要读上面刚算好的 ratioShown_/depthShown_。
+    //  ★ 与氛围一样在冻结时"停住"，但含义略有不同：氛围是停在当前值，心跳是**时间不走**，
+    //    于是位移作为一个纯函数自然保持不变（不需要额外的"记住上一帧"状态）。
+    AdvanceBeat(dtSeconds);
+
+    // ---- 5) 蒙光强度倍率 k(R,D)：与颜色分开缓动（连续解，与帧率无关）----
+    const float kTarget = static_cast<float>((kGlowInK0 + kGlowInK1 * ratioShown_) *
+                                             (1.0 - kGlowInD * depthShown_));
+    if (!glowSeeded_ || AmbienceFrozenFlag()) {
+        glowIntensity_ = kTarget;      // 起点落位；冻结时停在当前目标上不再缓动
+        glowSeeded_ = true;
+    } else if (dt > 0.0) {
+        const double a = 1.0 - std::exp(-dt / static_cast<double>(kGlowInTauSeconds));
+        glowIntensity_ += static_cast<float>((kTarget - glowIntensity_) * a);
+    }
+    if (glowIntensity_ < 0.0f) glowIntensity_ = 0.0f;
+    if (glowIntensity_ > 1.0f) glowIntensity_ = 1.0f;
+}
+
+// 导帧夹具：这一帧用给定的 (R, D) 画。见头文件里的理由（验收要求四帧可复现）。
+void DisplayedAmount::SetAmbienceGiven(double ratio, double depth) {
+    ambienceGiven_ = true;
+    ambienceGivenRatio_ = (ratio < 0.0) ? 0.0 : ((ratio > 1.0) ? 1.0 : ratio);
+    ambienceGivenDepth_ = (depth < 0.0) ? 0.0 : ((depth > 1.0) ? 1.0 : depth);
 }
 
 // 每帧一次：从曲线存储重算估计，再按这一帧的 dt 走一步弹簧。
@@ -756,12 +1156,22 @@ void PrimeHistoryForDemo(int points) {
     const int want = points;
     const int table = (want < 12) ? want : 12;   // <12 时取表尾那几个
     const int prefix = want - table;             // >12 时多喂的填充点，会被环挤掉
-    const int64_t nowSec = static_cast<int64_t>(std::time(nullptr));
+    // ★ 固定基准时刻 + 固定步长（所有者 2026-09-17 的要求）。
+    //   原来是 `std::time(nullptr)`：同一个 --history-demo=N 在不同时刻产生**不同的
+    //   时间戳串**，于是同一个导出命令两次跑出来的帧不逐位相同 —— 而"导帧可复现"
+    //   是这个项目唯一的验证方式。现在锚点是常量、步长是常量，任何时刻都是同一串点。
+    //   锚点取值只为可读（2026-09-17 00:00:00Z 附近），它不参与任何画面计算：
+    //   曲线横轴是**槽位**、纵轴是极值归一化，唯一用到时间是速率估计（本串只有 1 秒
+    //   跨度，本来就"不显著"）。
+    //   注：这一串点比"现在"早，所以它**只能**喂进内存里的存储；任何落盘路径都必须
+    //   配 --curve-store 指向夹具（生产路径的漏洞由 main 侧堵，不在这里补）。
+    constexpr int64_t kDemoAnchorSec = 1789574400;
+    constexpr int64_t kDemoStepSec = 1;
 
     for (int i = 0; i < want; ++i) {
         const double v = (i < prefix) ? (21.00 + 0.01 * i) : kDemo[12 - table + (i - prefix)];
         dshb::Sample s{};
-        s.wallMs = (nowSec - (want - 1 - i)) * 1000;   // 一点一秒，最老的最早
+        s.wallMs = (kDemoAnchorSec + static_cast<int64_t>(i) * kDemoStepSec) * 1000;
         s.amountsOk = true;
         s.currency = "CNY";
         s.total = dshb::Amount::FromYuanDouble(v);
@@ -775,6 +1185,42 @@ void PrimeHistoryForDemo(int points) {
 }
 
 // --curve-frame=k：把滚动计时器冻结在 k/60 秒（导帧口子）。
+// 心跳位移：把仿真时间直接放到 k/60 秒（导出夹具）。
+//  ★ 必须先 seed 再求值：没有历史条目时模块按常态最慢那一档走，位移是一条约 0 的曲线。
+void DisplayedAmount::SetBeatSimFrame(int frame) {
+    beatSimSeconds_ = (frame > 0) ? (static_cast<double>(frame) / kBeatFrameHz) : 0.0;
+    // ★ 夹具只负责"把仿真时刻放到 k/60"，**不在这里 seed**：此刻 ratioShown_/depthShown_ 还没
+    //   算出来（--ambience 夹具的覆盖值要等 AdvanceAmbience 把它落到那两个量上，而那在 Update 里）。
+    //   seed 一律交给 AdvanceBeat，用**当帧**的 R/D，且把变化时刻记在 t=0 —— 若记在"这一帧"，
+    //   任何一帧的经过时间都恰好是 0，永远还没到 onset，位移恒为 0（看起来像没接线）。
+    //   这里曾经读过 DisplayedAmount 里两个同名但没用到的成员，读到的永远是 0，
+    //   于是 seed 成 R=0、心跳最慢 —— 本项目"一个概念两个来源"的老毛病，这次是第三次。
+    beatHistory_.clear();
+    beatSeeded_ = false;
+    beatOffsetDip_ = BeatOffsetPx(beatSimSeconds_, beatHistory_, 1.0);
+}
+
+// 每帧推进心跳位移。
+//  ★ 冻结（暂停）时**不推进时间**：位移是 (时间, 历史) 的纯函数，时间不走位移就不变，
+//    这比"每帧记住一个值再锁住"更难写错。
+//  ★ R/D 变化才追加历史条目：F1/F2 由 R 决定，追加一条就是"心跳从这一刻起换了频率"。
+void DisplayedAmount::AdvanceBeat(double dtSeconds) {
+    if (!AmbienceFrozenFlag()) beatSimSeconds_ += dtSeconds;
+    const bool changed = (beatLastRatio_ != ratioShown_) || (beatLastDepth_ != depthShown_);
+    if (!beatSeeded_) {
+        beatHistory_.push_back(MakeBeatChange(0.0, ratioShown_, depthShown_));   // 变化发生在 t=0（首帧）
+        beatSeeded_ = true;
+        beatLastRatio_ = ratioShown_;
+        beatLastDepth_ = depthShown_;
+    } else if (changed && dtSeconds > 0.0) {   // dt=0 不是"又变化了一次"（夹具每帧是独立进程）
+        AppendBeatChange(&beatHistory_, MakeBeatChange(beatSimSeconds_, ratioShown_, depthShown_),
+                         kBeatHistoryKeep);
+        beatLastRatio_ = ratioShown_;
+        beatLastDepth_ = depthShown_;
+    }
+    beatOffsetDip_ = BeatOffsetPx(beatSimSeconds_, beatHistory_, 1.0);
+}
+
 void SetCurveScrollFrame(int frame) {
     g_curveFrozen = true;
     g_curveSeconds = (frame > 0) ? (static_cast<double>(frame) / kCurveFrameHz) : 0.0;
@@ -845,6 +1291,17 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     //   * 值不变 -> 没有新点 -> 曲线静止（规格 §2.1 的推论，故意的）
     //   * 没有数据 / 只有一个点 / 全都一样 -> 平线（curveHasData = false）
     BuildFrameCurve(&f);
+
+    // ---- 氛围蒙光（"E 蒙光.md" §3、§6）----
+    // ★ 渲染层只拿到两样东西：**颜色**（已逐通道缓动）与**强度倍率 k**。
+    //   它不知道余额、G、基线、R、D —— 那一整套留在显示层（和"余额为 0 与
+    //   查不到有什么区别"同一条分工）。剖面的形状属于渲染层（tuning.h 5.4）。
+    //   ★ 读不到余额时 R/D 的取值、以及"取甲不取乙"，都已经在 AdvanceAmbience 里
+    //     按状态规则算完，这里只是把它搬进帧。
+    f.ambientColor = amount.ambienceColor();
+    f.ambientIntensity = amount.ambienceIntensity();
+    f.beatOffsetDip = static_cast<float>(amount.beatOffsetDip());
+
     // ★ 符号与数字**分开决定**（所有者）：只要币种是确定的，即使没有数字也要显示符号，
     //   否则切到没数据的币种时看不出自己在看哪个币种。
     f.currencySymbol = currencyKnown ? (currencySymbol ? currencySymbol : L"") : L"";
@@ -904,6 +1361,62 @@ const wchar_t* StatusTextFor(ConnState state) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 命令行接线（--ambience=R,D / --no-text / --pause-ambience）—— 见头文件的说明
+// ---------------------------------------------------------------------------
+//  ★ 状态存放处（AmbienceOverride / TextLayerEnabled / AmbienceFrozenFlag）定义在
+//    本文件开头的匿名 namespace 里：DisplayedAmount::AdvanceAmbience 与渲染层都要
+//    读它们，而真正的命令行入口就是下面这三个函数。
+bool SetAmbienceGiven(const char* text) {
+    if (!text || !*text) return false;
+    char* end = nullptr;
+    const double first = std::strtod(text, &end);
+    if (end == text) return false;
+    while (*end == ' ' || *end == '\t') ++end;
+    if (*end != ',' && *end != ' ') return false;   // "R,D"（也容忍空格分隔）
+    ++end;
+    const char* second = end;
+    const double value = std::strtod(second, &end);
+    if (end == second) return false;
+    AmbienceOverride().given = true;
+    AmbienceOverride().ratio = (first < 0.0) ? 0.0 : ((first > 1.0) ? 1.0 : first);
+    AmbienceOverride().depth = (value < 0.0) ? 0.0 : ((value > 1.0) ? 1.0 : value);
+    return true;
+}
+
+void SetTextEnabled(bool on) { TextLayerEnabled() = on; }
+bool TextEnabled() { return TextLayerEnabled(); }
+
+void SetAmbienceFrozen(bool on) { AmbienceFrozenFlag() = on; }
+bool AmbienceFrozen() { return AmbienceFrozenFlag(); }
+
+// --ambience-glide=N：跑 N 帧真实的氛围推进。见头文件里的理由（量重烘代价）。
+// ★ 轨迹：前 25% 帧 R 从 0 爬到 1（余额刚掉一截），余下 75% 帧 R 从 1 落回 0
+//   （不再剧烈变化，颜色自己慢慢回到常态）。D 固定 0。
+// ★ 每帧 1/60 秒、用**真实**的 Update 路径推进：所以量到的是生产里那条代码，
+//   不是另写一套模拟。冻结标志在这里同样生效（于是它也能用来验证暂停）。
+void RunAmbienceGlide(int frames) {
+    if (frames < 1) return;
+    if (!g_ambienceGlideTarget) return;   // main 没挂实例 = 这一层不猜、不建第二个
+    const int rampUp = (frames + 3) / 4;
+    for (int i = 0; i < frames; ++i) {
+        const double r = (i < rampUp)
+                             ? (static_cast<double>(i) / static_cast<double>(rampUp))
+                             : (1.0 - static_cast<double>(i - rampUp) /
+                                            static_cast<double>(frames - rampUp > 0
+                                                                    ? frames - rampUp
+                                                                    : 1));
+        AmbienceOverride().given = true;
+        AmbienceOverride().ratio = (r < 0.0) ? 0.0 : ((r > 1.0) ? 1.0 : r);
+        AmbienceOverride().depth = 0.0;
+        g_ambienceGlideTarget->Update(1.0 / 60.0);
+    }
+    // 滑行结束后把夹具撤掉：后续帧回到"用真实算出来的 R/D"，与生产一致。
+    AmbienceOverride().given = false;
+}
+
+DisplayedAmount* g_ambienceGlideTarget = nullptr;
 
 }  // namespace dshb
 

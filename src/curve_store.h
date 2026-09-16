@@ -147,6 +147,17 @@ struct CurveStorePoint {
     int64_t at = 0;
     bool atValid = false;
 
+    // ★ The ambience colour of the moment this point was appended ("E 蒙光.md" §3.1:
+    //   a node *is* the ambience colour of that instant, and the segments between
+    //   nodes interpolate). Kept as the SAME "#rrggbb" text the writer emitted, for
+    //   the same reason the amounts are text: nothing here invents precision.
+    //
+    //   EMPTY means "this point has no colour" -- either a point read from a file
+    //   written before the field existed, or a caller that passed none. An empty
+    //   colour is never written back, so a legacy file round-trips byte-identically
+    //   instead of growing a field nobody measured.
+    std::string color;
+
     // nullptr when this point has no such currency.
     const Entry* Find(const std::string& currency) const;
 };
@@ -235,7 +246,16 @@ public:
     //
     // An appended point records the same `nowSeconds` as its own `at` (§2.3b), which
     // is why a point only ever has one time and the two can never disagree.
-    bool Append(const CurveObservation& obs, int64_t nowSeconds);
+    //
+    // `colorHex` is the ambience colour to store with the point, as "#rrggbb"; an
+    // empty string stores no colour at all (the point then draws with the current
+    // colour, see widget_display.h's CurvePoint::hasColor). The two-argument form
+    // stays for the probes and for any caller that has no colour to record -- it is
+    // exactly `Append(obs, nowSeconds, "")`.
+    bool Append(const CurveObservation& obs, int64_t nowSeconds, const std::string& colorHex);
+    bool Append(const CurveObservation& obs, int64_t nowSeconds) {
+        return Append(obs, nowSeconds, std::string());
+    }
 
     void Clear();
 

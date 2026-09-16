@@ -14,8 +14,10 @@
 #include <string>
 
 #include "widget_display.h"
-
 #include "tuning.h"
+
+// 探针出口的签名里用到（renderer.h 故意不引 d2d1.h：它对外只是一组包装）。
+struct ID2D1RenderTarget;
 
 #include <cstdint>
 
@@ -120,5 +122,65 @@ void SetLayoutProbe(bool on);
     // 鼠标是否悬停在币种符号上（悬停时符号变暗一档，提示可点击）
     void SetSymbolHover(bool on);
 void DumpLayoutProbe();
+
+// ---------------------------------------------------------------------------
+// 内蒙光的 alpha 剖面（"E 蒙光.md" §3.2、"E 施工单.md" 甲.4）
+// ---------------------------------------------------------------------------
+//  这是烘遮罩时用的**同一支函数**，所以"文档里的数"与"屏幕上的像素"不可能各说
+//  一套。它不碰任何 D2D 状态，可以被离线链接（探针就是这么核对它的）。
+//  ★ 输入输出都是 DIP：面板外一律 0（本层是**内**蒙光，不是外面那圈外光晕）。
+//    剖面 = 整板底噪 + 内侧 5 DIP 内唇 + 底部 17 DIP 透光。
+//  ★ 返回值**不含**强度倍率 k(R,D)：k 在 Pick() 里乘进彩色层，所以清一色遮罩
+//    永远不用重烘。
+float InnerGlowAlphaAt(float xDip, float yDip);
+
+// ---------------------------------------------------------------------------
+// 内蒙光的重烘记账（"E 施工单.md" 甲.4 的代价问题）
+// ---------------------------------------------------------------------------
+//  为什么要记：光强是**烘进彩色层**的，所以 k 每跨过 1/255 就要重烘一整张
+//  475x289 的位图。对一个 60 fps 的挂件，这可能是真正的开销 —— 而"我觉得不会"
+//  不是凭据。这里记的是：覆盖率烘了几次（应当永远是 1）、彩色层烘了几次、
+//  彩色层单次最坏耗时（毫秒）、以及颜色滑行一共跑了几帧。
+//  ★ 每帧都会变的两帧之间只需读一次；字段是单调累加的，不重置。
+struct InnerGlowBakeCounters {
+    int coverageBakes = 0;        // 覆盖率烘的次数（启动一次 = 1）
+    double coverageWorstMs = 0.0; // 覆盖率那一次花了多少毫秒
+    int tintBakes = 0;            // 彩色层重烘次数
+    double tintWorstMs = 0.0;     // 彩色层单次最坏耗时（毫秒）
+    double tintTotalMs = 0.0;     // 彩色层累计耗时（毫秒）
+    int frames = 0;               // 画过多少帧（Pick 被调用的次数）
+};
+const InnerGlowBakeCounters& InnerGlowBakeStats();
+
+// 单次调用到底重烘了没有（探针用：它按帧重放一次滑行，需要区分"贴缓存"与"重烘"）。
+// 实现读的是和 Pick 同一个计数器，所以它不会说谎。
+bool GlowTintBakedOnLastPick();
+
+// 探针用的 GlowCache 出口（.dsh/scratch/amb/glowbake.cpp）。
+// ★ 为什么必须 export：重烘代价只能在"逐帧重放一次真实滑行"里量出来，而挂件一次
+//   导帧只画一帧 —— 用它自己量不出重烘次数。这个类只是把内部的 GlowCache
+//   **原样**转出来（成员函数直接转发），所以探针量到的就是生产那条代码。
+//   生产路径不碰它（没有任何调用点）。
+class GlowCacheForProbe {
+public:
+    GlowCacheForProbe();
+    ~GlowCacheForProbe();
+    GlowCacheForProbe(const GlowCacheForProbe&) = delete;
+    GlowCacheForProbe& operator=(const GlowCacheForProbe&) = delete;
+
+    void EnsureCoverage(const CanvasSize& canvas);
+    // 与生产里的那次调用完全同一个函数（同一个 isExport 语义）。
+    void Pick(ID2D1RenderTarget* rt, const CanvasSize& canvas, const WidgetFrame& frame,
+              bool isExport);
+    int tintBakesThisCall() const;
+
+private:
+    struct Impl;
+    Impl* impl_ = nullptr;
+};
+
+// 氛围颜色/强度的纯函数出口（滑行探针要按状态取色，不能自己抄一份颜色表）。
+AmbienceColor AmbienceTargetColorForProbe(double ratio, double depth);
+float GlowIntensityForProbe(double ratio, double depth);
 
 }  // namespace dshb

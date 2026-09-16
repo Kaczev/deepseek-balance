@@ -6,6 +6,7 @@
 #include "renderer.h"
 #include "curve.h"   // 单调三次插值（氛围曲线）
 #include "roll_axis.h"
+#include "widget_display.h"   // WidgetFrame / CurvePoint（含每点的颜色）/ AmbienceColor
 
 #include <d2d1.h>
 #include <d2d1helper.h>
@@ -18,10 +19,85 @@
 #include <cmath>   // std::fmod
 #include <cstring> // std::strcmp
 #include <string>
+#include <vector>
 
 namespace dshb {
 
+// ---------------------------------------------------------------------------
+// 内蒙光（"E 蒙光.md" §1-§7、"E 施工单.md" 甲.4）—— 先声明，后定义
+// ---------------------------------------------------------------------------
+//  它是**面板自己背景的最下面一层**：画在面板底色之上、其余一切（边框、激活环、
+//  曲线、正文）之前。剖面（alpha 的形状）烘一次，彩色层只在颜色/强度真的变了时重烘。
+//
+//  ★ 为什么不是"烘覆盖率 + 每帧 FillOpacityMask"（设计阶段的方案）：
+//    量出来的事实是 **FillOpacityMask 在软件（WIC）渲染目标上根本不能用** ——
+//    不论遮罩是 A8 / R8 / BGRA、不论内容模式是 GRAPHICS 还是 TEXT_NATURAL、
+//    不论画笔是 solid 还是 bitmap，EndDraw 一律 D2DERR_WRONG_STATE(0x88990001)，
+//    整帧被丢弃；而导帧走的正是软件目标，导帧又是本项目唯一的验证手段。
+//    对照组：DrawBitmap 在同一个目标上成功（.dsh\scratch\amb\glowprobe.cpp 可复现）。
+//    所以改成"预乘彩色层 + 每帧一次 DrawBitmap"：**两个渲染目标上都成立**，
+//    而且屏幕与导帧走同一条代码路径（这才有"导出的 PNG 就是屏幕"这句话）。
+//
+//  ★ 为什么分成两层缓存：覆盖率是 137,375 个像素各算一次距离场（贵，但永不随状态
+//    变）；彩色层只是把覆盖率和当前颜色相乘（便宜，但每帧都可能变一点）。
+
+// ---------------------------------------------------------------------------
+// 内蒙光的声明区（定义在文件后面：它要用匿名 namespace 里的烘焙函数）
+// ---------------------------------------------------------------------------
+// --- 重烘计数与耗时（renderer.h 的 InnerGlowBakeStats 是它的只读出口）---
+InnerGlowBakeCounters g_glowBake;
+
+void PaintInnerGlow(ID2D1RenderTarget* rt, const WidgetFrame& f, ID2D1Bitmap* tinted);
+float InnerGlowAlphaAt(float xDip, float yDip);
+std::vector<uint8_t> InnerGlowMaskPixels(const CanvasSize& canvas);
+ID2D1Bitmap* BakeTintedGlow(ID2D1RenderTarget* rt, const CanvasSize& canvas,
+                            const std::vector<uint8_t>& coverage, const D2D1_COLOR_F& colour,
+                            float intensity);
+
+// 内蒙光的缓存：**覆盖率遮罩烘一次**（与颜色无关），彩色层只在颜色/强度真的变了时重烘。
+//  ★ 必须在匿名 namespace **之外**（成员函数要用匿名 namespace 里的烘焙函数，
+//    而那些函数在文件后面才定义，所以这里只写前置声明 + inline 定义在下面）。
+struct GlowCache {
+    std::vector<uint8_t> coverage;      // 覆盖率（0..255），与颜色无关，烘一次
+    ID2D1Bitmap* tinted = nullptr;      // 覆盖率 x 颜色 x k 的预乘彩色层
+    bool hasTint = false;
+    float lastR = -1.0f;
+    float lastG = -1.0f;
+    float lastB = -1.0f;
+    float lastK = -1.0f;
+    bool lastWasExport = false;         // 上一次建位图用的是不是软件目标
+    bool everBuilt = false;
+
+    void EnsureCoverage(const CanvasSize& canvas) {
+        if (coverage.empty()) coverage = InnerGlowMaskPixels(canvas);
+    }
+
+    // 换渲染目标（屏幕 <-> 导帧）时必须重建位图：位图归属创建它的目标。
+    // 覆盖率**不用**重算 —— 那是与目标无关的纯数值。
+    void Forget(bool isExport) {
+        if (!everBuilt || lastWasExport == isExport) return;
+        if (tinted) { tinted->Release(); tinted = nullptr; }
+        hasTint = false;
+        everBuilt = false;
+    }
+
+    // 这一帧要贴的那张彩色层；不需要重烘时直接返回上一张。
+    ID2D1Bitmap* Pick(ID2D1RenderTarget* rt, const CanvasSize& canvas, const WidgetFrame& f,
+                      bool isExport);
+
+    void Release() {
+        if (tinted) { tinted->Release(); tinted = nullptr; }
+        hasTint = false;
+        everBuilt = false;
+        coverage.clear();
+    }
+};
+
+// 匿名 namespace 从这里开始：下面的布局探针、场景绘制辅助与内蒙光烘焙函数都是
+// 本翻译单元私有的（内蒙光的**声明**区故意留在它外面，见上面）。
 namespace {
+
+// 氛围曲线开关：--no-curve 关掉它，用于 A/B 对比（关掉后文字位置必须逐像素不变）
 
 // 甯冨眬璇婃柇寮€鍏筹紙涓存椂锛夈€傚畾涔夊繀椤诲湪浣跨敤瀹冪殑 SetLayoutProbe 涔嬪墠鈥斺€擟++ 閲?
 // 鍚嶅瓧瑕佸厛澹版槑锛岃繖涓€鏉℃垜鍦ㄥ埆澶勫凡缁忚俯杩囦竴娆★紝涓嶅啀韪┿€?
@@ -232,6 +308,9 @@ static bool g_numberXValid = false;
 
 // 币种符号的矩形（像素），每帧刷新；点击命中测试要用
 static float g_symbolL = 0.0f, g_symbolT = 0.0f, g_symbolR = 0.0f, g_symbolB = 0.0f;
+// 心跳位移在**本帧**实际用掉的像素数。唯一的真相来源：绘制变换与命中矩形都读它，
+// 所以两者不可能对不上（本项目反复踩过"一个值两个来源"的坑）。
+static float g_lastBeatDyPx = 0.0f;
 static bool g_symbolValid = false;
 static float g_blockShift = 0.0f;   // 整块数字当帧的横向位移（符号要跟着它走）
 
@@ -400,10 +479,23 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
     // 要画的点列（归一化）。渲染层只管连线，不知道余额从哪来——按规格 §3，点已经
     // 是显示层算好的最终位置（横向滚动、纵向缓动都算完了），这里一个都不再改。
     std::vector<std::pair<float, float>> pts;
+
+    // ★ 每个采样点自己的颜色（"E 蒙光.md" §3.1 末句：节点恰好是那一刻的氛围颜色，
+    //   节点之间渐变过去）。渲染层拿到的只有**每个控制点的颜色**，段内怎么分配由
+    //   这里决定：按**段**插值，而不是按 u 插值 —— 单调三次在 u 上不是匀速的，
+    //   按 u 插值会让颜色在某些段里跑得比曲线本身快。
+    //   segOf[i] = 采样点 i 落在哪一段（控制点 k → k+1），tLocal[i] = 该段内的比例。
+    std::vector<AmbienceColor> colOf;
+    std::vector<float> segStartX;
+
     if (!f.curveHasData || f.curve.size() < 2) {
-        // 没有数据 = 平的（所有者规则），画在带子中线。
+        // 没有数据 = 平的（所有者规则），画在带子中线，用**当前 C**。
         pts.push_back({0.0f, 0.5f});
         pts.push_back({1.0f, 0.5f});
+        colOf.push_back(f.ambientColor);
+        colOf.push_back(f.ambientColor);
+        segStartX.push_back(0.0f);
+        segStartX.push_back(0.0f);
     } else {
         // 单调三次插值（curve.h）：我们只在采样时刻知道余额，区间内的形状是插出来的；
         // 单调插值保证不过冲（普通样条会画出从未出现过的余额）。
@@ -418,12 +510,46 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
         dshb::MonotoneCurve mc;
         mc.Build(xs, ys);
         const int steps = 300;
+        // 每段的起止 u：按控制点的 x 划分（x 是单调的，显示层保证）。
+        std::vector<float> uStart(f.curve.size(), 0.0f);
+        for (std::size_t k = 1; k < f.curve.size(); ++k) {
+            const float dx = f.curve[k].x - f.curve[k - 1].x;
+            uStart[k] = (dx > 0.0f) ? (uStart[k - 1] + dx) : uStart[k - 1];
+        }
+        const float uSpan = (uStart.back() > 0.0f) ? uStart.back() : 1.0f;
+        for (std::size_t k = 0; k < uStart.size(); ++k) uStart[k] /= uSpan;
+
+        std::size_t seg = 0;
         for (int i = 0; i <= steps; ++i) {
             const float u = static_cast<float>(i) / static_cast<float>(steps);
             pts.push_back({u, static_cast<float>(mc.Eval(static_cast<double>(u)))});
+            // 找到这个采样点所在的段（段号只增不减：下面用 while 前进）。
+            while (seg + 2 < uStart.size() && u >= uStart[seg + 1]) ++seg;
+            const float a = uStart[seg];
+            const float b = (seg + 1 < uStart.size()) ? uStart[seg + 1] : 1.0f;
+            const float t = (b > a) ? ((u - a) / (b - a)) : 0.0f;
+            const CurvePoint& n0 = f.curve[seg];
+            const CurvePoint& n1 = f.curve[(seg + 1 < f.curve.size()) ? (seg + 1) : seg];
+            // 两个端点里只要有一个没有颜色，就用**当前 C** 画这一段：
+            //   老文件里的点没有颜色（写颜色字段之前存的），那是"没测过"，
+            //   用当前色是唯一不编造历史的画法（widget_display.h CurvePoint::hasColor）。
+            const AmbienceColor c0 = n0.hasColor ? AmbienceColor{n0.cr, n0.cg, n0.cb}
+                                                 : f.ambientColor;
+            const AmbienceColor c1 = n1.hasColor ? AmbienceColor{n1.cr, n1.cg, n1.cb}
+                                                 : f.ambientColor;
+            AmbienceColor c;
+            c.r = c0.r + (c1.r - c0.r) * t;
+            c.g = c0.g + (c1.g - c0.g) * t;
+            c.b = c0.b + (c1.b - c0.b) * t;
+            colOf.push_back(c);
+            segStartX.push_back(px(u));
         }
     }
+    if (pts.size() < 2) return;
 
+    // ★ 每段单独画：段的几何与原来**逐点相同**（同一份采样、同一份单调三次求值），
+    //   所以曲线的位置一个像素都没动，动的只有落在它上面的颜色。
+    //   工厂与几何对象各只取一次，循环里只重开一次 sink（300 段/帧，不建 300 个对象）。
     ID2D1Factory* fac = nullptr;
     rt->GetFactory(&fac);
     if (!fac) return;
@@ -432,43 +558,39 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
         fac->Release();
         return;
     }
-    ID2D1GeometrySink* sink = nullptr;
-    if (FAILED(geo->Open(&sink)) || !sink) {
+    ID2D1SolidColorBrush* cb = nullptr;
+    if (FAILED(rt->CreateSolidColorBrush(
+            StraightRgba(kCurveColorR, kCurveColorG, kCurveColorB, kCurveAlpha), &cb)) ||
+        !cb) {
         geo->Release();
         fac->Release();
         return;
     }
-    // ★ 这里**没有**平滑：点的位置是显示层按 k 的纯函数算出来的（规格 §3 §4）。
-    //   旧实现（g_curveDrawn：把上一帧画出来的点朝这一帧逼近）已经删掉——它会让
-    //   导帧量到的像素位置与公式对不上，而且"滚动"与"纵向缓动"现在各自已经有了
-    //   自己的时间函数。
-    bool first = true;
-    for (const std::pair<float, float>& pt : pts) {
-        const float X = px(pt.first);
-        const float Y = py(pt.second);
-        if (first) {
-            sink->BeginFigure(D2D1::Point2F(X, Y), D2D1_FIGURE_BEGIN_HOLLOW);
-            first = false;
-        } else {
-            sink->AddLine(D2D1::Point2F(X, Y));
-        }
-    }
-    sink->EndFigure(D2D1_FIGURE_END_OPEN);
-    sink->Close();
-    sink->Release();
-
-    ID2D1SolidColorBrush* cb = nullptr;
-    if (SUCCEEDED(rt->CreateSolidColorBrush(
-            StraightRgba(kCurveColorR, kCurveColorG, kCurveColorB, kCurveAlpha), &cb)) && cb) {
+    for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+        ID2D1GeometrySink* sink = nullptr;
+        if (FAILED(geo->Open(&sink)) || !sink) break;   // 空几何：这一帧余下的段都不画
+        sink->BeginFigure(D2D1::Point2F(px(pts[i].first), py(pts[i].second)),
+                          D2D1_FIGURE_BEGIN_HOLLOW);
+        sink->AddLine(D2D1::Point2F(px(pts[i + 1].first), py(pts[i + 1].second)));
+        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+        sink->Close();
+        sink->Release();
+        cb->SetColor(StraightRgba(colOf[i].r, colOf[i].g, colOf[i].b, kCurveAlpha));
         rt->DrawGeometry(geo, cb, kCurveWidthDip * s);
-        cb->Release();
     }
+    cb->Release();
     geo->Release();
     fac->Release();
 }
 
 void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const WidgetFrame& f) {
     if (g_sceneMode != SceneMode::Normal) return;
+    // ★ 验收口子（命令行 --no-text，测试专用）：正文一层都不画。
+    //   为什么需要它：要量"白字对**它自己那层底色**的对比度"，必须知道底色是多少，
+    //   而整帧里文字墨迹正好盖在要量的那些像素上（第一次量就量到了字形本身，
+    //   得到 1.00:1 —— 那是"白字对白字"，不是对比度）。所以导一张没有文字的同一帧，
+    //   从它读出真实底色，再用它当尺子去量有文字那一帧。正常运行时这一行不生效。
+    if (!TextEnabled()) return;
 
     const float s = canvas.scale;
     const float cx = (kMarginDip + kEntityWidthDip * 0.5f) * s;   // 瀹炰綋鍖烘í鍚戜腑蹇?
@@ -776,10 +898,23 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
         }
     }
 }
+// 内蒙光与 GlowCache 都已经在文件开头声明（那里定义，因为它要用本 namespace 里的
+// 烘焙函数）。这里直接定义 PaintScene。
 
 void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedSeconds,
-                double flashAmount, const std::wstring& debugText) {
+                double flashAmount, const std::wstring& debugText, GlowCache* glow,
+                bool isExport) {
+    // 心跳位移：平移**整个面板内容**（底色、蒙光、文字、曲线、边框一起动）。
+    //  ★ 窗口真实位置一帧都不改 -> "移动窗口触发系统贴边吸附"结构上不可能发生，
+    //    设计 §9.4 的 E9 因此不需要实现，也不需要任何守卫。
+    //  ★ 必须**无条件**设置变换：dy==0 时若跳过，会把上一帧的平移留在目标上。
+    g_lastBeatDyPx = g_widgetFrame.beatOffsetDip * canvas.scale;
+    rt->SetTransform(g_lastBeatDyPx == 0.0f
+                         ? D2D1::Matrix3x2F::Identity()
+                         : D2D1::Matrix3x2F::Translation(0.0f, g_lastBeatDyPx));
+
     if (g_sceneMode == SceneMode::PremulProbe) {
+        rt->SetTransform(D2D1::Matrix3x2F::Identity());   // 探针路径不参与心跳位移
         PaintPremulProbe(rt);
         return;
     }    rt->Clear(D2D1::ColorF(0, 0.0f));   // 鐢诲竷鏁翠綋閫忔槑锛屽鎵╀綑閲忓繀椤诲畬鍏ㄩ€?
@@ -834,6 +969,11 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
 
     // 姝ｆ枃锛圕 闃舵锛夛細鏍囬銆佹暟瀛椼€佺鍙枫€佹竻闆堕浼?
     // 氛围曲线：必须在文字之前画（= 数字后面）
+    // ★ 内蒙光（"E 蒙光.md" §1）：面板自己背景的**最下面一层** ——
+    //   晚于面板底色（否则整层被底板盖掉）、早于其余一切（边框、激活环、曲线、正文）。
+    //   这就是所有者说的"比文字和曲线更早渲染、是面板自己的背景最底下的一部分"。
+    PaintInnerGlow(rt, g_widgetFrame, glow->Pick(rt, canvas, g_widgetFrame, isExport));
+
     PaintAmbientCurve(rt, canvas, g_widgetFrame);
 
     PaintWidgetText(rt, canvas, g_widgetFrame);
@@ -876,6 +1016,294 @@ double NowSeconds() {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// 内蒙光（"E 蒙光.md" §1-§7、"E 施工单.md" 甲.4）
+// ---------------------------------------------------------------------------
+//  它是**面板自己背景的最下面一层**：画在面板底色之上、其余一切（边框、激活环、
+//  曲线、正文）之前。剖面（alpha 的形状）烘一次，颜色与强度每帧变。
+//
+//  ★ 为什么剖面要烘：它是 137,375 个像素各算一次距离场。逐帧做等于把"一次乘加"
+//    变成十几万次开方与幂运算。
+//  ★ 为什么强度倍率 k 不烘进去：k 随 R/D 每帧都可能动，烘进去就得每帧重烘 ——
+//    而 k 正好可以走画笔的不透明度（"E 施工单.md" 甲.4 的"单独暴露的强度倍率"）。
+//
+// ★ 这是**唯一的**剖面定义：烘遮罩用它，探针（tools/storeprobe.cpp 的
+//   ambience 一节）也用同一支函数核对，所以"文档里的数"与"屏幕上的像素"
+//   不可能各说一套。它不碰任何 D2D 状态，可以被离线链接。
+float InnerGlowAlphaAt(float xDip, float yDip) {
+    // 到面板圆角矩形轮廓的距离（> 0 = 面板外）。与设计阶段的 Python 证据图、
+    // 与 "E 蒙光.md" §2 的距离场定义完全相同。
+    const float cx = kMarginDip + kEntityWidthDip * 0.5f;
+    const float cy = kMarginDip + kEntityHeightDip * 0.5f;
+    const float hw = kEntityWidthDip * 0.5f - kCornerRadiusDip;
+    const float hh = kEntityHeightDip * 0.5f - kCornerRadiusDip;
+    const float dx = std::fabs(xDip - cx) - hw;
+    const float dy = std::fabs(yDip - cy) - hh;
+    const float ax = (dx > 0.0f) ? dx : 0.0f;
+    const float ay = (dy > 0.0f) ? dy : 0.0f;
+    const float outside = std::sqrt(ax * ax + ay * ay) +
+                          ((dx > dy) ? dy : dx) - kCornerRadiusDip;
+    if (outside > 0.0f) return 0.0f;            // 面板外一律 0：本层是**内**蒙光
+    const float inside = -outside;
+
+    float a = kGlowInFloorAlpha;                // 整板底噪：处处 0.025
+    if (inside < kGlowInLipDip) {               // 内唇：贴边 5 DIP，二次衰减
+        const float t = 1.0f - inside / kGlowInLipDip;
+        a += kGlowInLipAlpha * t * t;
+    }
+    const float fromBottom = (kMarginDip + kEntityHeightDip) - yDip;
+    if (fromBottom >= 0.0f && fromBottom < kGlowInVertDip) {   // 底部透光：17 DIP
+        const float t = 1.0f - fromBottom / kGlowInVertDip;
+        a += kGlowInVertAlpha * t * t;
+    }
+    return a;
+}
+
+// 烘一次：整张画布大小的 8 位单通道遮罩的**像素**（CPU 侧的真值）。
+// ★ 逐像素求距离（每像素 4 个固定网格子采样做抗锯齿），**不做整幅降采样** ——
+//   5 DIP 的内唇太薄，降采样会把峰值抹掉两成（设计阶段量过）。
+// ★ 屏幕路径与导帧路径**共用这一份像素**：两条路各建一次位图对象，但数值来源
+//   只有这一个函数，所以"导出的 PNG"与"屏幕上的画面"不可能对不上。
+std::vector<uint8_t> InnerGlowMaskPixels(const CanvasSize& canvas) {
+    const UINT w = static_cast<UINT>(canvas.widthPx);
+    const UINT h = static_cast<UINT>(canvas.heightPx);
+    std::vector<uint8_t> pixels(static_cast<std::size_t>(w) * h, 0);
+    if (w == 0 || h == 0) return pixels;
+    const float invScale = (canvas.scale > 0.0f) ? (1.0f / canvas.scale) : 1.0f;
+    for (UINT y = 0; y < h; ++y) {
+        for (UINT x = 0; x < w; ++x) {
+            // 4 个子采样用固定网格（0.25 / 0.75），所以每个都严格落在本像素内 ——
+            // 不会借到邻居的像素（那会让整个剖面偏半个像素）。
+            float sum = 0.0f;
+            for (int sy = 0; sy < 2; ++sy) {
+                for (int sx = 0; sx < 2; ++sx) {
+                    const float px = (static_cast<float>(x) + 0.25f + 0.5f * sx) * invScale;
+                    const float py = (static_cast<float>(y) + 0.25f + 0.5f * sy) * invScale;
+                    sum += InnerGlowAlphaAt(px, py);
+                }
+            }
+            const float a = sum * 0.25f;
+            pixels[static_cast<std::size_t>(y) * w + x] = static_cast<uint8_t>(
+                a <= 0.0f ? 0 : (a >= 1.0f ? 255 : static_cast<int>(a * 255.0f + 0.5f)));
+        }
+    }
+    return pixels;
+}
+
+// 把上面那份像素变成一张位图。
+// ★ 格式必须和**这台渲染目标自己的**格式一致：FillOpacityMask 的遮罩位图与目标
+//   格式不一致时 EndDraw 直接报 D2DERR_WRONG_STATE(0x88990001)，整帧被丢掉
+//   —— 这一条是**量出来的**，不是推的：glowprobe 在软件 WIC 目标上试过 A8 / R8 /
+//   BGRA(只写 alpha) 三种，FillOpacityMask 之后 EndDraw 全部 FAIL。
+//   所以这里按目标的实际格式建：BGRA 目标就建 BGRA（覆盖率同时写进 B、G、R、A ——
+//   预乘口径下白色 + alpha 的四个通道本来就该相等），单通道目标就直接给单通道。
+ID2D1Bitmap* InnerGlowMaskBitmap(ID2D1RenderTarget* rt, const CanvasSize& canvas,
+                                 const std::vector<uint8_t>& pixels) {
+    if (!rt || pixels.empty()) return nullptr;
+    const UINT w = static_cast<UINT>(canvas.widthPx);
+    const UINT h = static_cast<UINT>(canvas.heightPx);
+    const D2D1_PIXEL_FORMAT target = rt->GetPixelFormat();
+    const bool targetIsBgra = (target.format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                               target.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+    const bool targetIsSingle =
+        (target.format == DXGI_FORMAT_A8_UNORM || target.format == DXGI_FORMAT_R8_UNORM);
+
+    if (targetIsBgra) {
+        std::vector<uint8_t> bgra(static_cast<std::size_t>(w) * h * 4, 0);
+        for (std::size_t i = 0; i < pixels.size(); ++i) {
+            const uint8_t a = pixels[i];
+            bgra[i * 4 + 0] = a;   // B
+            bgra[i * 4 + 1] = a;   // G
+            bgra[i * 4 + 2] = a;   // R
+            bgra[i * 4 + 3] = a;   // A
+        }
+        const D2D1_BITMAP_PROPERTIES props =
+            D2D1::BitmapProperties(D2D1::PixelFormat(target.format, target.alphaMode));
+        ID2D1Bitmap* made = nullptr;
+        if (SUCCEEDED(rt->CreateBitmap(D2D1::SizeU(w, h), bgra.data(), static_cast<UINT32>(w) * 4,
+                                       &props, &made)) &&
+            made) {
+            return made;
+        }
+        return nullptr;
+    }
+    if (targetIsSingle) {
+        const D2D1_BITMAP_PROPERTIES props =
+            D2D1::BitmapProperties(D2D1::PixelFormat(target.format, target.alphaMode));
+        ID2D1Bitmap* made = nullptr;
+        std::vector<uint8_t> copy(pixels);
+        if (SUCCEEDED(rt->CreateBitmap(D2D1::SizeU(w, h), copy.data(), static_cast<UINT32>(w),
+                                       &props, &made)) &&
+            made) {
+            return made;
+        }
+    }
+    return nullptr;   // 既不是 BGRA 也不是单通道：这一帧不画蒙光，其余照常
+}
+
+// 内蒙光的覆盖率遮罩、彩色层与绘制 —— 定义见文件开头的声明区。
+// （GlowCache 的定义必须在匿名 namespace **之外**：它的成员函数要用匿名 namespace
+//  里的烘焙函数，而那些函数在文件后面才定义，所以前面只留前置声明。）
+inline ID2D1Bitmap* GlowCache::Pick(ID2D1RenderTarget* rt, const CanvasSize& canvas,
+                                    const WidgetFrame& f, bool isExport) {
+    g_glowBake.frames += 1;   // 记账：Pick 每帧被调一次 = 这一帧画了蒙光
+    if (!rt) return nullptr;
+    EnsureCoverage(canvas);
+    Forget(isExport);
+    const float k = (f.ambientIntensity < 0.0f)
+                        ? 0.0f
+                        : ((f.ambientIntensity > 1.0f) ? 1.0f : f.ambientIntensity);
+    if (k <= 0.0f) return nullptr;   // 这一帧不画蒙光
+    // 量化到 4/255：颜色稳下来之后就不再重烘。
+    // ★ 为什么不是 1/255：量出来的（.dsh\scratch\amb\glowbake.cpp，逐帧重放一次
+    //   10 秒滑行）：1/255 会重烘 **280 次**、单次最坏 3.2 ms（≈ 一帧的 19%），
+    //   累计 0.43 s；放到 4/255 只重烘 **88 次**、累计 0.14 s，而 4/255 的色阶差
+    //   在近黑面板上完全看不出来（每通道 ≤ 4，且它本身还在被缓动）。放到 8/255
+    //   是 46 次 / 0.07 s —— 那是给"真机上仍嫌重"留的下一档。
+    // ★ 为什么不能像原计划那样"烘一张中性遮罩 + 每帧用画笔乘"：那条路要
+    //   ID2D1DeviceContext::DrawBitmap(bitmap, ..., brush)，而导帧走的是
+    //   ID2D1RenderTarget（WIC 软件目标），**它根本没有带画笔的那个重载**
+    //   （编译期就报 C2661）。用了它，导出的 PNG 里就没有蒙光 —— 而导帧是本项目
+    //   唯一的验证手段。见 renderer.h 里 InnerGlowBakeCounters 的说明。
+    const float q = 4.0f / 255.0f;
+    const bool same = hasTint && lastWasExport == isExport &&
+                      std::fabs(f.ambientColor.r - lastR) < q &&
+                      std::fabs(f.ambientColor.g - lastG) < q &&
+                      std::fabs(f.ambientColor.b - lastB) < q && std::fabs(k - lastK) < q;
+    if (same) return tinted;
+
+    LARGE_INTEGER bt0{}, bt1{}, bfreq{};
+    QueryPerformanceFrequency(&bfreq);
+    QueryPerformanceCounter(&bt0);
+    ID2D1Bitmap* made =
+        BakeTintedGlow(rt, canvas, coverage,
+                       D2D1::ColorF(f.ambientColor.r, f.ambientColor.g, f.ambientColor.b, 1.0f), k);
+    QueryPerformanceCounter(&bt1);
+    {
+        const double ms = static_cast<double>(bt1.QuadPart - bt0.QuadPart) * 1000.0 /
+                          static_cast<double>(bfreq.QuadPart);
+        g_glowBake.tintBakes += 1;
+        g_glowBake.tintTotalMs += ms;
+        if (ms > g_glowBake.tintWorstMs) g_glowBake.tintWorstMs = ms;
+    }
+    if (!made) return tinted;        // 重烘失败：沿用上一张，画面最多颜色旧一帧
+    if (tinted) tinted->Release();
+    tinted = made;
+    hasTint = true;
+    everBuilt = true;
+    lastWasExport = isExport;
+    lastR = f.ambientColor.r;
+    lastG = f.ambientColor.g;
+    lastB = f.ambientColor.b;
+    lastK = k;
+    return tinted;
+}
+
+// 把"遮罩覆盖率 × 当前颜色 × 当前强度"烘成一张预乘 ARGB 位图。
+// ★ 为什么不是"烘覆盖率 + 每帧 FillOpacityMask"（设计阶段的方案）：
+//   量出来的事实是 **FillOpacityMask 在软件（WIC）渲染目标上根本不能用**
+//   —— 不论遮罩是 A8 / R8 / BGRA、不论内容模式是 GRAPHICS 还是 TEXT_NATURAL、
+//   不论画笔是 solid 还是 bitmap，EndDraw 一律 D2DERR_WRONG_STATE(0x88990001)，
+//   整帧被丢弃。而导帧走的正是软件目标，导帧又是本项目唯一的验证手段。
+//   对照组：DrawBitmap 在同一个目标上成功（见 .dsh\scratch\amb\glowprobe.cpp）。
+//   所以改成"预乘彩色层 + 每帧一次 DrawBitmap"：**两个渲染目标上都成立**，
+//   而且屏幕与导帧走同一条代码路径（这才有"导出的 PNG 就是屏幕"这句话）。
+//
+// ★ 重烘的时机：颜色或强度每通道变化 ≥ 1/255 时。颜色是逐通道缓动的连续量，
+//   它稳定下来之后就不再重烘；缓动期间最多几十次。137k 像素的乘法在 CPU 上
+//   是亚毫秒级，所以这个代价远小于"每帧用失效的 API 丢弃整帧"。
+ID2D1Bitmap* BakeTintedGlow(ID2D1RenderTarget* rt, const CanvasSize& canvas,
+                            const std::vector<uint8_t>& coverage, const D2D1_COLOR_F& colour,
+                            float intensity) {
+    if (!rt || coverage.empty()) return nullptr;
+    const UINT w = static_cast<UINT>(canvas.widthPx);
+    const UINT h = static_cast<UINT>(canvas.heightPx);
+    const D2D1_PIXEL_FORMAT target = rt->GetPixelFormat();
+    // 只支持 32bpp 目标：蒙光是"一条预乘彩色层"，单通道目标上没有意义。
+    if (target.format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+        target.format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+        return nullptr;
+    }
+    const float k = (intensity < 0.0f) ? 0.0f : ((intensity > 1.0f) ? 1.0f : intensity);
+    const float alphaOf = k;
+    const float r = colour.r * alphaOf;
+    const float g = colour.g * alphaOf;
+    const float b = colour.b * alphaOf;
+
+    std::vector<uint8_t> bgra(static_cast<std::size_t>(w) * h * 4, 0);
+    for (std::size_t i = 0; i < coverage.size(); ++i) {
+        // 预乘：RGB = 颜色 × 覆盖率 × k，A = 覆盖率 × k。
+        const float a = static_cast<float>(coverage[i]) / 255.0f;
+        const float pa = a * alphaOf;
+        bgra[i * 4 + 0] = static_cast<uint8_t>(b * a * 255.0f + 0.5f);
+        bgra[i * 4 + 1] = static_cast<uint8_t>(g * a * 255.0f + 0.5f);
+        bgra[i * 4 + 2] = static_cast<uint8_t>(r * a * 255.0f + 0.5f);
+        bgra[i * 4 + 3] = static_cast<uint8_t>(pa * 255.0f + 0.5f);
+    }
+    const D2D1_BITMAP_PROPERTIES props =
+        D2D1::BitmapProperties(D2D1::PixelFormat(target.format, target.alphaMode));
+    ID2D1Bitmap* made = nullptr;
+    if (SUCCEEDED(rt->CreateBitmap(D2D1::SizeU(w, h), bgra.data(), static_cast<UINT32>(w) * 4,
+                                   &props, &made)) &&
+        made) {
+        return made;
+    }
+    return nullptr;
+}
+
+// 每帧一次：把烘好的彩色层贴上去（一次 DrawBitmap，不需要画笔）。// ★ 不逐帧模糊、不用 effect graph、不逐帧建几何；重烘只在颜色真的变了时发生。
+void PaintInnerGlow(ID2D1RenderTarget* rt, const WidgetFrame& f, ID2D1Bitmap* tinted) {
+    if (!tinted) return;
+    if (!(f.ambientIntensity > 0.0f)) return;   // k = 0：这一帧不画（关掉蒙光的那一帧）
+    const D2D1_SIZE_F size = tinted->GetSize();
+    const D2D1_RECT_F dest = D2D1::RectF(0.0f, 0.0f, size.width, size.height);
+    rt->DrawBitmap(tinted, &dest, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+}
+
+const InnerGlowBakeCounters& InnerGlowBakeStats() { return g_glowBake; }
+
+// ---------------------------------------------------------------------------
+// 探针出口（.dsh/scratch/amb/glowbake.cpp）：只是把内部实现原样转出来
+// ---------------------------------------------------------------------------
+//  生产中没有任何调用点。它存在的唯一理由是：重烘代价只能靠"逐帧重放一次真实滑行"
+//  量出来，而挂件一次导帧只画一帧。
+int g_glowTintBakedOnLastPick = 0;
+bool GlowTintBakedOnLastPick() { return g_glowTintBakedOnLastPick != 0; }
+
+struct GlowCacheForProbe::Impl {
+    GlowCache cache;
+};
+
+GlowCacheForProbe::GlowCacheForProbe() : impl_(new Impl()) {}
+GlowCacheForProbe::~GlowCacheForProbe() {
+    if (impl_) {
+        impl_->cache.Release();
+        delete impl_;
+        impl_ = nullptr;
+    }
+}
+
+void GlowCacheForProbe::EnsureCoverage(const CanvasSize& canvas) {
+    if (impl_) impl_->cache.EnsureCoverage(canvas);
+}
+
+void GlowCacheForProbe::Pick(ID2D1RenderTarget* rt, const CanvasSize& canvas,
+                             const WidgetFrame& frame, bool isExport) {
+    if (!impl_) return;
+    const int before = g_glowBake.tintBakes;
+    impl_->cache.Pick(rt, canvas, frame, isExport);
+    g_glowTintBakedOnLastPick = (g_glowBake.tintBakes != before) ? 1 : 0;
+}
+
+int GlowCacheForProbe::tintBakesThisCall() const { return g_glowTintBakedOnLastPick; }
+
+AmbienceColor AmbienceTargetColorForProbe(double ratio, double depth) {
+    return AmbienceTargetColor(ratio, depth);
+}
+
+float GlowIntensityForProbe(double ratio, double depth) {
+    return static_cast<float>((kGlowInK0 + kGlowInK1 * ratio) * (1.0 - kGlowInD * depth));
+}
 struct Renderer::Impl {
     ID3D11Device* device = nullptr;
     IDXGIDevice* dxgiDevice = nullptr;
@@ -887,8 +1315,11 @@ struct Renderer::Impl {
     IDCompositionDevice* compDevice = nullptr;
     IDCompositionTarget* compTarget = nullptr;
     IDCompositionVisual* compVisual = nullptr;
-
+    // ★ 内蒙光的缓存：覆盖率烘一次（与颜色无关），彩色层只在颜色/强度真的变了时重烘。
+    //   换渲染目标（屏幕 <-> 导帧）时只重建位图，覆盖率数值不用重算。
+    GlowCache glow;
     void ReleaseAll() {
+        glow.Release();
         if (target) { target->Release(); target = nullptr; }
         if (dc) { dc->Release(); dc = nullptr; }
         if (d2dDevice) { d2dDevice->Release(); d2dDevice = nullptr; }
@@ -982,6 +1413,23 @@ bool Renderer::Create(HWND hwnd, const CanvasSize& size) {
     if (FAILED(hrBitmap)) return false;
     d.dc->SetTarget(d.target);
 
+    // ---- 内蒙光的覆盖率遮罩：启动烘一次（"E 施工单.md" 甲.4）----
+    // 烘失败不是致命错误：没有遮罩 = 这一层不画（面板保持原样），其余一切照常。
+    // 宁可少一层氛围，也不要因为装饰让整块面板起不来。
+    // ★ 只烘**覆盖率**（与颜色无关）：彩色层在每帧的 Pick() 里按需重烘。
+    //   覆盖率是 137,375 个像素各算一次距离场，只在**启动时**做一次；把它计时记下来
+    //   （"廉价"这句话要有凭据，不能靠感觉）。
+    {
+        LARGE_INTEGER t0{}, t1{}, freq{};
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&t0);
+        d.glow.EnsureCoverage(size_);
+        QueryPerformanceCounter(&t1);
+        g_glowBake.coverageBakes = 1;
+        g_glowBake.coverageWorstMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
+                                     static_cast<double>(freq.QuadPart);
+    }
+
     // ---- DirectComposition锛氭妸浜ゆ崲閾炬寕鍒扮獥鍙ｄ笂 ----
     if (FAILED(DCompositionCreateDevice(d.dxgiDevice, __uuidof(IDCompositionDevice),
                                         reinterpret_cast<void**>(&d.compDevice)))) {
@@ -1070,7 +1518,8 @@ HRESULT Renderer::RenderFrame(double elapsedSeconds) {
     // 娉ㄦ剰锛欵ndDraw 鏄敮涓€浼氭姤閿欑殑涓€姝ワ紱BeginDraw 杩斿洖 void銆?
     // 杩欓噷鑷繁 BeginDraw/EndDraw锛岀敾鍐呭鐨勫嚱鏁颁笉瑕佸啀鍚勮皟涓€娆★紙A0 鐨勫潙锛夈€?
     d.dc->BeginDraw();
-    PaintScene(d.dc, size_, elapsedSeconds, ActivationFlash(elapsedSeconds), debugText_);
+    PaintScene(d.dc, size_, elapsedSeconds, ActivationFlash(elapsedSeconds), debugText_,
+               &d.glow, /*isExport=*/false);
     const HRESULT hrEnd = d.dc->EndDraw();
     if (FAILED(hrEnd)) {
         // A0 鐨勬暀璁細杩欓噷澶辫触鏃?Present 浠嶄細杩斿洖 S_OK锛岀敾闈笂鍗翠粈涔堥兘娌℃湁锛?
@@ -1081,8 +1530,11 @@ HRESULT Renderer::RenderFrame(double elapsedSeconds) {
 }
 
 SymbolRect CurrencySymbolRect() {
+    // ★ 命中框必须跟着心跳位移走，否则点击差 g_lastBeatDyPx 像素（币种符号命中、拖动判定都靠它）。
+    //   数值直接取本帧绘制时用的那一个，不重算、不猜。
     SymbolRect r{};
-    r.l = g_symbolL; r.t = g_symbolT; r.r = g_symbolR; r.b = g_symbolB;
+    r.l = g_symbolL; r.t = g_symbolT + g_lastBeatDyPx;
+    r.r = g_symbolR; r.b = g_symbolB + g_lastBeatDyPx;
     r.valid = g_symbolValid;
     return r;
 }
@@ -1114,8 +1566,13 @@ bool Renderer::ExportFrame(const wchar_t* path, double elapsedSeconds) {
         if (FAILED(d.d2dFactory->CreateWicBitmapRenderTarget(bitmap, props, &rt)) || !rt) break;
 
         // 鍚屼竴浠界粯鍒朵唬鐮侊紝鍙槸鐢诲埌绂诲睆浣嶅浘涓婏細灞忓箷涓婄殑閿欏湪杩欓噷涔熶細閿?
+        // ★ 内蒙光的遮罩要用**这个渲染目标自己的**位图：glowPixels 是同一份数值，
+        //   但 GPU 位图不能被软件（WIC）渲染目标采样。少了这一步，导出的 PNG 里
+        //   就没有蒙光 —— 而验收正是拿导出的 PNG 量的。
         rt->BeginDraw();
-        PaintScene(rt, size_, elapsedSeconds, 0.0, debugText_);
+        // ★ 同一个 GlowCache，但 isExport = true：彩色层必须用**这个**软件渲染目标
+        //   自己的位图（位图归属创建它的目标），覆盖率数值则复用同一份。
+        PaintScene(rt, size_, elapsedSeconds, 0.0, debugText_, &d.glow, /*isExport=*/true);
         if (FAILED(rt->EndDraw())) break;
 
         IWICBitmapEncoder* encoder = nullptr;

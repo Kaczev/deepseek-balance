@@ -965,6 +965,125 @@ void RunChecks(Harness* h, const ProbeDir& probe, bool verbose) {
 }
 
 // ---------------------------------------------------------------------------
+// E: the per-point ambience colour ("E 蒙光.md" §3.1, "E 施工单.md" 甲.6)
+// ---------------------------------------------------------------------------
+//  What has to hold, and why each one is here:
+//   1) a NEW point records the colour it was appended with, and it survives a save+load;
+//   2) a LEGACY file (no "color" member at all) loads, and its points report "no colour"
+//      -- not a guessed one;
+//   3) saving a legacy file back does NOT invent a colour member, so the round trip is
+//      byte-identical (the owner's own history must not grow fields nobody measured);
+//   4) a malformed colour is dropped (point keeps loading) rather than failing the load,
+//      because the colour is decoration and the money data is not;
+//   5) the two-argument Append() (used by probes and by any caller with no colour)
+//      stores no colour, so nothing silently gains one.
+void RunColourChecks(Harness* h, const ProbeDir& probe) {
+    const std::string path = PathOf(probe, "colour.json");
+
+    // --- 1) new points carry their colour, and it round-trips ---
+    {
+        RemoveFile(path);
+        CurveStore store;
+        store.Load(path);
+        const std::string colours[3] = {"#6c89f6", "#f6aa6c", "#f66c6c"};
+        // Timestamps are anchored to NOW (kAnchor), not to a fixed epoch second: the
+        // store discards points older than 86400 s on load, so a fixture stamped in the
+        // past would reload EMPTY and this check would be about staleness, not colour.
+        int64_t now = kAnchor;
+        for (int i = 0; i < 3; ++i) {
+            store.Append(Cny(std::string(1, static_cast<char>('1' + i)) + ".00"), now, colours[i]);
+            now += 10;
+        }
+        store.Save(path);
+        CurveLoadResult reload{};
+        const std::vector<CurveStorePoint> points = Reload(path, &reload);
+        std::string got;
+        for (const CurveStorePoint& point : points) {
+            got += point.color.empty() ? "(none)" : point.color;
+            got += " ";
+        }
+        h->Req("colour:record", "new points record the colour they were appended with",
+               "loaded=" + Num(points.size()) + " colours=[" + got + "]",
+               reload.ok && points.size() == 3 && points[0].color == "#6c89f6" &&
+                   points[1].color == "#f6aa6c" && points[2].color == "#f66c6c");
+    }
+
+    // --- 2) + 3) a legacy file loads, and is written back byte-identically ---
+    {
+        char stamp[32];
+        std::snprintf(stamp, sizeof(stamp), "%lld", static_cast<long long>(kAnchor));
+        const std::string legacy =
+            std::string("{\n  \"update_at\": ") + stamp + ",\n  \"points\": [\n" +
+            "    { \"CNY\": \"18.80\", \"at\": " + stamp + " },\n"
+            "    { \"CNY\": \"18.70\", \"at\": " + stamp + " }\n  ]\n}\n";
+        WriteBytes(path, legacy);
+        CurveLoadResult reload{};
+        const std::vector<CurveStorePoint> points = Reload(path, &reload);
+        bool allNoColour = !points.empty();
+        for (const CurveStorePoint& point : points) {
+            if (!point.color.empty()) allNoColour = false;
+        }
+        h->Req("colour:legacy-load", "a file with no colour member loads, points report no colour",
+               "loaded=" + Num(points.size()) + " ok=" + std::string(reload.ok ? "yes" : "no") +
+                   " allNoColour=" + std::string(allNoColour ? "yes" : "NO"),
+               reload.ok && points.size() == 2 && allNoColour);
+
+        // Save it back and compare BYTES: no invented colour member.
+        CurveStore reopened;
+        reopened.Load(path);
+        reopened.Save(path);
+        bool readOk = false;
+        const std::string after = ReadBytes(path, &readOk);
+        h->Req("colour:legacy-save", "saving a legacy file back leaves it byte-identical",
+               "in=" + Num(legacy.size()) + "B out=" + Num(after.size()) + "B identical=" +
+                   std::string(after == legacy ? "yes" : "NO"),
+               readOk && after == legacy);
+    }
+
+    // --- 4) a malformed colour is dropped, the point still loads ---
+    {
+        char stamp[32];
+        std::snprintf(stamp, sizeof(stamp), "%lld", static_cast<long long>(kAnchor));
+        const std::string broken =
+            std::string("{\n  \"update_at\": ") + stamp + ",\n  \"points\": [\n" +
+            "    { \"CNY\": \"18.80\", \"at\": " + stamp + ", \"color\": \"nonsense\" },\n"
+            "    { \"CNY\": \"18.70\", \"at\": " + stamp + ", \"color\": \"#GGGGGG\" },\n"
+            "    { \"CNY\": \"18.60\", \"at\": " + stamp + ", \"color\": \"#f6aa6c\" }\n  ]\n}\n";
+        WriteBytes(path, broken);
+        CurveLoadResult reload{};
+        const std::vector<CurveStorePoint> points = Reload(path, &reload);
+        const bool ok = reload.ok && points.size() == 3 && points[0].color.empty() &&
+                        points[1].color.empty() && points[2].color == "#f6aa6c";
+        h->Req("colour:malformed", "a malformed colour is dropped; the point and the load survive",
+               "loaded=" + Num(points.size()) + " ok=" + std::string(reload.ok ? "yes" : "no") +
+                   " colours=[" + (points.size() > 0 ? points[0].color : std::string("-")) + "," +
+                   (points.size() > 1 ? points[1].color : std::string("-")) + "," +
+                   (points.size() > 2 ? points[2].color : std::string("-")) + "]",
+               ok);
+    }
+
+    // --- 5) the two-argument Append stores no colour ---
+    {
+        RemoveFile(path);
+        CurveStore store;
+        store.Load(path);
+        store.Append(Cny("18.80"), kAnchor);                 // no colour argument
+        store.Append(Cny("18.70"), kAnchor + 10, "#f66c6c"); // with one
+        store.Save(path);
+        CurveLoadResult reload{};
+        const std::vector<CurveStorePoint> points = Reload(path, &reload);
+        const bool ok = reload.ok && points.size() == 2 && points[0].color.empty() &&
+                        points[1].color == "#f66c6c";
+        h->Req("colour:optional", "Append without a colour stores none; with one stores it",
+               "colours=[" + (points.size() > 0 ? points[0].color : std::string("-")) + "," +
+                   (points.size() > 1 ? points[1].color : std::string("-")) + "]",
+               ok);
+    }
+
+    RemoveFile(path);
+}
+
+// ---------------------------------------------------------------------------
 // The harness must be able to fail, or every PASS above is worthless
 // ---------------------------------------------------------------------------
 void RunHarnessSelfCheck(Harness* h) {
@@ -1013,6 +1132,7 @@ int main(int argc, char** argv) {
     try {
         RunHarnessSelfCheck(&h);
         RunChecks(&h, probe, verbose);
+        RunColourChecks(&h, probe);   // E: the per-point ambience colour schema
     } catch (const std::exception& e) {
         std::printf("FAIL: runner | an exception escaped a check: %s\n", e.what());
         ++h.failed;

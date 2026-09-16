@@ -187,6 +187,16 @@ std::string Serialize(int64_t updateAt, bool updateAtValid, const std::vector<Cu
         } else {
             out += "\"at\": null";
         }
+        // ★ The ambience colour of that instant. Written ONLY when the point actually
+        //   carries one: a point loaded from a pre-colour file must come back out of
+        //   Save() byte-identical, and a caller that recorded no colour never gets one
+        //   invented for it. The member name is "color" (American) to match the JSON
+        //   the rest of the file already speaks ("update_at", "points").
+        if (!points[i].color.empty()) {
+            out += ", ";
+            out += "\"color\": ";
+            AppendJsonString(out, points[i].color);
+        }
         if (!points[i].entries.empty()) out += " ";
         out += "}";
     }
@@ -196,11 +206,22 @@ std::string Serialize(int64_t updateAt, bool updateAtValid, const std::vector<Cu
 
 // --- JSON reading ------------------------------------------------------------
 
+// True for exactly "#rrggbb" (lower or upper case hex). This is the only shape the
+// writer ever emits, so anything else is treated as "no colour" rather than guessed at.
+bool IsHexColor(const std::string& text) {
+    if (text.size() != 7 || text[0] != '#') return false;
+    for (std::size_t i = 1; i < text.size(); ++i) {
+        const char c = text[i];
+        const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!hex) return false;
+    }
+    return true;
+}
+
 // Converts a verbatim JSON number token into whole seconds.
 // Rejects anything that is not a plain integer in range, so "1789537189.5" or "1e3"
 // can never be silently turned into a timestamp pointing at the wrong time.
-bool ParseWholeSeconds(const std::string& text, int64_t* out) {
-    if (text.empty() || text.size() > 19) return false;
+bool ParseWholeSeconds(const std::string& text, int64_t* out) {    if (text.empty() || text.size() > 19) return false;
     std::size_t i = 0;
     bool negative = false;
     if (text[0] == '-') {
@@ -318,6 +339,21 @@ CurveLoadResult CurveStore::Load(const std::string& path) {
                         ok = false;
                         problem = "a point has an empty currency name";
                         break;
+                    }
+                    // ★ The ambience colour ("E 蒙光.md" §3.1). It is a plain "#rrggbb"
+                    //   string. A point that carries none -- an older file, or one that
+                    //   simply never had a colour -- loads with an EMPTY colour and is
+                    //   then drawn with the current colour (the display layer's choice,
+                    //   see CurvePoint::hasColor). A malformed colour is NOT a load
+                    //   failure: the colour is decoration, and throwing away the whole
+                    //   curve because one hex digit is wrong would lose real money data.
+                    //   It is dropped instead (left empty = "no colour"), which is the
+                    //   same state an older file loads in.
+                    if (member.first == "color") {
+                        if (member.second.IsString() && IsHexColor(member.second.text)) {
+                            point.color = member.second.text;
+                        }
+                        continue;
                     }
                     if (member.second.IsNull()) {
                         // §2.4: "a currency may be absent from that response".
@@ -488,7 +524,8 @@ bool CurveStore::Expired(int64_t nowSeconds) const {
     return nowSeconds - updateAt_ > kExpirySeconds;
 }
 
-bool CurveStore::Append(const CurveObservation& obs, int64_t nowSeconds) {
+bool CurveStore::Append(const CurveObservation& obs, int64_t nowSeconds,
+                        const std::string& colorHex) {
     if (nowSeconds <= 0) return false;   // no trustworthy clock -> never invent a timestamp
 
     // Reset the diagnostic first; it is set again below when this call discards points.
@@ -562,6 +599,10 @@ bool CurveStore::Append(const CurveObservation& obs, int64_t nowSeconds) {
     // top of this function returns before reaching this line when it is not.
     point.at = nowSeconds;
     point.atValid = true;
+    // ★ The ambience colour of this instant ("E 蒙光.md" §3.1). Only a well-formed
+    //   "#rrggbb" is recorded; anything else is stored as "no colour" rather than
+    //   written into the file and then refused by the reader (one shape, one meaning).
+    if (IsHexColor(colorHex)) point.color = colorHex;
     for (const CurveObservation::Item& item : obs.observations) {
         if (item.currency.empty()) continue;   // a nameless entry cannot be written down
         point.entries.push_back(CurveStorePoint::Entry{

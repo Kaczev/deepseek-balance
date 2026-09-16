@@ -87,6 +87,10 @@ int g_pressX = 0, g_pressY = 0;
 unsigned long long g_pressTick = 0;
 bool g_pressValid = false;
 bool g_currenciesGiven = false;   // --currencies=：合成一条多币种样本（验证切换用）
+bool g_curveStoreGiven = false; // --curve-store=：把曲线记录文件改到别处（测试专用，绝不碰真实数据）
+std::wstring g_curveStorePath;
+bool g_logGlowStats = false;    // TEMPORARY (task 2): --log-glow-stats
+int g_ambienceGlide = 0;        // TEMPORARY (task 2): --ambience-glide=N
 std::string g_currenciesSpec;   // 形如 "CNY:19.20,USD:2.70"
 bool g_realApiPlanned = false;  // 进循环之前就定下"本次要不要用真接口"
 
@@ -101,6 +105,7 @@ bool g_pauseTest = false;
 bool g_noCurve = false;           // --no-curve：关掉氛围曲线（A/B 对比用）
 int  g_historyDemo = 0;           // --history-demo=N：合成 N 个曲线点（导帧验证用）
 int  g_curveFrame = -1;           // --curve-frame=k：把滚动计时器冻在第 k 帧（-1 = 未给）
+int  g_beatFrame = -1;            // --beat-frame=k：把心跳仿真时刻放到 k/60 秒（-1 = 未给）
          // --pause-test：注入"锁屏/解锁"，验证 J4（不用真锁屏）
 double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
 double g_displayAmount = 0.0;   // 已弃用（所有者改为 --last）
@@ -520,6 +525,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // 导帧夹具（规格 §5 验收 4）：把曲线滚动计时器冻在 k/60 秒，于是
             // "滚动中的第 k 帧"可以用 --export-frame=1 直接导出来（不需要连画 k 帧）。
             g_curveFrame = _wtoi(argv[i] + 14);
+        } else if (wcsncmp(argv[i], L"--beat-frame=", 13) == 0) {
+            // 导帧夹具：心跳位移是 (仿真时间, 变化历史) 的纯函数，把时间放到 k/60 秒，
+            // "第 k 帧的位移"就能单独导出（不必连跑 k 帧）——与 --curve-frame 同一套惯例。
+            g_beatFrame = _wtoi(argv[i] + 13);
         } else if (wcsncmp(argv[i], L"--history-demo=", 15) == 0) {
             g_historyDemo = _wtoi(argv[i] + 15);
         } else if (wcscmp(argv[i], L"--curve-selftest") == 0) {
@@ -605,7 +614,37 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             }
         } else if (wcsncmp(argv[i], L"--speed=", 8) == 0) {
             g_fake.SetSpeed(_wtof(argv[i] + 8));
-        } else if (wcsncmp(argv[i], L"--dpi=", 6) == 0) {
+        } else if (wcsncmp(argv[i], L"--curve-store=", 14) == 0) {
+                g_curveStorePath = argv[i] + 14;
+                g_curveStoreGiven = true;
+        // ===== TEMPORARY LOCAL WIRING (ambience-build, to be handed to the main agent) =====
+        } else if (wcsncmp(argv[i], L"--ambience=", 11) == 0) {
+            char amb[64] = {0};
+            WideCharToMultiByte(CP_UTF8, 0, argv[i] + 11, -1, amb, sizeof(amb), nullptr, nullptr);
+            if (!dshb::SetAmbienceGiven(amb)) {
+                SelfTestLog(L"[argv] --ambience 参数无法解析（要 R,D）：%ls", argv[i] + 11);
+            } else {
+                SelfTestLog(L"[argv] --ambience=%ls（测试夹具：这一帧的氛围钉在给定的 R,D）",
+                            argv[i] + 11);
+            }
+        } else if (wcscmp(argv[i], L"--no-text") == 0) {
+            dshb::SetTextEnabled(false);
+            SelfTestLog(L"[argv] --no-text：正文一层不画（量底色用）");
+        } else if (wcscmp(argv[i], L"--pause-ambience") == 0) {
+            dshb::SetAmbienceFrozen(true);
+            SelfTestLog(L"[argv] --pause-ambience：氛围冻结（暂停时颜色与光强一步都不推进）");
+        // ===== END TEMPORARY LOCAL WIRING =====
+        // ===== TEMPORARY: inner-glow re-bake accounting (task 2) =====
+        // ★ 必须挂在参数解析里（此刻还没画过帧，数字必然是 0）是错的 —— 所以这里
+        //   只置一个标志，真正的日志在导出/退出之前打。
+        } else if (wcscmp(argv[i], L"--log-glow-stats") == 0) {
+            g_logGlowStats = true;
+        } else if (wcsncmp(argv[i], L"--ambience-glide=", 17) == 0) {
+            g_ambienceGlide = _wtoi(argv[i] + 17);
+            SelfTestLog(L"[argv] --ambience-glide=%d（跑 %d 帧真实氛围推进，量重烘代价）",
+                        g_ambienceGlide, g_ambienceGlide);
+        // ===== END TEMPORARY: task 2 =====
+            } else if (wcsncmp(argv[i], L"--dpi=", 6) == 0) {
             g_dpiOverride = _wtoi(argv[i] + 6);
         } else if (wcsncmp(argv[i], L"--ui-scale=", 11) == 0) {
             g_uiScale = _wtof(argv[i] + 11);
@@ -855,6 +894,16 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             std::wstring curvePath = paths.dataDir;
             if (!curvePath.empty() && curvePath.back() != L'\\') curvePath += L'\\';
             curvePath += L"curve.json";
+            if (g_curveStoreGiven) curvePath = g_curveStorePath;   // 测试专用覆盖
+            // 安全阀：--history-demo 会把合成点经由 FeedCurve() 存盘，绝不能落在生产路径上
+            // （2026-09-17 事故：导出用的演示点覆盖了所有者的真实历史）
+            if (g_historyDemo > 0 && !g_curveStoreGiven) {
+                wchar_t tmpDir[MAX_PATH] = {};
+                if (::GetTempPathW(MAX_PATH, tmpDir) > 0) {
+                    curvePath = std::wstring(tmpDir) + L"dshb-demo-" +
+                                std::to_wstring(::GetCurrentProcessId()) + L".json";
+                }
+            }
             dshb::SetCurveStorePath(curvePath);
             SelfTestLog(L"[paths] 曲线=%ls", curvePath.c_str());
         }
@@ -954,6 +1003,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         dshb::SetCurveEnabled(!g_noCurve);
         if (g_symbolHoverTest) dshb::SetSymbolHover(true);   // --symbol-hover：导出对比用
         if (g_historyDemo > 0) dshb::PrimeHistoryForDemo(g_historyDemo);
+        // ===== TEMPORARY (task 2/3): run a real ambience glide before the frame ----
+        // 必须在这里（数据层已经喂好、绘制还没开始）：滑行推的就是"渲染前的那几帧"。
+        dshb::g_ambienceGlideTarget = &g_display;   // 显示层实例挂给滑行用（测试口子）
+        if (g_ambienceGlide > 0) dshb::RunAmbienceGlide(g_ambienceGlide);
+        // ===== END TEMPORARY =====
 
         // 让模拟数据源在"虚拟时间"里跑起来：否则导出的图没有数据，浮层也是空的。
         // 虚拟时间按 1/60 秒一步推进，所以导出是确定的、可重复的。
@@ -1089,7 +1143,14 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         //   那些虚拟时间循环（下面的 for / --roll 分支）每步都会 Update(1/60)，
         //   先冻结就会被它们推着走，导出来的就不是第 k 帧了。
         if (g_curveFrame >= 0) dshb::SetCurveScrollFrame(g_curveFrame);
+        // 心跳同理：必须在推进过计时器的循环之后再钉，否则会被那些循环推着走。
+        if (g_beatFrame >= 0) g_display.SetBeatSimFrame(g_beatFrame);
         g_display.Update(0.0);
+        if (g_beatFrame >= 0) {
+            SelfTestLog(L"[beat] frame=%d sim=%.4f dip=%.4f changes=%d",
+                        g_beatFrame, g_display.beatSimSeconds(), g_display.beatOffsetDip(),
+                        static_cast<int>(g_display.beatChangeCount()));
+        }
         // 组装正文（和真实运行时同一条路径），这样导出的图就是屏幕上会看到的图
         {
             const dshb::ConnState st = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
@@ -1143,6 +1204,15 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         SelfTestLog(L"[export] %ls 帧=%d 时刻=%.3fs 结果=%ls 画布=%dx%d",
                     g_exportPath, g_frameNo, t, ok ? L"成功" : L"失败",
                     size.widthPx, size.heightPx);
+        // ===== TEMPORARY: inner-glow re-bake accounting (task 2) =====
+        if (g_logGlowStats) {
+            const dshb::InnerGlowBakeCounters& g = dshb::InnerGlowBakeStats();
+            SelfTestLog(L"[glow] coverageBakes=%d coverageWorstMs=%.3f tintBakes=%d "
+                        L"tintWorstMs=%.3f tintTotalMs=%.3f frames=%d",
+                        g.coverageBakes, g.coverageWorstMs, g.tintBakes, g.tintWorstMs,
+                        g.tintTotalMs, g.frames);
+        }
+        // ===== END TEMPORARY: task 2 =====
         renderer.Destroy();
         g_renderer = nullptr;
     DestroyWindow(g_hwnd);

@@ -257,4 +257,83 @@ inline constexpr float kWarnG = 0.94f;
 inline constexpr float kWarnB = 0.60f;
 inline constexpr float kWarnAlpha = 0.95f;
 
+// ---------------------------------------------------------------------------
+// 5. 氛围：内蒙光 + 颜色管线（"E 蒙光.md" 第 1-10 章、"E 施工单.md" 甲）
+// ---------------------------------------------------------------------------
+//  这一段里每个数都是**外观**：所有者"看一眼觉得不对就改"的就是这里。
+//  改完重跑 build.bat 就生效（不要只改渲染代码里的字面量）。
+
+// ---- 5.1 三个颜色锚点（"E 重新设计.md" 第 9-11 行）----
+// 氛围初色 C_0：R=0 是"充足"的蓝，R=0.5 是橙，R=1 是血色。两段线性插值。
+// ★ 这是**氛围自己的**色标，与上面那个 kStatePrimary*（旧的"状态主色"）是两回事：
+//   后者已不参与面板底色，只留给演示用。不要把两者合并。
+inline constexpr float kAmbienceAnchor0R = 0x6c / 255.0f;   // R = 0.0  充足
+inline constexpr float kAmbienceAnchor0G = 0x89 / 255.0f;
+inline constexpr float kAmbienceAnchor0B = 0xf6 / 255.0f;
+inline constexpr float kAmbienceAnchor1R = 0xf6 / 255.0f;   // R = 0.5  橙
+inline constexpr float kAmbienceAnchor1G = 0xaa / 255.0f;
+inline constexpr float kAmbienceAnchor1B = 0x6c / 255.0f;
+inline constexpr float kAmbienceAnchor2R = 0xf6 / 255.0f;   // R = 1.0  血色
+inline constexpr float kAmbienceAnchor2G = 0x6c / 255.0f;
+inline constexpr float kAmbienceAnchor2B = 0x6c / 255.0f;
+// R 的分段点：0 → 0.5 走第一段，0.5 → 1.0 走第二段。
+inline constexpr float kAmbienceMidRatio = 0.5f;
+
+// ---- 5.2 剧烈程度 R 的基线 ----
+// 消耗基线（元/分钟）。估计不出来的时候就是它 —— 所有者定的 -0.25。
+// ★ R 用的**不是** kRateSpringTauSeconds 那条平滑后的速率，而是"最近一步"的
+//   每分钟步长：R 描述的是"刚刚有多陡"，平滑过的值恰恰把"刚刚"抹掉了
+//   （"E 施工单.md"：两者都是每分钟量，每步余额差 ÷ 该步自己的间隔秒数 × 60）。
+// ★ 分母是 2*|基线|，不是 |基线|（施工单的修正一）：除以 |基线| 时 R 能到 2，
+//   会把心跳频率推过上限。
+inline constexpr double kAmbienceBaselineYuanPerMinute = -0.25;
+
+// ---- 5.3 死态程度 D 的低余额阈值 G ----
+// 余额低于 G 元算"不足"。
+// ★ 这是**本地常量**：DeepSeek 账号里没有这个设置，不要去接口里找（施工单写明）。
+//   G <= 0 时 D 恒为 0（不做除法，"E 蒙光.md" §3.3 第 2 条）。
+inline constexpr double kLowBalanceThresholdYuan = 10.0;
+
+// ---- 5.4 内蒙光的剖面（alpha 形状，与亮度无关）----
+// 面板内部贴边的一圈"内唇"：从边框内沿向心衰减到 0。
+// 它碰不到任何元素（文字最短内缩 12 DIP > 5 DIP），所以它可以做到最亮。
+inline constexpr float kGlowInLipDip = 5.0f;      // 衰减距离（DIP）
+inline constexpr float kGlowInLipAlpha = 0.280f;  // 轮廓内沿处的 alpha（满强度）
+// 底部透光：从面板底边往上的一条竖向渐变（下亮上暗），17 DIP 内衰减到 0。
+inline constexpr float kGlowInVertDip = 17.0f;
+inline constexpr float kGlowInVertAlpha = 0.150f;
+// 整板底噪：面板内处处一层极淡的 alpha，作用是"整体被染了一点"，不提供亮度。
+inline constexpr float kGlowInFloorAlpha = 0.025f;
+
+// ---- 5.5 内蒙光的强度倍率 k(R,D) —— 单独暴露，改它不用动剖面 ----
+//   k(R,D) = (kGlowInK0 + kGlowInK1 * R) * (1 - kGlowInD * D)
+//   R 越大越亮（最多 +67%），D 越大越暗（最多 -60%）。
+// ★ 这是所有者唯一需要动的"亮度"旋钮：剖面（5.4）一个数都不用改。
+//   它乘在**整条剖面**上，所以形状不随状态变化（形状变了 = 换了一种状态语言）。
+inline constexpr float kGlowInK0 = 0.60f;   // R = 0 时的基准强度
+inline constexpr float kGlowInK1 = 0.40f;   // R = 1 时额外加多少
+inline constexpr float kGlowInD = 0.60f;    // D = 1 时暗掉的比例
+// 读不到余额（按 D = 1 处理）时观感取"甲"：冷白光**仍在**，不是"褪尽"
+// （一块死板子本身就是"出事了"的信号，v0.2 设计 §7.1 禁止）。
+// 想要"连光一起褪尽"就把 kGlowInD 改成 0.88（D=1 时 k 从 0.36 降到 0.088），
+// 剖面与几何一个数都不用动。
+// D = 1 时 C 是饱和度为 0 的近白；纯中性灰在近黑底上容易读成"玻璃上的灰"，
+// 所以朝基准蓝混一点点，让它读成"冷光"。
+inline constexpr float kGlowInD1Warm = 0.12f;
+
+// ---- 5.6 颜色与强度的缓动 ----
+// 颜色逐通道缓动：外观旋钮，与数字滚动共用同一套"帧号 k 的纯函数"手感。
+// ★ rate 是**每帧**系数（窗口垂直同步，约 60 帧/秒），与 kRollRate 同风格。
+//   c > 1 起步更快（颜色比数字更早看得出来）。
+inline constexpr float kAmbienceColorRate = 0.975f;
+inline constexpr float kAmbienceColorC = 10.0f;
+// 某个通道的残差小于它就吸附到目标（免得末位永远差一点点）。单位 0..1。
+inline constexpr float kAmbienceColorSnap = 0.002f;
+// 蒙光强度的缓动时间常数（秒）。与设计 §9.6「光晕透明度 1.5 s」同一个数。
+// ★ 强度与颜色分开：颜色逐帧自乘（纯帧号函数），强度用连续解 exp(-dt/τ)。
+inline constexpr float kGlowInTauSeconds = 1.5f;
+// 缓动每步的 dt 上限（秒）。与 kRateSpringMaxDtSeconds 同一个值、同一个理由：
+// 休眠唤醒后第一帧 dt 巨大，动画会一步跳到位。
+inline constexpr double kAmbienceMaxDtSeconds = 0.05;
+
 }  // namespace dshb
