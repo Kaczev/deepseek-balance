@@ -14,6 +14,7 @@
 #include "sampling.h"
 #include "single_instance.h"
 #include "state_machine.h"
+#include "tuning.h"     // 常量：所有可调值只有这一处来源（曾把 10000 硬编码在下面，改常量无效）
 #include "balance_source.h"
 
 #include <windows.h>
@@ -78,7 +79,7 @@ std::wstring g_apiHost = L"api.deepseek.com";
 int g_apiPort = 443;
 bool g_apiPlainHttp = false;
 int g_apiTimeoutMs = 5000;
-int g_apiIntervalMs = 10000;
+int g_apiIntervalMs = static_cast<int>(dshb::kApiIntervalMaxMs);   // 唯一来源：常量（曾在这里硬编码 10000，改常量无效）
 dshb::BalanceSource g_apiSource;
 
 // ---- 币种点击（只认单击；拖动与长按都不算）----

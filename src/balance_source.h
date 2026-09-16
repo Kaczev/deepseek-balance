@@ -11,6 +11,7 @@
 #pragma once
 
 #include "sampling.h"
+#include "tuning.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -28,7 +29,7 @@ struct BalanceSourceConfig {
     bool plainHttp = false;          // 本地测试服务器用
     std::wstring path = L"/user/balance";
     int timeoutMs = 5000;            // 设计 §4.1：请求必须在一个采样周期内完成
-    int intervalMs = 10000;          // 设计 §4.1：固定 10 秒
+    int intervalMs = static_cast<int>(kApiIntervalMaxMs);   // 默认 = 上限（自适应会自己缩短）
     std::string apiKey;
     bool once = false;               // 只取一次就停（自检用）
 };
@@ -69,7 +70,7 @@ private:
     std::atomic<int> failures_{0};
     std::atomic<bool> stop_{false};
     std::atomic<bool> paused_{false};   // 暂停中：不发请求
-    std::atomic<int> intervalMs_{10000};   // 当前生效的间隔（自适应）
+    std::atomic<int> intervalMs_{static_cast<int>(kApiIntervalMaxMs)};   // 当前生效的间隔（自适应）
     std::atomic<long long> nextDueMs_{0};    // 下一次请求的到期时刻（steady 毫秒）
     Sample prev_{};                          // 上一次成功样本（比"有没有变化"用）
     bool havePrev_ = false;
