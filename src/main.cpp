@@ -415,6 +415,26 @@ static bool ReadKeyFromDshCredentials(std::wstring* out) {
     return false;
 }
 
+// 滞后一拍（所有者要求）：显示用上一次确认的采样，最新那次压着，等下一个点来时再提交。
+// 这样每次提交都触发一格滚动，且比较的两个端点都是真观测值。
+dshb::Sample g_stash{};
+bool g_haveStash = false;
+
+void CommitDelayed() {
+    const dshb::Sample& s = g_states.lastGood();
+    if (!g_haveStash) {
+        g_haveStash = true;
+        g_stash = s;
+        g_display.OnSample(s);
+        SelfTestLog(L"[commit] t=%.1fs 首个采样直接显示：%.2f", g_elapsed, s.total.ToDouble());
+        return;
+    }
+    g_display.OnSample(g_stash);
+    SelfTestLog(L"[commit] t=%.1fs 提交上一个采样 %.2f（最新 %.2f 已收到，压着等下一点）",
+                g_elapsed, g_stash.total.ToDouble(), s.total.ToDouble());
+    g_stash = s;
+}
+
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -1413,7 +1433,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             while (g_apiSource.Poll(&rs)) {
                 g_states.OnSample(rs, rs.wallMs);
                 // 只有成功的样本才动显示值；失败时保持原样（所有者："先当作没变"）
-                if (rs.amountsOk) g_display.OnSample(g_states.lastGood());   // 取消延迟一拍：直接提交最新采样
+                if (rs.amountsOk) CommitDelayed();   // 滞后一拍（见 CommitDelayed）
             }
             std::string apiLine;
             // 带时间戳（设计 §10.5 的日志要求）：这样"暂停期间没请求""唤醒立刻补一次"可验证
