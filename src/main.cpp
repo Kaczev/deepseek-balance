@@ -21,7 +21,7 @@
 #include <objbase.h>    // CoInitializeEx / COINIT_APARTMENTTHREADED
 #include <shellapi.h>   // CommandLineToArgvW
 #include "curve.h"       // --curve-selftest
-#include "sample_history.h"   // 采样历史（氛围曲线用）
+
 #include <wtsapi32.h>   // 锁屏/解锁通知（J4）
 
 #include <cmath>
@@ -96,8 +96,8 @@ std::string g_apiKey;           // 只在内存里，绝不写日志
 bool g_clickTest = false;         // --click-test：注入三次手势
 bool g_pauseTest = false;
 bool g_noCurve = false;           // --no-curve：关掉氛围曲线（A/B 对比用）
-bool g_curveSine = false;         // --curve=sine：画 D1 那条假正弦（对照）
-int  g_historyDemo = 0;           // --history-demo=N：合成 N 个历史点（导帧验证用）
+int  g_historyDemo = 0;           // --history-demo=N：合成 N 个曲线点（导帧验证用）
+int  g_curveFrame = -1;           // --curve-frame=k：把滚动计时器冻在第 k 帧（-1 = 未给）
          // --pause-test：注入"锁屏/解锁"，验证 J4（不用真锁屏）
 double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
 double g_displayAmount = 0.0;   // 已弃用（所有者改为 --last）
@@ -469,8 +469,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // 导帧夹具：导出路径不取样，所以倒计时没有真实来源，靠它给一个值。
             g_countdownGiven = true;
             g_countdownSeconds = _wtoi(argv[i] + 12);
-        } else if (wcscmp(argv[i], L"--curve=sine") == 0) {
-            g_curveSine = true;
+        } else if (wcsncmp(argv[i], L"--curve-frame=", 14) == 0) {
+            // 导帧夹具（规格 §5 验收 4）：把曲线滚动计时器冻在 k/60 秒，于是
+            // "滚动中的第 k 帧"可以用 --export-frame=1 直接导出来（不需要连画 k 帧）。
+            g_curveFrame = _wtoi(argv[i] + 14);
         } else if (wcsncmp(argv[i], L"--history-demo=", 15) == 0) {
             g_historyDemo = _wtoi(argv[i] + 15);
         } else if (wcscmp(argv[i], L"--curve-selftest") == 0) {
@@ -893,7 +895,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         if (g_layoutProbe) dshb::SetLayoutProbe(true);
         // 氛围曲线默认开；--no-curve 关掉它，用于确认"关掉后文字位置逐像素不变"
         dshb::SetCurveEnabled(!g_noCurve);
-        if (g_curveSine) dshb::SetCurveMode(1);   // 对照：D1 的假正弦
         if (g_historyDemo > 0) dshb::PrimeHistoryForDemo(g_historyDemo);
 
         // 让模拟数据源在"虚拟时间"里跑起来：否则导出的图没有数据，浮层也是空的。
@@ -1025,6 +1026,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 渲染前先让显示层刷一次每位坐标（dt=0：追赶系数为 0，坐标直接落在整数目标上）。
         // 不刷的话 places 是空的，渲染层会退回整串绘制——静止画面看起来一样，
         // 但滚动时就没有逐位坐标可用了。实测：漏掉这一步时 99.50 的坐标是空的。
+        //
+        // ★ --curve-frame=k：必须在**所有推进过滚动计时器的循环之后**再冻结。
+        //   那些虚拟时间循环（下面的 for / --roll 分支）每步都会 Update(1/60)，
+        //   先冻结就会被它们推着走，导出来的就不是第 k 帧了。
+        if (g_curveFrame >= 0) dshb::SetCurveScrollFrame(g_curveFrame);
         g_display.Update(0.0);
         // 组装正文（和真实运行时同一条路径），这样导出的图就是屏幕上会看到的图
         {
@@ -1060,6 +1066,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         }
 
         const bool ok = renderer.ExportFrame(g_exportPath, t);
+
+        // 曲线状态的诊断（存储里有几个点、计时器停在哪一帧）：导帧量像素时，
+        // "这一帧到底是滚动中的第几帧、环里是哪几个点"必须能从日志里对上。
+        SelfTestLog(L"[curve] %hs", dshb::CurveStateLine().c_str());
 
         // 诊断写文件放在绘制**之后**：绘制路径里做 I/O 会让进程崩（实测）
         dshb::DumpLayoutProbe();

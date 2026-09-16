@@ -151,9 +151,8 @@ inline constexpr float kBorderColorG = 0xb2 / 255.0f;
 inline constexpr float kBorderColorB = 0xb7 / 255.0f;
 inline constexpr float kBorderWidthDip = 4.0f;
 
-// ---- 氛围曲线（D 段）----
-// D1：先画一条与数据无关的正弦线，只证明"能画出平滑曲线"。
-// 颜色取边缘文字那个中性色，透明度先给氛围档；D2 会专门调透明度。
+// ---- 氛围曲线（规格 §3 的显示层）----
+// 颜色仍是边缘文字那个中性色，透明度仍是氛围档（规格 §3 没让改，保持原样）。
 inline constexpr float kCurveColorR = 0xaf / 255.0f;
 inline constexpr float kCurveColorG = 0xb2 / 255.0f;
 inline constexpr float kCurveColorB = 0xb7 / 255.0f;
@@ -161,20 +160,6 @@ inline constexpr float kCurveAlpha = 0.35f;
 inline constexpr float kCurveWidthDip = 8.0f;
 inline constexpr float kCurveAmplitudeDip = 14.0f;
 inline constexpr float kCurveCenterYDip = 65.0f;   // 实体区内的中线 y（65 = 绝对 145 = 数字墨迹中线）
-inline constexpr float kCurvePeriods = 2.5f;
-
-// 曲线的平滑：每帧把"当前画出来的点"朝"目标点"逼近（与 kRollRate / kNumberShiftRate 同风格）。
-// 这一套同时解决三种跳变：刻度重算导致的上下跳、端点点进出导致的横向滑、以及"过渡到平线"。
-// 刻度**不改**：每个币种照样按自己窗口内的极值铺满整条带子（所有者：线要完美铺在带子里）。
-inline constexpr float kCurveSmoothRate = 0.88f;
-inline constexpr float kCurveSmoothSnapFrac = 0.002f;
-
-// 氛围曲线的时间轴（D3 口径，所有者定）：
-//   * 窗口 5 分钟（原来 10 分钟）
-//   * **名义步长 30 秒/点**：不管实际间隔是 10 还是 30 秒，画出来每点间距都一样，
-//     于是曲线以恒定速度向左移动——30 秒正好走一个点的间距（所有者：曲线要一直动）。
-inline constexpr int64_t kCurveWindowMs = 5 * 60 * 1000;
-inline constexpr int64_t kCurveNominalStepMs = 30 * 1000;
 
 // ---- 曲线的滚动动画（规格 §3；所有者给的公式）----
 // 第 k 帧每点纵坐标：P = L + (N − L) × (1 − rate^k)^c
@@ -185,9 +170,12 @@ inline constexpr int64_t kCurveNominalStepMs = 30 * 1000;
 inline constexpr float kCurveRollRate = 0.975f;
 inline constexpr float kCurveRollC = 10.0f;
 
-// （所有者决定保留"极值铺满"：微小变化被放大是可以接受的，因此**不做**最小跨度保护。）
+// 滚动一格的时间与帧率（规格 §3：整体**10 秒内匀速**移动到下一格；帧号 k = 秒数 × 60）。
+// 这两个不是外观旋钮，是规格写死的时钟：改它们等于改"10 秒一格"这条验收项。
+inline constexpr double kCurveScrollSeconds = 10.0;
+inline constexpr double kCurveFrameHz = 60.0;
 
-inline constexpr float kCurveSmoothSnap = 0.002f;
+// （所有者决定保留"极值铺满"：微小变化被放大是可以接受的，因此**不做**最小跨度保护。）
 
 // ★ 状态主色：原来那支蓝 #6C89F6。**保留**，后面演示各种状态时用；
 //   面板与文字已改成上面的中性色，所以它现在不参与面板底色。

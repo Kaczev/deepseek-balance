@@ -1,23 +1,271 @@
 #include "widget_display.h"
 
-#include "sample_history.h"
+#include "amount.h"        // Amount / ParseAmount：纵坐标从十进制原文解析，不用二进制浮点
+#include "curve_store.h"   // CurveStore：12 点环形、只记变化、curve.json（规格 §2）
 
-#include <ctime>
-#include <cstdio>
-
-namespace {
-// 采样历史（D3）：显示层自己记——每一个帧组装点都自动带上曲线，
-// 不会再犯"同形代码有两份、只改了一份"那类错。
-dshb::SampleHistory g_hist;
-}  // namespace
-
-#include "amount.h"
-
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <ctime>
+#include <string>
+#include <vector>
 
 namespace dshb {
-
 namespace {
+
+// ===========================================================================
+// 氛围曲线的显示状态（规格 §3）
+// ===========================================================================
+// 数据层（curve_store.h）已经定死了"记什么"：只有值变了才追加一个点、容量 12、
+// 超过 86400 秒作废。这一层只管**画**：取最新 11 个点铺满恰好 10 段；新点进来时
+// 整条在 10 秒内匀速左移一格；纵坐标按 P = L + (N − L)(1 − rate^k)^c 缓动。
+//
+// ★ 全部状态 = 存储内容 + 滚动计时器（"旧极值"本身也是存储内容的纯函数）。
+//   没有任何"每帧自乘的增量状态"，所以第 k 帧可以单独构造、单独导出、单独量。
+CurveStore g_curveStore;
+
+// 滚动计时器（秒）：追加一个点就归零，之后由每帧的 dt 推进（DisplayedAmount::Update）。
+double g_curveSeconds = 0.0;
+
+// 是否有一个还没走完的滚动。走到 kCurveScrollSeconds **之后**（严格大于）才退休：
+// 于是 elapsed == 10.000 s 那一帧仍是滚动的终点帧、10.001 s 那一帧是"没有滚动"的
+// 静止帧——验收项 2 正是拿这两帧比像素（两条不同的代码路径必须给出同一张图）。
+bool g_curveScrolling = false;
+
+// --curve-frame=k：把计时器冻结在 k/60 秒（导帧口子，只影响导出路径的一帧）。
+bool g_curveFrozen = false;
+
+// L 用的"旧极值"（规格 §3 第 6 条）：追加发生**之前**屏幕上那 11 个点的极值。
+// ★ 它其实也能从存储推出来（追加后环里最老的那些点就是刚才在看的点），但规格明确
+//   要求"记住上一次的极值"；记住之后，滚动当中再来一次追加也不会把 L 算错。
+double g_curveOldLo = 0.0;
+double g_curveOldHi = 0.0;
+bool g_curveOldValid = false;
+
+// §3：显示最新 11 个点、恰好 10 段。
+constexpr std::size_t kCurveDisplayPoints = 11;
+constexpr std::size_t kCurveSegments = kCurveDisplayPoints - 1;
+
+// 一个点对曲线的取值 = 这个点的**第一个可用条目**。
+// ★ 为什么不是"当前显示的币种"：数据层判定"变没变"用的就是响应第一个条目
+//   （primary）——一个点之所以存在，正是因为那个币种变了。让它与点一一对应，
+//   曲线画的就是"数据层记下的那条序列"，与用户此刻点了哪个币种符号无关。
+//   条目为 null（该次响应没有这个币种）时跳过，往后找第一个有值的。
+bool CurveValueOf(const CurveStorePoint& point, double* out) {
+    for (const CurveStorePoint::Entry& entry : point.entries) {
+        if (entry.missing || entry.text.empty()) continue;
+        Amount amount;
+        if (!ParseAmount(entry.text, &amount)) continue;
+        *out = amount.ToDouble();
+        return true;
+    }
+    return false;
+}
+
+// 全部点的取值（oldest -> newest）。某个点读不出值时用相邻点的值补上，横向几何
+// （一格一个点）才不会塌。数据层保证追加进来的点都有可用的第一个条目，所以这只有
+// 在手工编辑过 curve.json 时才会发生。
+bool CurveValues(const std::vector<CurveStorePoint>& points, std::vector<double>* out) {
+    out->assign(points.size(), 0.0);
+    std::vector<char> have(points.size(), 0);
+    bool any = false;
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        double v = 0.0;
+        if (CurveValueOf(points[i], &v)) {
+            (*out)[i] = v;
+            have[i] = 1;
+            any = true;
+        }
+    }
+    if (!any) return false;
+    double last = 0.0;
+    for (std::size_t i = 0; i < points.size(); ++i) {          // 向后填
+        if (have[i]) last = (*out)[i];
+        else (*out)[i] = last;
+    }
+    for (std::size_t i = points.size(); i-- > 0;) {            // 再向前填（头部空洞）
+        if (have[i]) last = (*out)[i];
+        else (*out)[i] = last;
+    }
+    return true;
+}
+
+// 窗口内极值（规格 §3：刻度按极值铺满整条带子，不做最小跨度保护）。
+struct CurveSpan {
+    double lo = 0.0;
+    double hi = 0.0;
+    bool degenerate() const { return !(hi > lo); }
+};
+
+CurveSpan SpanOf(const std::vector<double>& values, std::size_t begin, std::size_t end) {
+    CurveSpan span;
+    span.lo = values[begin];
+    span.hi = values[begin];
+    for (std::size_t i = begin; i < end; ++i) {
+        if (values[i] < span.lo) span.lo = values[i];
+        if (values[i] > span.hi) span.hi = values[i];
+    }
+    return span;
+}
+
+// 归一化纵坐标：0 = 带子顶、1 = 带子底。极值相同（或只有一个点）-> 带子正中。
+double NormY(double v, const CurveSpan& span) {
+    if (span.degenerate()) return 0.5;
+    return 1.0 - (v - span.lo) / (span.hi - span.lo);
+}
+
+// 槽位 -> 归一化横坐标。★ 两条路径（滚动 / 静止）必须用同一个式子，同一槽位要给出
+// 逐位相同的 float，否则"滚动终点帧 == 静止帧"的逐像素比较会败在最后一位的舍入上。
+float SlotX(double slot) { return static_cast<float>(slot * 0.1); }
+
+// 纵向缓动：P = L + (N − L) × (1 − rate^k)^c（规格 §3 第 6 条，k = 帧号）。
+// ★ 走到终点（第 600 帧，整 10 秒）时直接取 N：公式在 k=600 处还剩 0.975^600 ≈ 2.5e-7
+//   的残量（折算约 7e-5 像素），而"动画结束在数据自己给出的位置上"正是验收项 2 要逐
+//   像素比的东西，所以终点取精确值。这不是改公式：10 秒之后本来就没有动画了。
+double EasedY(double L, double N, double seconds) {
+    if (seconds >= kCurveScrollSeconds) return N;
+    const double k = seconds * kCurveFrameHz;
+    const double decay = std::pow(static_cast<double>(kCurveRollRate), k);
+    return L + (N - L) * std::pow(1.0 - decay, static_cast<double>(kCurveRollC));
+}
+
+// 环里两个快照是不是同一批点（逐条目比币种/缺失/原文）。
+bool SamePoints(const std::vector<CurveStorePoint>& a, const std::vector<CurveStorePoint>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].entries.size() != b[i].entries.size()) return false;
+        for (std::size_t j = 0; j < a[i].entries.size(); ++j) {
+            if (a[i].entries[j].currency != b[i].entries[j].currency) return false;
+            if (a[i].entries[j].missing != b[i].entries[j].missing) return false;
+            if (a[i].entries[j].text != b[i].entries[j].text) return false;
+        }
+    }
+    return true;
+}
+
+// 一条取样喂给数据层（§2.1 / §2.3 的规则全在那里），并观察"是不是追加了一个点"。
+// 只有追加才启动滚动——值不变时曲线**静止**（规格 §2.1 的推论，这条是刻意的）。
+void FeedCurve(const Sample& s) {
+    std::vector<CurveStorePoint> before = g_curveStore.Points();
+    std::vector<double> beforeValues;
+    const bool beforeOk = CurveValues(before, &beforeValues);
+
+    CurveObservation obs;
+    // §2.1：判定"变没变"用**响应第一个条目**那个币种。
+    obs.primaryCurrency = !s.entries.empty() ? s.entries.front().currency : s.currency;
+    for (const CurrencyAmount& e : s.entries) {
+        obs.observations.push_back(CurveObservation::Item{
+            e.currency, e.ok ? e.total.ToString2() : std::string(), e.ok});
+    }
+    if (obs.observations.empty()) {
+        if (!s.amountsOk || obs.primaryCurrency.empty()) return;   // 没有币种信息，没什么可记
+        obs.observations.push_back(CurveObservation::Item{
+            obs.primaryCurrency, s.total.ToString2(), true});
+    }
+    // 样本的**墙钟秒**就是数据层的时间戳（规格 §2.3）。
+    g_curveStore.Append(obs, s.wallMs / 1000);
+
+    // ★ 判定"追加了一个点"看的是**存储自己的状态**，不是 Append() 返回值的含义：
+    //   点数变了，或者环里的内容变了（容量 12 到顶时 size() 不动，但最老的点会被挤掉）。
+    //   只比 size() 会在环满之后永远看不到新点（那时曲线会在生产里停住不滚）。
+    const std::vector<CurveStorePoint> after = g_curveStore.Points();
+    const bool appended = !SamePoints(before, after);
+    if (!appended) return;
+
+    // 追加了：计时器归零，并记下"旧极值"= 刚才屏幕上那 11 个点的极值（规格 §3 第 6 条）。
+    // 新点入场时也按这套旧极值算 L，于是它不会凭空跳进来，而是从旧刻度滑过去。
+    const std::size_t keep =
+        (before.size() < kCurveDisplayPoints) ? before.size() : kCurveDisplayPoints;
+    g_curveOldValid = beforeOk && keep > 0;
+    if (g_curveOldValid) {
+        const CurveSpan old = SpanOf(beforeValues, before.size() - keep, before.size());
+        g_curveOldLo = old.lo;
+        g_curveOldHi = old.hi;
+    }
+    g_curveSeconds = 0.0;
+    g_curveScrolling = true;
+}
+
+// 每帧推进滚动计时器（规格 §3：计时器由帧 dt 推进，追加时归零）。
+void AdvanceCurve(double dtSeconds) {
+    if (g_curveFrozen || !g_curveScrolling) return;
+    g_curveSeconds += dtSeconds;
+    if (g_curveSeconds > kCurveScrollSeconds) {
+        g_curveSeconds = kCurveScrollSeconds;
+        g_curveScrolling = false;   // 走完了：显示集就是最新 11 个，不再有"第 12 个"
+    }
+}
+
+// 组装一帧的曲线点（规格 §3）。全部是"存储内容 + 计时器"的纯函数。
+void BuildFrameCurve(WidgetFrame* f) {
+    f->curve.clear();
+    f->curveHasData = false;
+
+    const std::vector<CurveStorePoint> points = g_curveStore.Points();
+    const std::size_t n = points.size();
+    if (n == 0) return;                         // 没有数据：渲染层画带子正中的平线
+
+    std::vector<double> values;
+    if (!CurveValues(points, &values)) return;
+
+    const bool scrolling = g_curveScrolling;
+    const double seconds = g_curveSeconds;
+    const double progress =
+        (seconds >= kCurveScrollSeconds) ? 1.0 : (seconds / kCurveScrollSeconds);
+
+    // 滚动结束后留下的那些点（规格 §3 第 6 条：N 用"留下的点"的极值）——静止时
+    // 它就是显示集本身（最新 11 个）。
+    const std::size_t shownBegin = (n > kCurveDisplayPoints) ? (n - kCurveDisplayPoints) : 0;
+    const CurveSpan newSpan = SpanOf(values, shownBegin, n);
+    const CurveSpan oldSpan =
+        (scrolling && g_curveOldValid) ? CurveSpan{g_curveOldLo, g_curveOldHi} : newSpan;
+
+    // 画哪些点、各自在哪个槽位：
+    //   静止：最新 11 个，槽位 0..10（最老在左、最新在右边缘）。
+    //   滚动：环里全部点（最多 12 个），槽位再右移 0.1×(1−进度)——于是"第 12 个"
+    //         从 x=1.1 进来、整条以**线性**进度左移一格，走完时正好落在"最新 11 个"。
+    const double slotBase = static_cast<double>(n) - 1.0 - static_cast<double>(kCurveSegments);
+    const std::size_t first = scrolling ? 0 : shownBegin;
+
+    std::vector<double> xs;
+    std::vector<double> ys;
+    xs.reserve(n + 1);
+    ys.reserve(n + 1);
+    for (std::size_t p = first; p < n; ++p) {
+        const double slot = static_cast<double>(p) - slotBase;
+        double x = SlotX(slot);
+        if (scrolling) x += 0.1 * (1.0 - progress);
+        const double y = scrolling ? EasedY(NormY(values[p], oldSpan), NormY(values[p], newSpan),
+                                            seconds)
+                                   : NormY(values[p], newSpan);
+        xs.push_back(x);
+        ys.push_back(y);
+    }
+    if (xs.size() < 2) return;                  // 一个点：渲染层画平线（curveHasData = false）
+
+    // 横向裁剪到 [0,1]（规格 §3）：两端的点只要"还有一段在画面里"就留着——单调三次只在
+    // [0,1] 上取值，越界的部分自然画不出来（渲染层按 u∈[0,1] 采样）。完全在画面外、
+    // 连相邻那一段都挤不进来的点直接丢掉：否则它会通过切线影响画面内那一段的形状，
+    // 于是"滚动终点帧"与"静止帧"就不再逐像素相同了。
+    std::size_t from = 0;
+    while (from + 1 < xs.size() && xs[from + 1] <= 0.0) ++from;
+    std::size_t to = xs.size();
+    while (to > 1 && xs[to - 2] >= 1.0) --to;
+    if (to <= from) return;
+
+    // 左侧拉平（规格 §2.2、验收 3）：显示的点还不够 11 个时，最早那个点左边的区间
+    // "看做与它同值"。滚动中同理——最左那个点滑出画面后，左端由次左点拉平。
+    if (xs[from] > 0.0) f->curve.push_back({0.0f, static_cast<float>(ys[from])});
+    for (std::size_t i = from; i < to; ++i) {
+        f->curve.push_back({static_cast<float>(xs[i]), static_cast<float>(ys[i])});
+    }
+    // 极值两边都退化（没有数据 / 只有一个点 / 全都一样）= 平线，按老规矩交给渲染层画。
+    f->curveHasData = (f->curve.size() >= 2) && !(newSpan.degenerate() && oldSpan.degenerate());
+}
+
+// ---------------------------------------------------------------------------
+// 数字那一侧用的小工具
+// ---------------------------------------------------------------------------
 
 // 找出两段文本第一个与最后一个不同的位置。长度不等时退化为"整段都变"。
 void DiffSpan(const std::string& a, const std::string& b, int* from, int* to) {
@@ -176,7 +424,8 @@ void DisplayedAmount::OnSample(const Sample& s) {
     frames_ = 0;                               // k = 0：本次变化还没运算过
     animating_ = true;
     tripsDirty_ = true;                        // 下一帧重建每一位的行程
-        g_hist.Add(s);   // 历史：氛围曲线要用（本文件上方的 g_hist）
+    // 氛围曲线（规格 §2/§3）：每次取到样本都喂给曲线存储；只有**追加了点**才滚动。
+    FeedCurve(s);
     if (!hasValue_) {
         // 第一次拿到值就直接落位：从 0 滚上去会让人以为余额在涨
         value_ = yuan;
@@ -355,7 +604,9 @@ void DisplayedAmount::SyncValueFromTrips() {
 
 // 对外只有一个 Update：先推进显示值，再按行程刷新每一位的坐标。
 // 这样"值"和"轮子"永远在同一帧里一起走，调用方不需要记得多调一次。
+// 曲线的滚动计时器也在这里推进（规格 §3：由帧 dt 推进，追加时归零）。
 double DisplayedAmount::Update(double dtSeconds) {
+    AdvanceCurve(dtSeconds);
     const double shown = UpdateValue(dtSeconds);
     AdvancePlaces(dtSeconds, TextToShow());
     return shown;
@@ -391,27 +642,72 @@ std::string DisplayedAmount::TextToShow() const {
 }
 
 
-// --history-demo=N：合成一段历史（从 20.00 缓慢降到 19.50，最后四分之一不动），
-// 供导帧验证。真实历史在导帧路径里不存在（一个进程只画一帧），所以必须能合成。
+// --history-demo=N：合成 N 条样本喂进**曲线存储**（一个进程只画一帧，导帧路径里没有
+// 真实历史，所以历史必须能合成）。走的是真实那条路（Sample -> FeedCurve -> Append），
+// 所以"只记变化"照旧生效：值必须两两不同才会真的留下 N 个点。
+//
+// ★ 这 12 个值是为验收测量定的形状（不是随便一条线）：
+//   * p0 = 21.00 是"追加前那 11 个点"的上极值，滚动一格后它被挤出缓冲
+//     -> 旧极值 [19.90,21.00]、新极值 [19.90,20.20]，极值真的变了，纵向缓动有活干；
+//   * p9 = 19.90 是**两套极值下的同一个最小值**，所以它自己的 y 从头到尾不动，
+//     是量像素时可跟踪的特征；它的横坐标是 363.5 -> 332 px（在数字右侧那块
+//     **没有文字压着**的区域里：数字盖住了带子中间一段，这是画法本身决定的）；
+//   * 与它相邻的 p8/p10 都比它高 5 px 以上，所以"最低那一行墨"只属于它一个点；
+//   * 其余各点都落在两套极值之内，没有谁会飞出带子（p0 例外：它是被删掉的那个
+//     极值，它的纵向目标是"新极值之外"，按规格第 6 条本来就会飞出带子；它只在前
+//     0.6 秒里还留在画面边缘，整段行程里它只动了 0.6 px）。
+//   （--fixed-amount=20.12 配上它，屏幕上的数字正好等于最新那个点。）
 void PrimeHistoryForDemo(int points) {
-    if (points < 2) return;
-    const int64_t now = static_cast<int64_t>(std::time(nullptr)) * 1000;
-    const int64_t windowMs = 10 * 60 * 1000;
-    for (int i = 0; i < points; ++i) {
+    if (points < 1) return;
+    static const double kDemo[12] = {21.00, 20.20, 20.19, 20.18, 20.17, 20.16,
+                                     20.15, 20.14, 20.13, 19.90, 20.10, 20.12};
+    const int want = points;
+    const int table = (want < 12) ? want : 12;   // <12 时取表尾那几个
+    const int prefix = want - table;             // >12 时多喂的填充点，会被环挤掉
+    const int64_t nowSec = static_cast<int64_t>(std::time(nullptr));
+
+    for (int i = 0; i < want; ++i) {
+        const double v = (i < prefix) ? (21.00 + 0.01 * i) : kDemo[12 - table + (i - prefix)];
         dshb::Sample s{};
-        s.wallMs = now - windowMs + (windowMs * i) / (points - 1);
+        s.wallMs = (nowSec - (want - 1 - i)) * 1000;   // 一点一秒，最老的最早
         s.amountsOk = true;
         s.currency = "CNY";
-        const double u = static_cast<double>(i) / static_cast<double>(points - 1);
-        const double v = (u < 0.75) ? (20.00 - 0.50 * (u / 0.75)) : 19.50;
         s.total = dshb::Amount::FromYuanDouble(v);
         dshb::CurrencyAmount e{};
         e.currency = "CNY";
         e.total = s.total;
         e.ok = true;
         s.entries.push_back(e);
-        g_hist.Add(s);
+        FeedCurve(s);
     }
+}
+
+// --curve-frame=k：把滚动计时器冻结在 k/60 秒（导帧口子）。
+void SetCurveScrollFrame(int frame) {
+    g_curveFrozen = true;
+    g_curveSeconds = (frame > 0) ? (static_cast<double>(frame) / kCurveFrameHz) : 0.0;
+}
+
+// 一行诊断给 main 记日志（这一层自己不写文件）。
+std::string CurveStateLine() {
+    std::string values;
+    const std::vector<CurveStorePoint> points = g_curveStore.Points();
+    std::vector<double> v;
+    if (CurveValues(points, &v)) {
+        char one[24];
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            std::snprintf(one, sizeof(one), "%s%.2f", (i == 0) ? "" : ",", v[i]);
+            values += one;
+        }
+    }
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+                  "points=%zu lastUpdate=%lld scrollFrame=%.0f progress=%.4f scrolling=%s frozen=%s old=[%.2f,%.2f] values=[%s]",
+                  points.size(), static_cast<long long>(g_curveStore.lastUpdate()),
+                  g_curveSeconds * kCurveFrameHz, g_curveSeconds / kCurveScrollSeconds,
+                  g_curveScrolling ? "yes" : "no", g_curveFrozen ? "yes" : "no", g_curveOldLo,
+                  g_curveOldHi, values.c_str());
+    return buf;
 }
 
 WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, bool currencyKnown,
@@ -430,58 +726,14 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     } else {
         f.amountText = "--.--";                // 占位符，不是 0.00
     }
-    // 氛围曲线（D3）：从采样历史装配归一化点。规则（所有者定）：
-    //   * 窗口 5 分钟；**名义步长 30 秒/点** -> 每点间距恒定，曲线匀速左移
-    //   * 横轴的头 = 已确认采样 + 自提交以来经过的时间（最多走一个点的间距）
-    //     -> 曲线**一直在动**；头右侧是"还不知道的未来"，用最后确认值拉平，
-    //        下一个点到来时再由缓动平滑修正
-    //   * 纵向按**该币种**本窗口内的极值铺满固定带子（换币种不改布局、刻度不变）
-    //   * 没有数据 / 只有 1 点 / 极值相同 -> 平线（curveHasData = false）
-    {
-        const std::string& cur = amount.shownCurrency();
-        const int64_t nowWall = static_cast<int64_t>(std::time(nullptr)) * 1000;
-        const int64_t commitWall = amount.lastSampleWallMs();
-        const int64_t anchor = (commitWall > 0) ? commitWall : nowWall;
-        std::vector<dshb::HistoryPoint> hp =
-            (cur.empty() || !haveNumber)
-                ? std::vector<dshb::HistoryPoint>{}
-                : g_hist.Window(cur, anchor, kCurveWindowMs, 24);
-
-        const double stepFrac =
-            static_cast<double>(kCurveNominalStepMs) / static_cast<double>(kCurveWindowMs);   // 30/300 = 0.1
-        double xHead = 1.0 - (static_cast<double>(nowWall - anchor) /
-                              static_cast<double>(kCurveNominalStepMs)) * stepFrac;
-        if (xHead < 0.0) xHead = 0.0;
-        if (xHead > 1.0) xHead = 1.0;
-
-        if (hp.size() >= 2) {
-            double lo = hp.front().total.ToDouble();
-            double hi = lo;
-            for (const dshb::HistoryPoint& p : hp) {
-                const double v = p.total.ToDouble();
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-            }
-            const double span = hi - lo;
-            if (span > 0.0) {
-                auto ynorm = [&](double v) { return static_cast<float>(1.0 - (v - lo) / span); };
-                f.curve.clear();
-                for (size_t i = 0; i < hp.size(); ++i) {
-                    const size_t back = hp.size() - 1 - i;          // 距最新几个点
-                    const double x = xHead - static_cast<double>(back) * stepFrac;
-                    if (x < 0.0) continue;                          // 出窗口的丢掉
-                    f.curve.push_back({static_cast<float>(x), ynorm(hp[i].total.ToDouble())});
-                }
-                // 头右侧（未知的未来）用最后确认值拉平；头本身也在列表里，
-                // 因此这里补右侧点即可。左侧不补：窗口外本来就没有数据，
-                // 曲线自然从最旧的点开始（不再是"假装一直有数据"）。
-                if (!f.curve.empty() && xHead < 0.999) {
-                    f.curve.push_back({1.0f, f.curve.back().y});
-                }
-                if (f.curve.size() >= 2) f.curveHasData = true;
-            }
-        }
-    }
+    // 氛围曲线（规格 §3）：点由**显示层**算好（横向位置 + 纵向缓动都算完），渲染层
+    // 只负责连线。规则（都在本文件上方的 BuildFrameCurve 里）：
+    //   * 显示集 = 记录里最新 11 个点铺满恰好 10 段（左侧不足时按最早的点拉平）
+    //   * 只有**追加了一个点**才滚动：整条在 10 秒内匀速左移一格，新点从 x=1.1 进来
+    //   * 纵向按 P = L + (N − L)(1 − rate^k)^c 缓动，极值仍铺满整条带子
+    //   * 值不变 -> 没有新点 -> 曲线静止（规格 §2.1 的推论，故意的）
+    //   * 没有数据 / 只有一个点 / 全都一样 -> 平线（curveHasData = false）
+    BuildFrameCurve(&f);
     // ★ 符号与数字**分开决定**（所有者）：只要币种是确定的，即使没有数字也要显示符号，
     //   否则切到没数据的币种时看不出自己在看哪个币种。
     f.currencySymbol = currencyKnown ? (currencySymbol ? currencySymbol : L"") : L"";

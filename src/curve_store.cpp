@@ -145,7 +145,7 @@ void AppendJsonString(std::string& out, const std::string& text) {
     out += '"';
 }
 
-std::string Serialize(int64_t updateAt, bool updateAtValid, const std::vector<CurvePoint>& points) {
+std::string Serialize(int64_t updateAt, bool updateAtValid, const std::vector<CurveStorePoint>& points) {
     std::string out = "{\n  \"update_at\": ";
     if (updateAtValid) {
         char buf[32];
@@ -159,7 +159,7 @@ std::string Serialize(int64_t updateAt, bool updateAtValid, const std::vector<Cu
     for (std::size_t i = 0; i < points.size(); ++i) {
         out += (i == 0) ? "\n    {" : ",\n    {";
         for (std::size_t k = 0; k < points[i].entries.size(); ++k) {
-            const CurvePoint::Entry& entry = points[i].entries[k];
+            const CurveStorePoint::Entry& entry = points[i].entries[k];
             out += (k == 0) ? " " : ", ";
             AppendJsonString(out, entry.currency);
             out += ": ";
@@ -217,7 +217,7 @@ const char* CurveLoadResult::StatusName() const {
     return "?";
 }
 
-const CurvePoint::Entry* CurvePoint::Find(const std::string& currency) const {
+const CurveStorePoint::Entry* CurveStorePoint::Find(const std::string& currency) const {
     for (const Entry& entry : entries) {
         if (entry.currency == currency) return &entry;
     }
@@ -258,7 +258,7 @@ CurveLoadResult CurveStore::Load(const std::string& path) {
 
     // Everything is collected in locals first: a half-valid file must never leave
     // half a curve in the store.
-    std::vector<CurvePoint> loaded;
+    std::vector<CurveStorePoint> loaded;
     int64_t updateAt = 0;
     bool sawUpdateAt = false;
     bool ok = true;
@@ -276,7 +276,7 @@ CurveLoadResult CurveStore::Load(const std::string& path) {
                     problem = "\"points\" holds a non-object element";
                     break;
                 }
-                CurvePoint point;
+                CurveStorePoint point;
                 for (const auto& member : element.members) {
                     if (member.first.empty()) {
                         ok = false;
@@ -285,7 +285,7 @@ CurveLoadResult CurveStore::Load(const std::string& path) {
                     }
                     if (member.second.IsNull()) {
                         // §2.4: "a currency may be absent from that response".
-                        point.entries.push_back(CurvePoint::Entry{member.first, std::string(), true});
+                        point.entries.push_back(CurveStorePoint::Entry{member.first, std::string(), true});
                         continue;
                     }
                     if (!member.second.IsString() && !member.second.IsNumber()) {
@@ -302,7 +302,7 @@ CurveLoadResult CurveStore::Load(const std::string& path) {
                         problem = "a point value is not a decimal amount";
                         break;
                     }
-                    point.entries.push_back(CurvePoint::Entry{member.first, member.second.text, false});
+                    point.entries.push_back(CurveStorePoint::Entry{member.first, member.second.text, false});
                 }
                 if (!ok) break;
                 if (point.entries.empty()) {
@@ -385,7 +385,7 @@ CurveLoadResult CurveStore::Load(const std::string& path) {
     if (count_ > 0) {
         // The newest point's first entry is the primary currency again: the file keeps
         // the response's own order, so the change comparison survives the reload.
-        const CurvePoint& newest = buf_[(next_ + kCapacity - 1) % kCapacity];
+        const CurveStorePoint& newest = buf_[(next_ + kCapacity - 1) % kCapacity];
         lastPrimaryCurrency_ = newest.entries.front().currency;
         lastPrimaryText_ = newest.entries.front().missing ? std::string() : newest.entries.front().text;
     }
@@ -420,7 +420,7 @@ bool CurveStore::Save(const std::string& path) const {
 // ---------------------------------------------------------------------------
 
 void CurveStore::Clear() {
-    for (CurvePoint& point : buf_) point = CurvePoint{};
+    for (CurveStorePoint& point : buf_) point = CurveStorePoint{};
     count_ = 0;
     next_ = 0;
     updateAt_ = 0;
@@ -430,8 +430,8 @@ void CurveStore::Clear() {
     clearReason_.clear();
 }
 
-std::vector<CurvePoint> CurveStore::Points() const {
-    std::vector<CurvePoint> out;
+std::vector<CurveStorePoint> CurveStore::Points() const {
+    std::vector<CurveStorePoint> out;
     const std::size_t live = size();
     out.reserve(live);
     const std::size_t start = (count_ < kCapacity) ? 0 : next_;   // oldest first
@@ -441,10 +441,10 @@ std::vector<CurvePoint> CurveStore::Points() const {
     return out;
 }
 
-std::vector<CurvePoint> CurveStore::Newest(std::size_t n) const {
-    std::vector<CurvePoint> all = Points();
-    if (n == 0 || all.size() <= n) return (n == 0) ? std::vector<CurvePoint>() : all;
-    return std::vector<CurvePoint>(all.end() - static_cast<std::ptrdiff_t>(n), all.end());
+std::vector<CurveStorePoint> CurveStore::Newest(std::size_t n) const {
+    std::vector<CurveStorePoint> all = Points();
+    if (n == 0 || all.size() <= n) return (n == 0) ? std::vector<CurveStorePoint>() : all;
+    return std::vector<CurveStorePoint>(all.end() - static_cast<std::ptrdiff_t>(n), all.end());
 }
 
 bool CurveStore::Expired(int64_t nowSeconds) const {
@@ -479,8 +479,8 @@ bool CurveStore::Append(const CurveObservation& obs, int64_t nowSeconds) {
         // The last recorded value of the PRIMARY currency. When the newest point does
         // not carry it, there is nothing to compare against and the value counts as
         // changed (the same answer as "we could not read the old value").
-        const CurvePoint& newest = buf_[(next_ + kCapacity - 1) % kCapacity];
-        const CurvePoint::Entry* lastPrimary = newest.Find(lastPrimaryCurrency_);
+        const CurveStorePoint& newest = buf_[(next_ + kCapacity - 1) % kCapacity];
+        const CurveStorePoint::Entry* lastPrimary = newest.Find(lastPrimaryCurrency_);
 
         // ★ Compare AMOUNTS, not text. "18.80" and "18.8" are the same balance written
         //   differently, and §2.1 is about the balance changing, not about the endpoint
@@ -521,10 +521,10 @@ bool CurveStore::Append(const CurveObservation& obs, int64_t nowSeconds) {
         clearReason_ = "no timestamp";
     }
 
-    CurvePoint point;
+    CurveStorePoint point;
     for (const CurveObservation::Item& item : obs.observations) {
         if (item.currency.empty()) continue;   // a nameless entry cannot be written down
-        point.entries.push_back(CurvePoint::Entry{
+        point.entries.push_back(CurveStorePoint::Entry{
             item.currency,
             item.amountOk ? item.text : std::string(),
             !item.amountOk});
@@ -532,7 +532,7 @@ bool CurveStore::Append(const CurveObservation& obs, int64_t nowSeconds) {
     if (point.entries.empty()) {
         // No writable currency at all: fall back to the primary alone, which we know
         // parsed, so the point is never an empty object.
-        point.entries.push_back(CurvePoint::Entry{obs.primaryCurrency, primary->text, false});
+        point.entries.push_back(CurveStorePoint::Entry{obs.primaryCurrency, primary->text, false});
     }
 
     buf_[next_] = std::move(point);

@@ -188,8 +188,9 @@ private:
 
 
 // 曲线上的一个点：x、y 都归一化到实体区 [0,1]。
-// 由**显示层之外**（main）按采样历史算好再塞进帧里——渲染层不该知道余额从哪来，
-// 只负责把点连成线（连法用单调三次，见 curve.h）。
+// ★ 规格 §3 之后，这个点由**显示层**（本文件所在的这一层）算好最终位置再塞进帧里：
+//   横向位置、纵向缓动都已经算完，渲染层只负责把点连成线（连法用单调三次，见 curve.h）。
+//   渲染层不再做"逐帧逼近"——那正是规格 §4 要删掉的旧实现。
 struct CurvePoint {
     float x = 0.0f;
     float y = 0.0f;   // 0 = 带子顶部，1 = 底部
@@ -227,7 +228,19 @@ const wchar_t* StatusTextFor(ConnState state);
 void SetCountdownText(const wchar_t* text);
 
 // 合成一段历史（--history-demo=N）：导帧时没有真实历史，用它验证曲线画得对。
+// ★ 规格 §2 之后它喂的是**曲线存储**（Append，只记变化那一条规则照旧生效），
+//   不是旧的 SampleHistory；N=12 时正好得到"11 个点在看 + 第 12 个刚进来"的滚动起点。
 void PrimeHistoryForDemo(int points);
 const wchar_t* CountdownText();
+
+// ---- 曲线的滚动计时（规格 §3，导帧口子）----
+// --curve-frame=k：把滚动计时器**冻结**在 k/60 秒，于是"滚动中的第 k 帧"可以用
+// --export-frame=1 单独导出（帧状态是 k 的纯函数，不必连画 k 帧）。
+// 必须在任何推进过计时器的循环**之后**调用；不带这个参数时导出路径照旧（一帧一个进程）。
+void SetCurveScrollFrame(int frame);
+
+// 一行诊断：存储里有几个点、滚动计时器停在哪一帧、进度多少。
+// 这一层不写日志（约定：显示层只返回文本，写文件由 main 做），所以返回字符串给 main。
+std::string CurveStateLine();
 
 }  // namespace dshb

@@ -32,7 +32,7 @@
 using dshb::Amount;
 using dshb::CurveLoadResult;
 using dshb::CurveObservation;
-using dshb::CurvePoint;
+using dshb::CurveStorePoint;
 using dshb::CurveStore;
 using dshb::ParseAmount;
 
@@ -92,15 +92,15 @@ std::string Num(long long value) { return std::to_string(value); }
 std::string Quote(const std::string& text) { return "\"" + text + "\""; }
 
 // "CNY=18.80", or "CNY=<absent>" when the point does not carry the currency.
-std::string AmountText(const CurvePoint& point, const std::string& currency) {
-    const CurvePoint::Entry* entry = point.Find(currency);
+std::string AmountText(const CurveStorePoint& point, const std::string& currency) {
+    const CurveStorePoint::Entry* entry = point.Find(currency);
     if (!entry) return currency + "=<no such entry>";
     return currency + "=" + (entry->missing ? std::string("<absent>") : Quote(entry->text));
 }
 
 // "[18.80, 18.80]" -- values, comma separated, in point order. Unquoted on purpose:
 // this is a comparison key, not JSON.
-std::string Contents(const std::vector<CurvePoint>& points, const std::string& currency) {
+std::string Contents(const std::vector<CurveStorePoint>& points, const std::string& currency) {
     std::string out = "[";
     for (std::size_t i = 0; i < points.size(); ++i) {
         if (i != 0) out += ", ";
@@ -112,10 +112,10 @@ std::string Contents(const std::vector<CurvePoint>& points, const std::string& c
 // "[18.80,18.8]" -- the bare amounts, comma separated with NO space, "?" for a point
 // without that currency and "-" for an entry that is present but null. Written by
 // helper and compared by helper, so the separator is never hand-typed twice.
-std::string AllTexts(const std::vector<CurvePoint>& points, const std::string& currency) {
+std::string AllTexts(const std::vector<CurveStorePoint>& points, const std::string& currency) {
     std::string out = "[";
     for (std::size_t i = 0; i < points.size(); ++i) {
-        const CurvePoint::Entry* entry = points[i].Find(currency);
+        const CurveStorePoint::Entry* entry = points[i].Find(currency);
         if (i != 0) out += ",";
         out += entry ? (entry->missing ? std::string("-") : entry->text) : std::string("?");
     }
@@ -275,14 +275,14 @@ std::vector<std::string> CountUp(int first, int count) {
 
 // Writes the store and returns the file's points, read back by a FRESH store, so
 // "the file holds N points" is measured from the file and not from memory.
-std::vector<CurvePoint> Reload(const std::string& path, CurveLoadResult* out) {
+std::vector<CurveStorePoint> Reload(const std::string& path, CurveLoadResult* out) {
     CurveStore store;
     const CurveLoadResult result = store.Load(path);
     if (out) *out = result;
     return store.Points();
 }
 
-std::string PointSummary(const std::vector<CurvePoint>& points) {
+std::string PointSummary(const std::vector<CurveStorePoint>& points) {
     std::string out = "[";
     for (std::size_t i = 0; i < points.size(); ++i) {
         if (i != 0) out += ", ";
@@ -296,7 +296,7 @@ std::string PointSummary(const std::vector<CurvePoint>& points) {
     return out + "]";
 }
 
-bool SamePoints(const std::vector<CurvePoint>& a, const std::vector<CurvePoint>& b) {
+bool SamePoints(const std::vector<CurveStorePoint>& a, const std::vector<CurveStorePoint>& b) {
     if (a.size() != b.size()) return false;
     for (std::size_t i = 0; i < a.size(); ++i) {
         if (a[i].entries.size() != b[i].entries.size()) return false;
@@ -333,10 +333,10 @@ void RunChecks(Harness* h, const ProbeDir& probe, bool verbose) {
         /* one different value: must append exactly one */
         const bool a3 = store.Append(Cny("18.60"), t0 + 30);
 
-        const std::vector<CurvePoint> mem = store.Points();
+        const std::vector<CurveStorePoint> mem = store.Points();
         store.Save(file);
         CurveLoadResult reloaded;
-        const std::vector<CurvePoint> disk = Reload(file, &reloaded);
+        const std::vector<CurveStorePoint> disk = Reload(file, &reloaded);
 
         const std::string memContents = Contents(mem, "CNY");
         const bool ok = mem.size() == 2 && a0 && !a1 && !a2 && a3 &&
@@ -363,15 +363,15 @@ void RunChecks(Harness* h, const ProbeDir& probe, bool verbose) {
         store.Save(file);
 
         CurveLoadResult reloaded;
-        const std::vector<CurvePoint> disk = Reload(file, &reloaded);
+        const std::vector<CurveStorePoint> disk = Reload(file, &reloaded);
 
         std::vector<std::string> expected;
         for (int v = 4; v <= 15; ++v) expected.push_back(std::to_string(v) + ".00");
 
-        std::vector<CurvePoint> mem = store.Points();
+        std::vector<CurveStorePoint> mem = store.Points();
         bool contentsMatch = mem.size() == CurveStore::kCapacity;
         for (std::size_t i = 0; contentsMatch && i < mem.size(); ++i) {
-            const CurvePoint::Entry* entry = mem[i].Find("CNY");
+            const CurveStorePoint::Entry* entry = mem[i].Find("CNY");
             contentsMatch = entry && !entry->missing && entry->text == expected[i];
         }
 
@@ -416,12 +416,12 @@ void RunChecks(Harness* h, const ProbeDir& probe, bool verbose) {
         // would silently hold one point instead of five -- which is exactly what an
         // earlier version of this case did, and why the values here are distinct.
 
-        const std::vector<CurvePoint> before = store.Points();
+        const std::vector<CurveStorePoint> before = store.Points();
         store.Save(file);
         bool readOk = false;
         const std::string raw = ReadBytes(file, &readOk);
         CurveLoadResult reloaded;
-        const std::vector<CurvePoint> after = Reload(file, &reloaded);
+        const std::vector<CurveStorePoint> after = Reload(file, &reloaded);
 
         // Expected values are built with the same helper that prints them, so the
         // separator and the "present but null" marker are never hand-typed twice.
@@ -431,8 +431,8 @@ void RunChecks(Harness* h, const ProbeDir& probe, bool verbose) {
         const bool cnyExact = AllTexts(after, "CNY") == cnyAsText && AllTexts(before, "CNY") == cnyAsText;
         const bool usdExact = AllTexts(after, "USD") == usdAsText && AllTexts(before, "USD") == usdAsText;
 
-        const CurvePoint::Entry* first = after.empty() ? nullptr : after.front().Find("USD");
-        const CurvePoint::Entry* second = (after.size() < 2) ? nullptr : after[1].Find("USD");
+        const CurveStorePoint::Entry* first = after.empty() ? nullptr : after.front().Find("USD");
+        const CurveStorePoint::Entry* second = (after.size() < 2) ? nullptr : after[1].Find("USD");
         const bool absentStaysAbsent = first && first->missing && first->text.empty() &&
                                        second && !second->missing && second->text == "1234567.89";
         const bool fileSaysNull = raw.find("\"USD\": null") != std::string::npos;
@@ -497,9 +497,9 @@ void RunChecks(Harness* h, const ProbeDir& probe, bool verbose) {
             std::printf("  per point  before: %s\n", PointSummary(before).c_str());
             std::printf("  per point  after : %s\n", PointSummary(after).c_str());
             std::printf("  entries    after :");
-            for (const CurvePoint& point : after) {
+            for (const CurveStorePoint& point : after) {
                 std::printf(" [");
-                for (const CurvePoint::Entry& e : point.entries) {
+                for (const CurveStorePoint::Entry& e : point.entries) {
                     std::printf("%s=%s ", e.currency.c_str(), e.missing ? "<null>" : e.text.c_str());
                 }
                 std::printf("]");
@@ -797,13 +797,13 @@ void RunChecks(Harness* h, const ProbeDir& probe, bool verbose) {
         store.Append(CnyUsd("12.05", "5.40", true), kAnchor - 20);
         store.Append(CnyUsd("11.9999", "5.40", true), kAnchor - 10);
 
-        const std::vector<CurvePoint> before = store.Points();
+        const std::vector<CurveStorePoint> before = store.Points();
         const int64_t stampBefore = store.lastUpdate();
         const bool saved = store.Save(file);
 
         CurveStore reloaded;
         const CurveLoadResult result = reloaded.Load(file);
-        const std::vector<CurvePoint> after = reloaded.Points();
+        const std::vector<CurveStorePoint> after = reloaded.Points();
 
         bool readOk = false;
         const std::string raw = ReadBytes(file, &readOk);

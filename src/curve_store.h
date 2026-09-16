@@ -94,7 +94,15 @@ namespace dshb {
 //   precision is invented here. `missing` means "this response had no such
 //   currency" -- that is NOT a zero balance, and the two must never be merged
 //   (the same distinction the API layer refuses to blur).
-struct CurvePoint {
+//
+// ★ WHY THE NAME IS `CurveStorePoint` and not `CurvePoint`: the display layer
+//   (widget_display.h) already declares `dshb::CurvePoint` -- a normalised
+//   screen point {x,y} for the renderer. Both live in namespace dshb, so the
+//   two names collided the moment one translation unit needed both (the display
+//   layer is exactly that unit: it reads this store and writes those points).
+//   This one is the STORE's record (currencies and amounts), so it carries the
+//   store's name; the display's name is unchanged.
+struct CurveStorePoint {
     struct Entry {
         std::string currency;    // API code, e.g. "CNY" / "USD"
         std::string text;        // verbatim decimal string; empty when missing
@@ -193,13 +201,13 @@ public:
     void Clear();
 
     // Oldest -> newest (the newest point is the last element).
-    std::vector<CurvePoint> Points() const;
+    std::vector<CurveStorePoint> Points() const;
 
     // The newest n points, oldest -> newest; fewer when the store holds fewer.
-    std::vector<CurvePoint> Newest(std::size_t n) const;
+    std::vector<CurveStorePoint> Newest(std::size_t n) const;
 
     // §2.2: the display layer takes the newest 11 of these.
-    std::vector<CurvePoint> DisplayPoints() const { return Newest(kCapacity - 1); }
+    std::vector<CurveStorePoint> DisplayPoints() const { return Newest(kCapacity - 1); }
 
     std::size_t size() const { return count_ < kCapacity ? count_ : kCapacity; }
     bool empty() const { return size() == 0; }
@@ -221,7 +229,7 @@ public:
     const std::string& lastPrimaryCurrency() const { return lastPrimaryCurrency_; }
 
 private:
-    CurvePoint buf_[kCapacity]{};
+    CurveStorePoint buf_[kCapacity]{};
     std::size_t count_ = 0;   // points written in total (may exceed the capacity)
     std::size_t next_ = 0;    // next slot to write
     int64_t updateAt_ = 0;    // §2.4 "update_at": the last update, in seconds

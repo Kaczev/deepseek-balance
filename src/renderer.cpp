@@ -68,20 +68,16 @@ int g_digitDrawMode = 0;
 
 // 氛围曲线开关：--no-curve 关掉它，用于 A/B 对比（关掉后文字位置必须逐像素不变）
 bool g_curveEnabled = true;
-int g_curveMode = 0;
 
-// 曲线的平滑状态：上一帧真正画出去的点（归一化）。列数变化时把旧曲线重采样到
-// 新的 x 网格上再逐点逼近——于是"横向平移"也变成了动画，而不是瞬移。
-std::vector<std::pair<float, float>> g_curveDrawn;
-bool g_curveDrawnValid = false;   // 0 = 用采样历史画（默认）；1 = D1 的假正弦（--curve=sine，对照用）
-
-// 氛围曲线（D1）：一条与数据无关的正弦线，画在**所有文字之前** = 数字后面。
-// 采样密度 1 像素一个点，所以肉眼看到的是连续曲线，不会出现折角
+// 氛围曲线：点由显示层算好（规格 §3），渲染层只连线——
+// 采样密度 1 像素一个点，所以肉眼看到的是连续曲线，不会出现折角。
+// ★ 这里不再做"整条重采样 + 逐点逼近"（规格 §4 明确替换掉的那套）：
+//   横向滚动与纵向缓动现在都是显示层里"帧号 k 的纯函数"，渲染层再插一层平滑
+//   只会让导帧量到的位置和公式对不上。
 namespace { float g_lastLinePitch = 0.0f; }
 float LastLinePitchDip() { return g_lastLinePitch; }
 
 void SetCurveEnabled(bool on) { g_curveEnabled = on; }
-void SetCurveMode(int mode) { g_curveMode = mode; }
 
 void SetLayoutProbe(bool on) {
     g_layoutProbe = on;
@@ -399,21 +395,18 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
     auto px = [&](float xn) { return x0 + xn * (x1 - x0); };
     auto py = [&](float yn) { return (cy - amp) + yn * (2.0f * amp); };
 
-    // 要画的点列（归一化）。渲染层只管连线，不知道余额从哪来。
+    // 要画的点列（归一化）。渲染层只管连线，不知道余额从哪来——按规格 §3，点已经
+    // 是显示层算好的最终位置（横向滚动、纵向缓动都算完了），这里一个都不再改。
     std::vector<std::pair<float, float>> pts;
-    if (g_curveMode == 1) {
-        // 对照用：D1 那条与数据无关的假正弦（--curve=sine）
-        for (int i = 0; i <= 200; ++i) {
-            const float u = static_cast<float>(i) / 200.0f;
-            pts.push_back({u, 0.5f - 0.5f * std::sin(2.0f * 3.14159265f * kCurvePeriods * u)});
-        }
-    } else if (!f.curveHasData || f.curve.size() < 2) {
+    if (!f.curveHasData || f.curve.size() < 2) {
         // 没有数据 = 平的（所有者规则），画在带子中线。
         pts.push_back({0.0f, 0.5f});
         pts.push_back({1.0f, 0.5f});
     } else {
         // 单调三次插值（curve.h）：我们只在采样时刻知道余额，区间内的形状是插出来的；
         // 单调插值保证不过冲（普通样条会画出从未出现过的余额）。
+        // ★ 只按 u∈[0,1] 采样 = 横向裁剪到实体区（规格 §3）：越界的段自然画不出来，
+        //   左右两端正好落在实体区的两条边上。
         std::vector<double> xs;
         std::vector<double> ys;
         for (const CurvePoint& p : f.curve) {
@@ -443,55 +436,12 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
         fac->Release();
         return;
     }
-    // ---- 平滑：把上一帧的点朝这一帧的目标点逼近 ----
-    // 目标点数与上一帧不同时（端点点进出），先在**旧曲线上按新 x 重采样**，
-    // 这样"整条平移"表现为逐点的 y 差，被同一个缓动吃掉。
-    if (g_curveMode == 0) {
-        if (!g_curveDrawnValid || g_curveDrawn.size() != pts.size()) {
-            std::vector<std::pair<float, float>> resampled;
-            resampled.reserve(pts.size());
-            for (const std::pair<float, float>& tp : pts) {
-                float y = tp.second;   // 没有旧曲线时直接用目标值（首帧、或刚切换）
-                if (g_curveDrawnValid && g_curveDrawn.size() >= 2) {
-                    const float xq = tp.first;
-                    if (xq <= g_curveDrawn.front().first) {
-                        y = g_curveDrawn.front().second;
-                    } else if (xq >= g_curveDrawn.back().first) {
-                        y = g_curveDrawn.back().second;
-                    } else {
-                        for (size_t i = 0; i + 1 < g_curveDrawn.size(); ++i) {
-                            const float x0 = g_curveDrawn[i].first;
-                            const float x1 = g_curveDrawn[i + 1].first;
-                            if (xq >= x0 && xq <= x1 && x1 > x0) {
-                                const float u = (xq - x0) / (x1 - x0);
-                                y = g_curveDrawn[i].second +
-                                    u * (g_curveDrawn[i + 1].second - g_curveDrawn[i].second);
-                                break;
-                            }
-                        }
-                    }
-                }
-                resampled.push_back({tp.first, y});
-            }
-            g_curveDrawn.swap(resampled);
-        }
-        for (size_t i = 0; i < pts.size() && i < g_curveDrawn.size(); ++i) {
-            const float d = pts[i].second - g_curveDrawn[i].second;
-            if (std::fabs(d) < kCurveSmoothSnap) {
-                g_curveDrawn[i].second = pts[i].second;
-            } else {
-                g_curveDrawn[i].second += d * kCurveSmoothRate;
-            }
-            g_curveDrawn[i].first = pts[i].first;
-        }
-        g_curveDrawnValid = true;
-    } else {
-        g_curveDrawn = pts;          // 对照模式（假正弦）不平滑，保持原样
-        g_curveDrawnValid = true;
-    }
-
+    // ★ 这里**没有**平滑：点的位置是显示层按 k 的纯函数算出来的（规格 §3 §4）。
+    //   旧实现（g_curveDrawn：把上一帧画出来的点朝这一帧逼近）已经删掉——它会让
+    //   导帧量到的像素位置与公式对不上，而且"滚动"与"纵向缓动"现在各自已经有了
+    //   自己的时间函数。
     bool first = true;
-    for (const std::pair<float, float>& pt : g_curveDrawn) {
+    for (const std::pair<float, float>& pt : pts) {
         const float X = px(pt.first);
         const float Y = py(pt.second);
         if (first) {
