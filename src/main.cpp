@@ -163,6 +163,19 @@ void SelfTestLog(const wchar_t* fmt, ...) {
     }
 }
 
+// UTF-8（显示层给的窄字符串）-> UTF-16，只给日志用。
+// ★ 为什么不直接把那个窄串喂给 %hs：SelfTestLog 的窄参数是按当前 C 区域设置转换的，
+//   中文（UTF-8 多字节）会被逐字节当成宽字符，日志里就成了乱码。逐字节 != 解码。
+std::wstring WidenUtf8(const std::string& text) {
+    if (text.empty()) return std::wstring();
+    const int need = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                                         nullptr, 0);
+    if (need <= 0) return std::wstring();
+    std::wstring out(static_cast<std::size_t>(need), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), need);
+    return out;
+}
+
 double NowWallMs() {
     FILETIME ft{};
     GetSystemTimeAsFileTime(&ft);
@@ -1081,10 +1094,19 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         {
             const dshb::ConnState st = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
             const bool currencyKnown = g_states.hasGood() && (g_display.shownCurrency() == "CNY" || g_display.shownCurrency() == "USD");
-            renderer.SetWidgetFrame(dshb::BuildWidgetFrame(
+            const dshb::WidgetFrame frame = dshb::BuildWidgetFrame(
                 st, g_display, currencyKnown,
                 ((g_display.shownCurrency() == "CNY") ? L"\u00A5"
-                 : ((g_display.shownCurrency() == "USD") ? L"$" : L""))));
+                 : ((g_display.shownCurrency() == "USD") ? L"$" : L"")));
+            renderer.SetWidgetFrame(frame);
+            // 诊断（只在导帧这一条路径上）：这一帧底部那行字的**原文**，以及它是从
+            // 哪个速率状态、哪个平滑速率算出来的。导帧进程没有控制台，PNG 里的字又要
+            // OCR 才读得回来，所以把帧携带的那串字符逐字写进日志——验收要比的就是这一份。
+            SelfTestLog(L"[frame] amount=%hs status=%hs rate=%.10f zeroTime=\"%ls\" (utf8bytes=%zu)",
+                        frame.amountText.c_str(),
+                        dshb::RateStatusName(g_display.rateEstimate().status),
+                        g_display.rateDisplay(), WidenUtf8(frame.zeroTimeText).c_str(),
+                        frame.zeroTimeText.size());
         }
 
         if (g_debug) {

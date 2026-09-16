@@ -272,6 +272,62 @@ void BuildFrameCurve(WidgetFrame* f) {
 }
 
 // ---------------------------------------------------------------------------
+// 消耗速率：把**本文件自己的曲线存储**变成估计器的输入（设计 §7.2 §7.3）
+// ---------------------------------------------------------------------------
+//  ★ 只取"当前显示的那个币种"，和曲线画的那条序列**故意不同**：曲线永远画数据层
+//    记下的那条（primary 条目），而速率是给用户看的——他要的是"我现在看的这个
+//    数字还剩多久"，所以必须用他正在看的币种。两个口径各自都要成立。
+//  ★ 每个点用它**自己的**时间戳（curve_store §2.3b）：`atValid == false` 的点就是
+//    "没有时间"，照样传成 atValid=false 交给估计器（它会因此报"不显著"），
+//    **绝不**拿存储的全局 update_at 顶替——那会把"没人测量过"变成一个时间。
+std::vector<RateInputPoint> RateInputForCurrency(const std::string& currency) {
+    const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
+    std::vector<RateInputPoint> out;
+    out.reserve(points.size());
+    for (const CurveStorePoint& point : points) {
+        RateInputPoint p;
+        p.at = point.at;
+        p.atValid = point.atValid;
+
+        const CurveStorePoint::Entry* entry = nullptr;
+        if (currency.empty()) {
+            // 还没选过币种（第一次样本之前）：退回这个点的第一个有值的条目，
+            // 与曲线取值的口径一致。这不是"随便挑一个"——它就是数据层记这个点时
+            // 用的那个币种（primary）。
+            for (const CurveStorePoint::Entry& e : point.entries) {
+                if (!e.missing && !e.text.empty()) { entry = &e; break; }
+            }
+        } else {
+            // ★ 有选中的币种时**不回退**：这个点没有该币种就是"这个点没有可用金额"。
+            //   回退到别的币种等于把两条不同的曲线接在一起，比不显著更糟。
+            entry = point.Find(currency);
+        }
+        if (entry != nullptr && !entry->missing && !entry->text.empty()) {
+            Amount amount;
+            if (ParseAmount(entry->text, &amount)) {
+                p.amountRaw = amount.raw;
+                p.amountValid = true;
+            }
+        }
+        out.push_back(p);
+    }
+    return out;
+}
+
+// UTF-16（文案在估计器里就是宽字符）-> UTF-8（WidgetFrame 里的字段是窄字符，
+// 渲染层自己再 Widen 回去）。失败时给空串：宁可这一行不画，也不画半截乱码。
+std::string Utf8FromWide(const std::wstring& text) {
+    if (text.empty()) return std::string();
+    const int need = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    if (need <= 0) return std::string();
+    std::string out(static_cast<std::size_t>(need), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), need,
+                        nullptr, nullptr);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // 数字那一侧用的小工具
 // ---------------------------------------------------------------------------
 
@@ -615,9 +671,37 @@ void DisplayedAmount::SyncValueFromTrips() {
 // 曲线的滚动计时器也在这里推进（规格 §3：由帧 dt 推进，追加时归零）。
 double DisplayedAmount::Update(double dtSeconds) {
     AdvanceCurve(dtSeconds);
+    AdvanceRate(dtSeconds);       // 消耗速率（§7.3）：每帧重算 + 走一步弹簧
     const double shown = UpdateValue(dtSeconds);
     AdvancePlaces(dtSeconds, TextToShow());
     return shown;
+}
+
+// 每帧一次：从曲线存储重算估计，再按这一帧的 dt 走一步弹簧。
+// dt 是调用方给的帧 dt（休眠唤醒后的巨型 dt 已被 Clock::Tick 钳到 50 ms；
+// RateSpringStep 自己还会再钳一次，见 rate_estimator.cpp）。
+void DisplayedAmount::AdvanceRate(double dtSeconds) {
+    rateEstimate_ = EstimateRate(RateInputForCurrency(currencyShown_));
+
+    // 目标：只有显著（余额在掉）时才是正数；不显著 / 空 / 不消耗都以 0 为目标。
+    const double target = (rateEstimate_.status == RateStatus::Significant)
+                              ? rateEstimate_.rateYuanPerMinute
+                              : 0.0;
+
+    // ★ 什么时候**不做平滑、直接落位**：这三种都是"分支切换"，不是数字在动。
+    //   1) 第一次算出来：弹簧还没有起点；
+    //   2) 上一帧没有可用速率（显示 0）、这一帧有了：中间那几帧的极小速率换算成
+    //      "归零时间"是几十万分钟，屏幕上会先闪一下「超过 7 天」才变成正常值
+    //      （tau=6 s、60 Hz 下要 4 秒才收敛到 1% 以内，实测）；
+    //   3) 这一帧没有可用速率：那行字要么是「—」要么是「暂无法预测」，都不是数字，
+    //      平滑一个看不见的数没有意义。
+    //   §7.4 的重绘规则本来就写着"分支变了 -> 一定重画"，这里是同一个道理。
+    if (!rateSeeded_ || rateDisplay_ <= 0.0 || target <= 0.0) {
+        rateDisplay_ = target;
+        rateSeeded_ = true;
+        return;
+    }
+    rateDisplay_ = RateSpringStep(rateDisplay_, target, dtSeconds);
 }
 
 
@@ -768,22 +852,30 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     // 每一位的纵坐标交给渲染层。空则渲染层退回整串绘制。
     f.places = amount.places();
 
-    // 清零预估（占位）：**只放文案，不接速率计算**。
+    // 清零预估（C9）：**接上了**估计器（原来这里是一句占位文案「按当前速度，约 X
+    // 小时后归零」，所有者等了它三轮）。
     //
-    // 所有者当前要的是"把这行字摆上去、好调排版"，所以时间用 X 代替，
-    // 不去算一个还没有依据的数字——编一个假的时长比空着更糟（设计 §7.4 的
-    // 原则：预估必须带口径，不能给一个没人信的精确值）。
-    // 真正的速率估计与四种分支（暂无法预测 / — / 已用尽 / 超过 7 天）等
-    // 有了历史样本再按 §7.3 §7.4 接上；接的时候只改这里，渲染层不用动。
+    // 口径：
+    //   * 速率 = 这一层每帧从曲线存储重算、并用弹簧平滑过的那个值（amount.rateDisplay()），
+    //     状态来自估计器本身（Significant / NotConsuming / Insignificant / Empty）。
+    //   * 余额用**目标值**（amount.target()）而不是动画值：动画途中穿过 0 不该让这行字闪。
+    //   * 时间用当前墙钟：§7.4 要求"剩余 ≤ 6 小时时补一个绝对时刻"，那需要本地时钟。
+    //     估计器自己是纯函数（没有时钟），时钟只在文案这一层用。
+    //   * 五个分支与中文逐字由 ZeroTimeFor 决定（暂无法预测 / — / 已用尽 / 超过 7 天 /
+    //     按当前速度，约 …后归零），这里不改写一个字。
     //
-    // 文案形态按 §7.4 的两种分支预留：相对时长在前，剩余较短时后面再补一个
-    // 绝对时刻（设计原文示例「按当前速度，约 2 小时后归零」+「约 14:32」）。
-    // 整行偏长，若排版放不下，先砍掉括号里的绝对时刻。
-    // ★ 所有者：欠款与为 0 时不显示这一行。
-    //   欠款时说"约 X 小时后归零"是废话（已经欠了），余额为 0 时更荒谬。
-    //   判定用**目标值**而不是动画值：动画途中穿过 0 不该让这行字闪。
-    const bool canEstimate = haveNumber && amount.target() > 0.0;
-    f.zeroTimeText = canEstimate ? "按当前速度，约 X 小时后归零" : "";
+    // ★ 门（所有者 2026-09-16 改）：**只有欠款（余额为负）才藏这一行**。
+    //   原来写的是 `amount.target() > 0.0`，那会把「已用尽」（余额恰好 0）和
+    //   「—」（不消耗）一起藏掉——而这两条正是估计器算出来的结论，藏了就等于
+    //   余额归零时那行字凭空消失。
+    const bool canEstimate = haveNumber && amount.target() >= 0.0;
+    if (canEstimate) {
+        RateEstimate smoothed = amount.rateEstimate();
+        smoothed.rateYuanPerMinute = amount.rateDisplay();
+        const int64_t balanceRaw = static_cast<int64_t>(std::llround(amount.target() * kUnitsPerYuan));
+        const ZeroTimeText line = ZeroTimeFor(smoothed, balanceRaw, static_cast<int64_t>(std::time(nullptr)));
+        f.zeroTimeText = Utf8FromWide(line.text);   // UTF-16 -> UTF-8（渲染层自己再 Widen 回去）
+    }
 
     // ★ 逐位里程表：把"这一帧的连续金额"交给渲染层，**任何时刻都要给**。
     //

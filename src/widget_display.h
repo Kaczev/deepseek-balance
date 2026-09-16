@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "rate_estimator.h"
 #include "roll_axis.h"
 #include "state_machine.h"
 #include "tuning.h"
@@ -92,6 +93,14 @@ public:
 
     // 每帧推进。返回当前应当显示的余额（元）。
     double Update(double dtSeconds);
+
+    // ---- 消耗速率（设计 §7.3 的弹簧 / §7.4 的底部文案）----
+    // ★ 速率在这里**每帧从曲线存储重算**：输入就是本文件那个 g_curveStore 里的点，
+    //   取"当前显示的币种"，用每个点**自己的**时间戳（没有时间的点就是不显著，
+    //   绝不拿全局 update_at 顶替）。结果是纯函数 EstimateRate 的输出，弹簧按帧的
+    //   dt 把它平滑成 rateDisplay，两者都留在成员里，BuildWidgetFrame 拿来算底部那行字。
+    const RateEstimate& rateEstimate() const { return rateEstimate_; }
+    double rateDisplay() const { return rateDisplay_; }
 
     bool hasValue() const { return hasValue_; }
     // 连续失败到达阈值后调用：显示回到"没有值"（即 --.--）。
@@ -184,6 +193,13 @@ private:
     // "有哪些位次"由文本决定——高位是 0 时文本里没有这一位，于是自动隐藏。
     void AdvancePlaces(double dtSeconds, const std::string& amountText);
     double UpdateValue(double dtSeconds);   // Update 的内核（只推进显示值）
+
+    // 速率：每帧从曲线存储重算一次，再按帧的 dt 走一步弹簧（见头文件上面那一段）。
+    void AdvanceRate(double dtSeconds);
+
+    RateEstimate rateEstimate_;   // 最近一次 EstimateRate 的结果（纯函数输出）
+    double rateDisplay_ = 0.0;    // rate_display：被弹簧平滑过的速率，元/分钟
+    bool rateSeeded_ = false;     // 弹簧有没有一个起点（没有时第一次直接落位）
 };
 
 
@@ -208,7 +224,7 @@ struct WidgetFrame {
     // >=2 个点 = 用单调三次连成曲线（curve.h）。x、y 都归一化到实体区 [0,1]。
     std::vector<CurvePoint> curve;
     bool curveHasData = false;   // false 时一律按平线画
-    std::string zeroTimeText;       // 清零预估（C9 填；现在留占位）
+    std::string zeroTimeText;       // 清零预估（C9）：由估算速率与当前余额算出的那行字（UTF-8）
     // 每一位当前的纵坐标（渲染层按它画数字）。空 = 渲染层退回整串绘制。
     std::vector<axis::PlaceCoord> places;
 };

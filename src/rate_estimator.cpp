@@ -11,13 +11,8 @@
 namespace dshb {
 namespace {
 
-// 定点 -> 元。**只有这一个方向**：拟合用 double，但金额的存储与比较始终是定点。
+// 定点 -> 元。**只有这一个方向**：速率用 double，但金额的存储与比较始终是定点。
 constexpr double kUnitsPerYuanD = static_cast<double>(kUnitsPerYuan);
-
-// 拟合前的斜率下限（元/分钟）。低于它就算"这条序列根本没在变"。
-// 为什么需要它：半天掉一分钱时，OLS 给出的斜率是一个约 1e-6 元/分钟的极小值，
-// 它不是"消耗速度"，只是首尾差被摊到时间上。报出去等于编了一个数字。
-constexpr double kFlatRateCutoffYuanPerMinute = 1e-6;
 
 // 十的幂，手写一份免得引入 <cmath> 之外的约定。
 double Pow10(int digits) {
@@ -33,7 +28,13 @@ double RoundToDigits(double value, int digits) {
 }
 
 std::string Num(long long value) { return std::to_string(value); }
-int64_t Abs64(int64_t value) { return value < 0 ? -value : value; }
+
+// 定点金额 -> 四位小数的"元"，只用在诊断文本里（note）。
+std::string Yuan(int64_t raw) {
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "%.4f", static_cast<double>(raw) / kUnitsPerYuanD);
+    return buf;
+}
 
 bool MostlyFinite(double value) { return std::isfinite(value); }
 
@@ -43,7 +44,7 @@ const char* RateStatusName(RateStatus status) {
     switch (status) {
         case RateStatus::Empty: return "Empty";
         case RateStatus::Insignificant: return "Insignificant";
-        case RateStatus::Rising: return "Rising";
+        case RateStatus::NotConsuming: return "NotConsuming";
         case RateStatus::Significant: return "Significant";
     }
     return "?";
@@ -62,7 +63,7 @@ const char* ZeroTimeKindName(ZeroTimeKind kind) {
 }
 
 // ===========================================================================
-// §7.3 的估计本体
+// §7.2 §7.3 的估计本体
 // ===========================================================================
 RateEstimate EstimateRate(const std::vector<RateInputPoint>& pointsOldestFirst) {
     RateEstimate result;
@@ -92,13 +93,17 @@ RateEstimate EstimateRate(const std::vector<RateInputPoint>& pointsOldestFirst) 
         previousUndated = false;
     }
 
-    // -- 2. 只保留"金额和时间都可用"的点，它们按时间顺序进拟合 ----------------
-    std::vector<RateInputPoint> raw;
-    raw.reserve(pointsOldestFirst.size());
+    // -- 2. 窗口 = "金额和时间都可用"的点，**一个都不剔除** --------------------
+    //   ★ 这里不再剔除回升的点（旧口径丢的是"发现跳变的那一个点"）。回升只让**它自己
+    //     那一个台阶**贡献 0（分子只加下降量），它的时间照样留在跨度里——那段时间确实
+    //     过去了。把回升的点丢出窗口正是那次回归的病根：充值之后每个点都比前一个低水位
+    //     高、全被判成跳变丢掉，一次充值就把跨度和样本一起打没。
+    std::vector<RateInputPoint> usable;
+    usable.reserve(pointsOldestFirst.size());
     for (const RateInputPoint& point : pointsOldestFirst) {
-        if (point.amountValid && point.atValid) raw.push_back(point);
+        if (point.amountValid && point.atValid) usable.push_back(point);
     }
-    if (raw.empty()) {
+    if (usable.empty()) {
         // ★ "Empty" means exactly this: not one point in the series carried a usable
         //   AMOUNT -- there is nothing to look at at all. Every other way of being
         //   inconclusive is "Insignificant": a series of undated points HAS a balance to
@@ -116,127 +121,102 @@ RateEstimate EstimateRate(const std::vector<RateInputPoint>& pointsOldestFirst) 
         result.note = "no point carries a usable amount";
         return result;
     }
-
-    // -- 3. ★ 正跳变先剔除：**发现跳变的那一个点丢掉**，只丢它一个 --------------
-    //   ★ 比的是**紧邻的前一个点**，不是"上一个保留点"。这个区别是探针 case9 逼出来的：
-    //     拿"上一个保留点"当基准，充值之后每一个点都比那个低水位高，于是**充值之后的
-    //     所有点全被当成跳变丢掉**——跨度塌掉、样本塌掉，一次充值就把整个估计器打成
-    //     "不显著"。那既不是 §7.2 要的，也会让"充完接着花"这种最常见的场景读不出速率。
-    //   §7.2 要丢的是**跳变那一刻**：余额涨了 = 这一刻不是消费，仅此而已。跳变之后的
-    //   点每一个都仍然是"相对上一次的余额变化"，照常参与拟合。
-    std::vector<RateInputPoint> usable;
-    usable.reserve(raw.size());
-    int jumps = 0;
-    for (std::size_t i = 0; i < raw.size(); ++i) {
-        if (i > 0 && raw[i].amountRaw > raw[i - 1].amountRaw) {
-            ++jumps;      // 充值 / 赠金：不是负消费，也永远不许进入拟合（§7.2）
-            continue;
-        }
-        usable.push_back(raw[i]);
-    }
     result.usablePoints = static_cast<int>(usable.size());
-    // The span is reported even when the checks below refuse the series: a reader has to
-    // be able to tell "not enough time" from "not enough points", and an evidence line
-    // that says "span=0" for a series that plainly spans ten minutes is a lie.
     result.spanSeconds = usable.size() > 1 ? usable.back().at - usable.front().at : 0;
+
+    // -- 3. ★ 分子：只把**下降**的台阶加起来（所有者的口径）--------------------
+    //   drop = 前一点 − 后一点；drop > 0 -> 真的花了这么多，进分子；drop <= 0 -> 不进分子，
+    //   但**绝不作废窗口**（回升时 drop < 0 只记诊断，它的时间照样留在跨度里）。
+    int64_t dropSumRaw = 0;
+    for (std::size_t i = 1; i < usable.size(); ++i) {
+        const int64_t drop = usable[i - 1].amountRaw - usable[i].amountRaw;
+        if (drop > 0) {
+            dropSumRaw += drop;
+            ++result.decreasingSteps;
+        } else if (drop < 0) {
+            ++result.risingSteps;
+        }
+    }
+    result.dropSumRaw = dropSumRaw;
+
     // What was actually measured, kept alongside the reason for refusing (below): a
     // refusal that replaces the numbers would make every "no" look identical.
     const std::string note = "usable=" + Num(result.usablePoints) + ", span=" +
-                             Num(static_cast<long long>(result.spanSeconds)) + " s, removed " +
-                             Num(jumps) + " positive jump(s)";
+                             Num(static_cast<long long>(result.spanSeconds)) + " s, decreasing steps=" +
+                             Num(result.decreasingSteps) + ", drops=" + Yuan(dropSumRaw) +
+                             " yuan, rising steps=" + Num(result.risingSteps) +
+                             " (a rise contributes 0 and never discards the window), undated=" +
+                             Num(result.undatedPoints) + ", no amount=" + Num(result.unusablePoints);
 
-    // -- 4. 不显著的两条硬判据（§7.3「样本不足」）----------------------------
-    //   ★ "可用的点在减少的点少于 3 个" = 保留点少于 3 个：因为正跳变已经剔掉，
-    //     相邻两个保留点之间不可能上升。所以这里数点就是数"在减少的样本"。
-    //   ★ 5 分钟跨度同样要有：三点挤在 4 秒里，斜率是一个没有意义的数。
-    //   ★ 从这一行往后所有"不给数字"的结论都是 Insignificant，不是 Empty。
-    //     `refusal` 说的是"为什么不肯给数字"，`note` 是测量到的事实；两个都留着，
-    //     所以一句 "the balance did not move" 不会把 "usable=10, span=540s" 挤掉。
+    // 取整之前的原始速率（元/分钟）。**只看不判**：不显著的结论里也照记——"测到了多少"
+    // 和"肯不肯报"是两件事。跨度 <= 0（点的时间不是递增的）时不编一个数：留 0。
+    if (result.spanSeconds > 0) {
+        result.rawRateYuanPerMinute = static_cast<double>(dropSumRaw) / kUnitsPerYuanD * 60.0 /
+                                      static_cast<double>(result.spanSeconds);
+    }
+    if (!MostlyFinite(result.rawRateYuanPerMinute)) {
+        result.note = "the computed rate is not a finite number; " + note;
+        return result;
+    }
+
+    // -- 4. 判定（顺序就是规格，别调换）--------------------------------------
+    //   从这一行往后所有"不给数字"的结论都是 Insignificant，不是 Empty。
+    //   `refusal` 说的是"为什么不肯给数字"，`note` 是测量到的事实；两个都留着。
     result.status = RateStatus::Insignificant;
     std::string refusal;
+
+    // (a) 有点没有自己的时间 -> 不显著。绝不假设点距（曲线规格 §2.3b）。
     if (sawUndated) {
         refusal = "a point has no time of its own (" + Num(result.undatedPoints) +
                   " undated run(s)): a rate would have to assume the spacing";
         result.note = refusal + "; " + note;
         return result;
     }
-    if (result.usablePoints < kRateMinDecreasingSamples) {
-        refusal = "only " + Num(result.usablePoints) +
-                  " usable decreasing sample(s) after removing " + Num(jumps) +
-                  " positive jump(s); " + Num(kRateMinDecreasingSamples) + " are required";
+    // (b) ★ 一个下降台阶都没有 -> 速率**恰好 0**，status = NotConsuming。
+    //     这一条**故意排在两条显著性判据之前**：显著性是"够不够格给一个速率"，
+    //     而"这段没在花钱"本身就是个结论，不该被"样本不够"顶掉。
+    //     两个已知后果，探针 case4/case5 都把它们印出来：
+    //       · 一个点（或跨度 0）的窗口也算"没有下降" -> 破折号。曲线存储"只记变化"，
+    //         所以余额一直不动时环里本来就只有一个点——那正是"不消耗"。
+    //       · 只有回升（充值）的窗口同样 -> 破折号，而不是"暂无法预测"。
+    if (result.decreasingSteps == 0) {
+        result.rateYuanPerMinute = 0.0;
+        result.status = RateStatus::NotConsuming;
+        result.note = "no decreasing step in the window (flat, or rising only); " + note;
+        return result;
+    }
+    // (c) 下降的台阶少于 kRateMinDecreasingSamples 个 -> 不显著。两个台阶可以
+    //     "算出"任何东西，所以这条不能松（所有者的旧决定）。
+    if (result.decreasingSteps < kRateMinDecreasingSamples) {
+        refusal = "only " + Num(result.decreasingSteps) + " decreasing step(s); " +
+                  Num(kRateMinDecreasingSamples) + " are required";
         result.note = refusal + "; " + note;
         return result;
     }
+    // (d) 跨度不到 kRateMinSpanSeconds -> 不显著。10 个台阶挤在 4 秒里，速率是没有意义的数。
     if (result.spanSeconds < kRateMinSpanSeconds) {
         refusal = "time span " + Num(static_cast<long long>(result.spanSeconds)) + " s < " +
                   Num(static_cast<long long>(kRateMinSpanSeconds)) + " s";
         result.note = refusal + "; " + note;
         return result;
     }
-
-    // -- 5. 普通最小二乘（OLS）：斜率 = Σ(t−t̄)(v−v̄) / Σ(t−t̄)² ---------------
-    //   §7.3 文档写的是"稳健回归"，所有者明确换成 OLS（见头文件顶部第 2 条）。
-    //   时间基点取第一个可用的点，免得大 epoch 数进平方和丢精度。
-    const int64_t t0 = usable.front().at;
-    double meanT = 0.0;
-    double meanV = 0.0;
-    for (const RateInputPoint& point : usable) {
-        meanT += static_cast<double>(point.at - t0);
-        meanV += static_cast<double>(point.amountRaw);
-    }
-    meanT /= static_cast<double>(usable.size());
-    meanV /= static_cast<double>(usable.size());
-
-    double cov = 0.0;
-    double varT = 0.0;
-    for (const RateInputPoint& point : usable) {
-        const double dt = static_cast<double>(point.at - t0) - meanT;
-        cov += dt * (static_cast<double>(point.amountRaw) - meanV);
-        varT += dt * dt;
-    }
-    double rawSlope = 0.0;
-    if (varT > 0.0) {
-        // amountRaw 是 1/10000 元，时间是秒 -> 乘 60000 换成"元/分钟"。
-        rawSlope = cov / varT / kUnitsPerYuanD * 60.0;
-    }
-    if (!MostlyFinite(rawSlope)) {
-        result.note = "the fitted slope is not a finite number; " + note;
-        return result;
-    }
-    result.rawSlopeYuanPerMinute = rawSlope;
-
-    // 整条序列根本没动？那"速率 0"是事实本身，不是估计值。
-    const bool noChangeAtAll = usable.front().amountRaw == usable.back().amountRaw;
-
-    result.rateYuanPerMinute = RoundToDigits(rawSlope, kRateRoundDigitsYuanPerMinute);
-    if (noChangeAtAll) {
-        // The balance did not move at all. That is not "we could not tell" -- it is a
-        // rate of exactly zero, which the wording turns into the dash ("不消耗"). Status
-        // Rising carries "rate >= 0" (see the header), so this belongs here and not with
-        // the refusals: reporting it as Insignificant would print "cannot predict yet"
-        // for a balance that is simply sitting still.
+    // (e) 速率 = 分子 / 跨度，取整到 kRateRoundDigitsYuanPerMinute 位。
+    //     分子是下降量之和、跨度为正 -> 取整前的速率**永远 > 0**，所以速率永不为负。
+    result.rateYuanPerMinute = RoundToDigits(result.rawRateYuanPerMinute, kRateRoundDigitsYuanPerMinute);
+    if (!(result.rateYuanPerMinute > 0.0)) {
+        // There WAS a drop, but it is so small that it rounds to zero at the reporting
+        // resolution. Reporting "0" here would be a lie (we measured a drop) and reporting
+        // the unrounded value would be a fabricated number, so this one is a refusal.
+        // Unreachable with real data: the store's spans are at most 86400 s and one raw
+        // unit of drop over that span is still 6.9e-8 yuan/min.
         result.rateYuanPerMinute = 0.0;
-        result.status = RateStatus::Rising;
-        result.note = "the balance did not move at all over the samples; " + note;
-        return result;
-    }
-    if (std::fabs(result.rateYuanPerMinute) < kFlatRateCutoffYuanPerMinute) {
-        // There WAS movement, but the fitted slope is too small to mean anything (half a
-        // cent over a day, where the "slope" is only the endpoint difference spread over
-        // the time). Reporting 1e-6 yuan/min would be a fabricated number, so this one is
-        // a refusal -- unlike the exactly-flat case above.
-        result.rateYuanPerMinute = 0.0;
-        result.status = RateStatus::Insignificant;
-        refusal = "the fitted slope rounds to zero: no consumption to report";
+        refusal = "the computed rate rounds to zero at " + Num(kRateRoundDigitsYuanPerMinute) +
+                  " digits; nothing to report";
         result.note = refusal + "; " + note;
         return result;
     }
-    if (result.rateYuanPerMinute > 0.0) {
-        // 走到这里说明上升**不是**正跳变造成的（正跳变已经剔除），是真的在回升。
-        result.status = RateStatus::Rising;
-        return result;
-    }
     result.status = RateStatus::Significant;
+    result.note = "consumption is the sum of the decreases only; " + note;
     return result;
 }
 
@@ -328,27 +308,26 @@ ZeroTimeText ZeroTimeFor(const RateEstimate& estimate, int64_t balancedRaw, int6
         return out;
     }
     // ★ 这两条的**顺序**是规格的一部分，而且很容易写反：
-    //   「速率不显著」和「速率 ≤ 0」互相不含对方，但一个平的序列同时满足"算不出
+    //   「速率不显著」和「速率 == 0」互相不含对方，但一个平的序列同时满足"算不出
     //   消耗"和"速率恰好是 0"。文档给它的是破折号（"不消耗"），不是"暂无法预测"。
-    //   所以先判"我们手上有没有一个真正算出来的、非正的速率"：有就破折号。
+    //   所以先判"我们手上有没有一个真正算出来的、等于 0 的速率"：有就破折号。
     //   Insignificant / Empty 都**没有**可用速率（rate 被清成 0 只是"没数字"，
     //   不是"数字是 0"），所以它们必须走在后面，否则平的序列会说错话。
     //   （这个顺序也真的写错过一次，探针的 case4 就是为它留的。）
-    //   3) 速率 ≤ 0（不消耗 / 在回升）->「—」
+    //   3) 速率 == 0（不消耗）->「—」
     //      ★ 这个破折号是 U+2014（em dash），与设计文档 §7.4 表格里那个字符逐字节
     //        相同——不是 U+2015（horizontal bar），两者在屏幕上几乎一样，
     //        拿前者去比后者会一直"看起来一样但断言失败"。探针按字节比，就是为了
     //        让这种错当场暴露（这个错真的发生过）。
     const bool rateReported = estimate.status == RateStatus::Significant ||
-                              estimate.status == RateStatus::Rising;
-    // ★ 破折号到底给谁：**给"没在消耗"的那一种**，也就是 Rising（平的，或真的在
-    //   回升）。不是给"速率为负"——**消耗的速率本来就是负的**。
-    //   写成 `estimate.rateYuanPerMinute <= 0.0` 是这个模块最贵的一个错：那个条件对
-    //   每一个正常消耗都成立，于是每一个正常消耗都拿到破折号、永远走不到外推。
-    //   case1-7 全绿也照样带着它（它们只看斜率，不看文案），是 case8 抓出来的。
-    //   文档的「速率 ≤ 0」之所以能写成 ≤，是因为它指的是**余额的趋势**：趋势在涨或
-    //   不动 -> 破折号；趋势在掉 -> 外推。状态已经把这件事说清楚了，就别再看符号。
-    if (rateReported && estimate.status == RateStatus::Rising) {
+                              estimate.status == RateStatus::NotConsuming;
+    // ★ 破折号到底给谁：**给"没在消耗"的那一种**，也就是 NotConsuming（平的，或只在
+    //   回升）。按**新口径**，速率是"下降量之和 / 跨度"，**永远不为负**，所以
+    //   "速率恰好为 0"就完整地描述了它；写成 `<= 0.0` 现在与 `== 0.0` 等价，
+    //   但那是**旧口径**的遗留写法（那时消耗的速率是负数，`<= 0` 对每个正常消耗都成立，
+    //   于是每个正常消耗都拿到破折号、永远走不到外推——case8 抓出来的那个错）。
+    //   按新口径写清楚，下一个读的人就不会再踩。
+    if (rateReported && estimate.rateYuanPerMinute == 0.0) {
         out.kind = ZeroTimeKind::Dash;
         out.text = L"\u2014";
         return out;
@@ -361,10 +340,10 @@ ZeroTimeText ZeroTimeFor(const RateEstimate& estimate, int64_t balancedRaw, int6
     }
 
     //   4) 剩余时长。
-    //      ★ 用速率的**大小**（fabs），不是它本身。消耗的速率是负数（余额在掉），
-    //        拿负数去除余额会得到负的分钟数，然后被下面的保护吞成"暂无法预测"——
-    //        那等于**永远不会给出一条外推**。这个错真的发生过，是探针的 case8 抓出来的
-    //        （case1-7 全绿也照样带着它，因为它们只看斜率不看文案）。
+    //      ★ 用速率的**大小**（fabs）。新口径下速率永远是正的，所以 fabs 只是
+    //        一层保险；它的来历值得留着：旧口径里消耗的速率是**负数**，拿负数去除
+    //        余额会得到负的分钟数，然后被下面的保护吞成"暂无法预测"——那等于
+    //        **永远不会给出一条外推**（case8 抓出来的）。
     //        raw 是 1/10000 元，速率是元/分钟。
     const double balanceYuan = static_cast<double>(balancedRaw) / kUnitsPerYuanD;
     const double speedYuanPerMinute = std::fabs(estimate.rateYuanPerMinute);
@@ -410,9 +389,9 @@ std::wstring ZeroTimeTextForFrame(const RateEstimate& estimate, int64_t balanced
         }
         // 但有例外：速率明显变了（>10%）就必须重画——"2.0 小时"和"1.05 小时"
         // 都取整成同一个分钟数附近时，光看分钟会把这个变化吞掉。
-        // ★ 比的是**绝对值**：本分支里速率的符号是固定的（是一个正速率），只看
+        // ★ 比的是**绝对值**：本分支里速率是正的（新口径下速率永不为负），只看
         //   大小才比得出来。写成 `ratePrevious > 0.0` 是这个模块真的犯过的错——
-        //   消耗的速率是负的，那个判断永远不成立，这一整条例外就成了死代码。
+        //   旧口径里消耗的速率是负的，那个判断永远不成立，这一整条例外就成了死代码。
         const double rateBefore = std::fabs(state->rateYuanPerMinute);
         const bool rateMoved = rateBefore > 1e-12 &&
                                std::fabs(std::fabs(estimate.rateYuanPerMinute) - rateBefore) >=

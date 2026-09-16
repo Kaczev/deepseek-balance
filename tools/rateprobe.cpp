@@ -5,23 +5,28 @@
 //   rateprobe --verbose  also print the per-case series and the spring's convergence
 //
 // No network, no external file, no shared state: the estimator is a pure function, so
-// this tool needs nothing but synthetic series. It creates one temporary directory it
-// removes again (only with --keep does it stay, which is only useful for debugging).
+// this tool needs nothing but synthetic series. It creates no file at all.
 //
 // Output contract (same shape as storeprobe): one line per acceptance item, each line
 // starting with "PASS: " or "FAIL: ". The exit code is 0 only when every line is a PASS.
-// ★ Every check prints the NUMBERS it judged -- raw slope, rounded rate, status, point
-//   counts, time span, and the wording produced -- so the report can be read, not just
-//   trusted. A check that only printed PASS would be worth nothing here.
+// ★ Every check prints the NUMBERS it judged -- the raw rate, the rounded rate, status,
+//   point/step counts, time span, the drop sum and the wording produced -- so the report
+//   can be read, not just trusted. A check that only printed PASS would be worth nothing.
 //
-// 所有者要求的 7 项验收，逐条对应（编号就是下面 case 的编号）：
-//   (1) 稳定消耗 -> 估计速率对上已知的元/分钟，status = Significant
-//   (2) 同一序列插入一次大额充值 -> 速率不许变负，且仍接近真实消耗
-//   (3) 只有两个点 -> Insignificant，且文案说"暂无法预测"
-//   (4) 平的序列 -> 速率 0、不是 Significant，文案是破折号
-//   (5) 时间跨度不到 5 分钟 -> 不管几个点都 Insignificant
-//   (6) 带"没有时间"的点的序列 -> Insignificant，而不是编一个数
+// 所有者要求的验收项，逐条对应（编号就是下面 case 的编号）：
+//   (1) 稳定消耗 -> 估计速率对上已知的元/分钟，且底部文案就是那一条外推
+//   (2) 一次大额充值 -> 速率不为负、**仍然为正**、且接近真实消耗（充值自己不进分子）
+//   (3) ★ 回归（这一轮的起点）：既有上升又有下降的序列 -> 一个真实的显著正速率，
+//       而不是「暂无法预测」。旧口径在这个序列上会丢掉回升之后的每一个点，
+//       剩下的下降段跨度 240 s < 300 s -> 「暂无法预测」；case 里把这两组数字都印出来
+//   (4) 一个下降台阶都没有 -> 速率 0、status = NotConsuming、文案是破折号 U+2014
+//   (5) 跨度不到 5 分钟、或下降台阶不到 3 个 -> 不显著（bar 就是 3：2 个不显著、3 个显著）
+//   (6) 带"没有时间"的点的序列 -> 不显著，绝不假设点距
 //   (7) 弹簧：给一个阶跃，收敛到目标且**从不过冲**
+//   (8) §7.4 其余分支（已用尽 / 超过 7 天 / 外推 + 绝对时刻）与 10% 重绘规则
+//   (9) 旧夹具那种形状（跳上去、随后掉回原来的水平）现在读数是**真的**一笔 50 元消费：
+//       冻结这条期望，免得下一次有人照着旧探针"修回去"
+//   (10) 平滑的边界：0 -> 正速率这一段**不做平滑**（否则屏幕上会先闪一下「超过 7 天」）
 #include "../src/rate_estimator.h"
 
 #include "amount.h"
@@ -119,7 +124,7 @@ std::string Show(const std::wstring& text) {
 
 std::string Quote(const std::string& text) { return "\"" + text + "\""; }
 
-// Fixed 4-decimal formatting, so two slopes can be compared by eye.
+// Fixed 4-decimal formatting, so two rates can be compared by eye.
 std::string F4(double value) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%.4f", value);
@@ -192,7 +197,7 @@ RateInputPoint Undated(const std::string& yuan) {
 // `first` yuan with `count` points. Built through the same decimal parser as everything
 // else: the amounts are written with 4 decimals so a computed fixture cannot drift.
 std::vector<RateInputPoint> SteadySeries(const std::string& first, double drainPerMinute,
-                                         int count, int64_t stepSeconds) {
+                                        int count, int64_t stepSeconds) {
     double yuan = std::atof(first.c_str());
     std::vector<RateInputPoint> out;
     for (int i = 0; i < count; ++i) {
@@ -204,47 +209,118 @@ std::vector<RateInputPoint> SteadySeries(const std::string& first, double drainP
     return out;
 }
 
-// One big top-up inserted into a series: the point at jumpIndex is the SAME point as in
-// the plain series but with +50 yuan added, so it is a large RISE against the previous
-// retained point. Every later point keeps its plain-series value, which therefore sits
-// 50 yuan below the jump point -- this is the only shape the store can really write,
-// because the store never records a rise: a top-up arrives as one high point followed by
-// continuation of the old level (curve_store §2.1 records changes, and §2.3's comparison
-// is against the newest point, so the high point IS the newest point when it arrives).
-std::vector<RateInputPoint> WithTopUp(const std::vector<RateInputPoint>& base, int jumpIndex) {
+// A REAL top-up, in the only shape the store can write it: the rise arrives as ONE point
+// that is higher than its predecessor, and every later point continues at the NEW level
+// (curve_store §2.1 records a point only when the value changed, and §2.3 compares the
+// incoming value against the newest point). The store never writes "one high point, then
+// the old level" -- that would mean the balance fell back by the whole top-up, i.e. a real
+// spend of that size, and case9 pins down what the estimator says about exactly that shape.
+std::vector<RateInputPoint> WithRealTopUp(const std::vector<RateInputPoint>& base, int jumpIndex,
+                                         const std::string& topUpYuan) {
     std::vector<RateInputPoint> out = base;
-    if (jumpIndex < 0 || jumpIndex >= static_cast<int>(out.size())) return out;
-    out[static_cast<std::size_t>(jumpIndex)].amountRaw += 50 * dshb::kUnitsPerYuan;
+    Amount top;
+    if (!dshb::ParseAmount(topUpYuan, &top)) return out;
+    for (std::size_t i = static_cast<std::size_t>(jumpIndex); i < out.size(); ++i) {
+        out[i].amountRaw += top.raw;
+    }
     return out;
 }
 
-// A series summary for the evidence line: "10.0000 -> 8.0000 over 600 s, 11 points".
+// ---------------------------------------------------------------------------
+// An INDEPENDENT walk over a series (the expectation the estimator is judged against)
+// ---------------------------------------------------------------------------
+// ★ Written here from the definition -- "sum of the decreases, over the span between the
+//   oldest and the newest usable point" -- and NOT by calling the estimator: an expectation
+//   computed by the code under test would agree with it by construction.
+struct DropWalk {
+    bool comparable = true;    // every point carried both an amount and its own time
+    int64_t dropSumRaw = 0;    // Σ max(0, previous − next)
+    int steps = 0;             // how many steps fell
+    int rises = 0;             // how many steps rose (they contribute 0, they do not discard)
+    int64_t spanSeconds = 0;
+};
+
+DropWalk WalkDrops(const std::vector<RateInputPoint>& points) {
+    DropWalk walk;
+    std::vector<int64_t> amounts;
+    std::vector<int64_t> times;
+    for (const RateInputPoint& point : points) {
+        if (!point.amountValid || !point.atValid) {
+            walk.comparable = false;
+            continue;
+        }
+        amounts.push_back(point.amountRaw);
+        times.push_back(point.at);
+    }
+    if (amounts.size() < 2) return walk;
+    walk.spanSeconds = times.back() - times.front();
+    for (std::size_t i = 1; i < amounts.size(); ++i) {
+        const int64_t drop = amounts[i - 1] - amounts[i];
+        if (drop > 0) {
+            walk.dropSumRaw += drop;
+            ++walk.steps;
+        } else if (drop < 0) {
+            ++walk.rises;
+        }
+    }
+    return walk;
+}
+
+// Yuan per minute implied by a walk: dropSum / span, in 元/分钟.
+double WalkRate(const DropWalk& walk) {
+    if (walk.spanSeconds <= 0) return 0.0;
+    return static_cast<double>(walk.dropSumRaw) / static_cast<double>(dshb::kUnitsPerYuan) * 60.0 /
+           static_cast<double>(walk.spanSeconds);
+}
+
+// What a reading that counted |change| instead (i.e. treated a top-up as consumption)
+// would produce. Printed as "what we are NOT reporting" -- the number that makes the
+// difference between "the rise contributed 0" and "the rise was counted" visible.
+double AbsoluteChangeRate(const std::vector<RateInputPoint>& points) {
+    std::vector<int64_t> amounts;
+    std::vector<int64_t> times;
+    for (const RateInputPoint& point : points) {
+        if (!point.amountValid || !point.atValid) continue;
+        amounts.push_back(point.amountRaw);
+        times.push_back(point.at);
+    }
+    if (amounts.size() < 2 || times.back() - times.front() <= 0) return 0.0;
+    int64_t sum = 0;
+    for (std::size_t i = 1; i < amounts.size(); ++i) {
+        sum += std::llabs(amounts[i] - amounts[i - 1]);
+    }
+    return static_cast<double>(sum) / static_cast<double>(dshb::kUnitsPerYuan) * 60.0 /
+           static_cast<double>(times.back() - times.front());
+}
+
+// A series summary for the evidence line: "10.0000@+0s, 9.9800@+60s, ...".
 std::string SeriesSummary(const std::vector<RateInputPoint>& points) {
     if (points.empty()) return "no points";
     std::string out;
     for (std::size_t i = 0; i < points.size(); ++i) {
         if (i != 0) out += ", ";
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "%.4f", static_cast<double>(points[i].amountRaw) /
-                                                    static_cast<double>(dshb::kUnitsPerYuan));
+        const double yuan = static_cast<double>(points[i].amountRaw) /
+                            static_cast<double>(dshb::kUnitsPerYuan);
         if (!points[i].atValid) {
-            out += std::string("undated@") + buf;
+            std::snprintf(buf, sizeof(buf), "%.4f@undated", yuan);
         } else {
-            std::snprintf(buf, sizeof(buf), "%.4f@+%llds", static_cast<double>(points[i].amountRaw) /
-                                                               static_cast<double>(dshb::kUnitsPerYuan),
+            std::snprintf(buf, sizeof(buf), "%.4f@+%llds", yuan,
                           static_cast<long long>(points[i].at - points.front().at));
-            out += buf;
         }
+        out += buf;
     }
     return out;
 }
 
-// "raw=-0.020000 rounded=-0.0200000000 status=Significant usable=11/11 span=600s"
+// "raw=0.0200000000 rate=0.0200000000 status=Significant usable=11/11 steps=10/0 span=600s"
 std::string EstimateSummary(const RateEstimate& e) {
-    return "rawSlope=" + F6(e.rawSlopeYuanPerMinute) + " yuan/min, rate=" +
-           F6(e.rateYuanPerMinute) + " yuan/min, status=" + dshb::RateStatusName(e.status) +
-           ", usable=" + Num(e.usablePoints) + "/" + Num(e.pointsSeen) +
-           ", undated=" + Num(e.undatedPoints) + ", unusableAmount=" + Num(e.unusablePoints) +
+    return "rawRate=" + F6(e.rawRateYuanPerMinute) + " rate=" + F6(e.rateYuanPerMinute) +
+           " yuan/min, status=" + dshb::RateStatusName(e.status) + ", usable=" +
+           Num(e.usablePoints) + "/" + Num(e.pointsSeen) + ", decreasingSteps=" +
+           Num(e.decreasingSteps) + ", risingSteps=" + Num(e.risingSteps) + ", dropSum=" +
+           F6(static_cast<double>(e.dropSumRaw) / static_cast<double>(dshb::kUnitsPerYuan)) +
+           " yuan, undated=" + Num(e.undatedPoints) + ", unusableAmount=" + Num(e.unusablePoints) +
            ", span=" + Num(static_cast<long long>(e.spanSeconds)) + "s" +
            (e.note.empty() ? std::string() : ", note=" + Quote(e.note));
 }
@@ -254,128 +330,244 @@ std::string EstimateSummary(const RateEstimate& e) {
 // ===========================================================================
 void RunChecks(Harness* h, bool verbose) {
     // -----------------------------------------------------------------------
-    // (1) A steady drain at a KNOWN rate: the estimate must match, and be Significant.
-    //     设计 §7.3 的方法（OLS）在一条规则序列上的正确性。
+    // (1) A steady drain at a KNOWN rate: the estimate must match it, and be Significant.
+    //     The wording of §7.4's extrapolating branch is checked on the same fixture.
     // -----------------------------------------------------------------------
     {
         const double trueDrain = 0.02;                       // 元/分钟
         const std::vector<RateInputPoint> series = SteadySeries("10.0000", trueDrain, 11, 60);
         const RateEstimate e = dshb::EstimateRate(series);
-        const double error = std::fabs(e.rateYuanPerMinute - (-trueDrain));
-        const bool ok = e.status == RateStatus::Significant && error <= 1e-6 &&   // 1e-6 元/分钟容差
-                        e.usablePoints == 11 && e.spanSeconds == 600 &&
-                        e.rateYuanPerMinute < 0.0;
+        const DropWalk walk = WalkDrops(series);
+        const double expectedRate = WalkRate(walk);
+        const double error = std::fabs(e.rateYuanPerMinute - expectedRate);
+        // 10.00 元 / 0.02 元每分钟 = 500 分钟 = 8.3 小时（> 6 小时，所以 §7.4 不补绝对时刻）
+        const ZeroTimeText text = dshb::ZeroTimeFor(e, 10 * dshb::kUnitsPerYuan, kTextNow);
+        const std::wstring wantText = L"按当前速度，约 8.3 小时后归零";
+        const bool ok = e.status == RateStatus::Significant && error <= 1e-9 &&
+                        std::fabs(e.rateYuanPerMinute - trueDrain) <= 1e-9 && e.rateYuanPerMinute > 0.0 &&
+                        e.decreasingSteps == 10 && e.risingSteps == 0 && e.usablePoints == 11 &&
+                        e.spanSeconds == 600 &&
+                        e.dropSumRaw == 20 * (dshb::kUnitsPerYuan / 100) &&   // ten 2-cent drops
+                        e.dropSumRaw == walk.dropSumRaw &&
+                        text.kind == ZeroTimeKind::Extrapolated && text.text == wantText &&
+                        text.minutesToZero == 500;
         h->Req("case1", "a steady synthetic drain (0.020000 yuan/min) is estimated as such",
-               "expected=" + F6(-trueDrain) + " yuan/min, " + EstimateSummary(e) +
-                   ", |error|=" + F6(error) + " (tolerance 0.000001)",
+               "independent walk says " + F6(expectedRate) + " yuan/min (" + F6(walk.dropSumRaw /
+                   static_cast<double>(dshb::kUnitsPerYuan)) + " yuan over " +
+                   Num(static_cast<long long>(walk.spanSeconds)) + "s in " + Num(walk.steps) +
+                   " steps), " + EstimateSummary(e) + ", |error|=" + F6(error) +
+                   " (tolerance 0.000000001); balance 10.00 -> " + Show(text.text) +
+                   ", minutesToZero=" + Num(text.minutesToZero),
                ok);
         if (verbose) std::printf("  series: %s\n", SeriesSummary(series).c_str());
     }
 
     // -----------------------------------------------------------------------
-    // (2) ★ The same series with one large TOP-UP inserted: the rate must not become
-    //     negative-positive (i.e. must not read as "recovering") and must stay close to
-    //     the true drain. 设计 §7.2：正跳变先剔除，充值不许读成负消费。
-    //     The top-up fixture is +50.00 yuan -- if the jump were NOT removed, the fitted
-    //     slope over that series would be wildly positive, so the near-exact result
-    //     below is itself the evidence that the jump was removed.
+    // (2) The same series with one large TOP-UP (+50.00 yuan) part-way through: the rate
+    //     must stay POSITIVE and close to the true drain. 设计 §7.2：充值不是负消费。
+    //     ★ The top-up's own step contributes 0 to the numerator, and the window keeps
+    //     every point (that is the whole point of the new rule): the reported rate loses
+    //     exactly the ONE step's drain that the rise replaced -- printed as a number.
     // -----------------------------------------------------------------------
     {
         const double trueDrain = 0.02;
         const std::vector<RateInputPoint> plain = SteadySeries("10.0000", trueDrain, 11, 60);
-        const std::vector<RateInputPoint> topped = WithTopUp(plain, 7);   // big rise at point 7
+        const std::vector<RateInputPoint> topped = WithRealTopUp(plain, 7, "50.00");
+        const RateEstimate plainEstimate = dshb::EstimateRate(plain);
         const RateEstimate e = dshb::EstimateRate(topped);
-        const double error = std::fabs(e.rateYuanPerMinute - (-trueDrain));
-        // The decisive assertions: NOT positive (no "recovering" reading), still
-        // negative, and the true drain is recovered.
-        // ★ Only the ONE point where the rise was detected comes out of the fit. The
-        // samples after it are ordinary "balance changed" readings and stay in -- if the
-        // rule dropped every later point instead, the span would collapse and one top-up
-        // would make the estimator useless (that was the first version; case9 caught it).
-        const bool notPositive = e.rateYuanPerMinute <= 0.0;
-        const bool ok = e.status == RateStatus::Significant && notPositive && error <= 1e-6 &&
-                        e.usablePoints == 10 && e.spanSeconds == 600;
-        h->Req("case2", "one large TOP-UP inserted: the rate stays negative and near the true drain",
-               "trueDrain=" + F6(-trueDrain) + ", " + EstimateSummary(e) +
-                   ", usable=" + Num(e.usablePoints) + " of " + Num(e.pointsSeen) +
-                   " (the single +50.00 yuan jump point was removed, the rest stayed), "
-                   "|error|=" + F6(error),
+        const DropWalk walk = WalkDrops(topped);
+        const double expectedRate = WalkRate(walk);
+        const double error = std::fabs(e.rateYuanPerMinute - expectedRate);
+        const double deficit = plainEstimate.rateYuanPerMinute - e.rateYuanPerMinute;
+        const double oneStepShare = trueDrain * (1.0 / 10.0);   // 11 points -> 10 drop steps
+        const ZeroTimeText text = dshb::ZeroTimeFor(e, 5980 * (dshb::kUnitsPerYuan / 100), kTextNow);
+        const bool ok = e.status == RateStatus::Significant && e.rateYuanPerMinute > 0.0 &&
+                        error <= 1e-9 && e.usablePoints == 11 && e.spanSeconds == 600 &&
+                        e.decreasingSteps == 9 && e.risingSteps == 1 &&
+                        std::fabs(deficit - oneStepShare) <= 1e-12 &&
+                        e.rateYuanPerMinute > 0.9 * plainEstimate.rateYuanPerMinute - 1e-12 &&
+                        text.kind == ZeroTimeKind::Extrapolated;
+        h->Req("case2", "one large TOP-UP: the rate stays positive and within one step of the true drain",
+               "plain " + F6(plainEstimate.rateYuanPerMinute) + " yuan/min vs topped " +
+                   F6(e.rateYuanPerMinute) + " yuan/min; the deficit " + F6(deficit) +
+                   " is exactly the one step the rise replaced (" + F6(oneStepShare) +
+                   ", i.e. 1 of 10 drop steps; its time still counts, which is why it is not 0); " +
+                   EstimateSummary(e) + ", |error| vs independent walk=" + F6(error) +
+                   "; the +50.00 rise contributed 0 (had a rise been counted as consumption, "
+                   "the |change| sum would give " + F6(AbsoluteChangeRate(topped)) +
+                   " yuan/min); balance 59.80 -> " + Show(text.text),
                ok);
         if (verbose) std::printf("  with top-up: %s\n", SeriesSummary(topped).c_str());
     }
 
     // -----------------------------------------------------------------------
-    // (3) Two points only -> Insignificant, and the wording says it cannot predict.
-    //     设计 §7.3「少于 3 个下降样本」；§7.4「暂无法预测」。
+    // (3) ★ THE REGRESSION THAT STARTED THIS: a series that both RISES and FALLS.
+    //     Four falling steps (3 drops over 240 s), then a +50.00 top-up, then a balance
+    //     that keeps RISING. Under the old rule (drop every rise, then fit) the only
+    //     surviving points are the 4 falling ones -- span 240 s < the 5-minute bar --
+    //     so the old code answered 「暂无法预测」. Under the owner's rule the window keeps
+    //     every point, the three drops are real spending, and the rate is 0.075 yuan/min.
     // -----------------------------------------------------------------------
     {
         std::vector<RateInputPoint> series;
-        series.push_back(Dated(kAnchor, "10.0000"));
-        series.push_back(Dated(kAnchor + 600, "9.0000"));   // 600 s apart: the SPAN is fine
+        series.push_back(Dated(kAnchor + 0, "10.0000"));
+        series.push_back(Dated(kAnchor + 60, "9.7000"));    // drop 0.30
+        series.push_back(Dated(kAnchor + 120, "9.4000"));   // drop 0.30
+        series.push_back(Dated(kAnchor + 240, "9.1000"));   // drop 0.30
+        series.push_back(Dated(kAnchor + 360, "59.1000"));  // +50.00 top-up: a rise
+        series.push_back(Dated(kAnchor + 480, "59.6000"));  // rising (a rise, not a drop)
+        series.push_back(Dated(kAnchor + 600, "60.1000"));  // rising
+        series.push_back(Dated(kAnchor + 720, "60.6000"));  // rising
         const RateEstimate e = dshb::EstimateRate(series);
-        const ZeroTimeText text = dshb::ZeroTimeFor(e, 900 * dshb::kUnitsPerYuan, kTextNow);
-        const std::wstring expected = L"暂无法预测";
-        const bool ok = e.status == RateStatus::Insignificant && e.usablePoints == 2 &&
-                        e.spanSeconds == 600 && text.text == expected &&
-                        text.kind == ZeroTimeKind::NoPrediction;
-        h->Req("case3", "two points only -> Insignificant, and the wording cannot predict",
-               "points=2 spanning " + Num(static_cast<long long>(e.spanSeconds)) +
-                   "s (the SPAN alone would have been enough, so the refusal is about the "
-                   "sample count), " + EstimateSummary(e) + ", text=" +
-                   Show(text.text) + ", expected=" + Show(expected),
+        const DropWalk walk = WalkDrops(series);
+        const double expectedRate = WalkRate(walk);          // 0.90 yuan over 720 s = 0.075
+        const double error = std::fabs(e.rateYuanPerMinute - expectedRate);
+        // 60.60 元 / 0.075 元每分钟 = 808 分钟 = 13.5 小时（> 6 小时，所以不补绝对时刻）
+        const ZeroTimeText text = dshb::ZeroTimeFor(e, 6060 * (dshb::kUnitsPerYuan / 100), kTextNow);
+        const std::wstring wantText = L"按当前速度，约 13.5 小时后归零";
+        const std::wstring noPrediction = L"暂无法预测";
+        const bool ok = e.status == RateStatus::Significant && e.rateYuanPerMinute > 0.0 &&
+                        error <= 1e-9 && e.decreasingSteps == 3 && e.risingSteps == 4 &&
+                        e.usablePoints == 8 && e.spanSeconds == 720 &&
+                        text.kind == ZeroTimeKind::Extrapolated && text.text == wantText &&
+                        text.text != noPrediction;
+        h->Req("case3", "★ REGRESSION: a series that rises AND falls gives a real significant "
+                        "positive rate, not 「暂无法预测」",
+               "8 points, 3 drops (0.90 yuan) and 4 rises over 720 s -> " + EstimateSummary(e) +
+                   " (independent walk: " + F6(expectedRate) + " yuan/min, |error|=" + F6(error) +
+                   "); nothing was discarded (usable=" + Num(e.usablePoints) + "/" +
+                   Num(e.pointsSeen) + "), so the span is the whole 720 s instead of the 240 s "
+                   "the old rule was left with (240 s < " +
+                   Num(static_cast<long long>(dshb::kRateMinSpanSeconds)) +
+                   " s -> that is where 「暂无法预测」 came from); balance 60.60 -> " +
+                   Show(text.text),
                ok);
+        if (verbose) std::printf("  mixed rise/fall: %s\n", SeriesSummary(series).c_str());
     }
 
     // -----------------------------------------------------------------------
-    // (4) A flat series -> rate zero, status not Significant, the wording is the dash.
-    //     ★ This is the case that must never become "zero in 3 years": 10 points over
-    //     10 minutes at one single value. 设计 §7.4「速率 ≤ 0 ->「—」」。
-    //     ★ The expected dash is written as an ESCAPE (U+2014, em dash) on purpose: the
-    //     characters U+2014 and U+2015 look identical on screen, and comparing against
-    //     the wrong one is a failure that reads like a pass. Written as a codepoint,
-    //     there is nothing to mistake.
+    // (4) NO DROPS AT ALL -> rate exactly zero, status NotConsuming, the wording is the
+    //     dash. 设计 §7.4「速率 == 0 ->「—」」。
+    //     ★ The dash is written as an ESCAPE (U+2014, em dash) on purpose: U+2014 and
+    //     U+2015 look identical on screen, and comparing against the wrong one is a
+    //     failure that reads like a pass. Written as a codepoint there is nothing to
+    //     mistake.
+    //     ★ Three shapes, because "no drop" is not only "flat": flat, rising-only, and a
+    //     one-point window (which is what the store really holds when the balance never
+    //     moved: a point exists only where the value changed).
     // -----------------------------------------------------------------------
     {
         const std::wstring expected = L"\u2014";   // em dash, U+2014 -- see the note above
-        std::vector<RateInputPoint> series;
-        for (int i = 0; i < 10; ++i) series.push_back(Dated(kAnchor + i * 60, "10.0000"));
-        const RateEstimate e = dshb::EstimateRate(series);
-        const ZeroTimeText text = dshb::ZeroTimeFor(e, 10 * dshb::kUnitsPerYuan, kTextNow);
-        const bool ok = e.status != RateStatus::Significant && e.rateYuanPerMinute == 0.0 &&
-                        e.rawSlopeYuanPerMinute == 0.0 && e.usablePoints == 10 &&
-                        text.text == expected && text.kind == ZeroTimeKind::Dash &&
-                        text.minutesToZero < 0;
-        h->Req("case4", "a flat series -> rate zero, not Significant, wording is the dash",
-               EstimateSummary(e) + ", text=" + Show(text.text) +
-                   ", expected=U+2014 " + Show(expected) + ", minutesToZero=" +
-                   Num(text.minutesToZero) + " (none claimed)",
+        // (a) flat: 10 points over 9 minutes at one single value.
+        std::vector<RateInputPoint> flat;
+        for (int i = 0; i < 10; ++i) flat.push_back(Dated(kAnchor + i * 60, "10.0000"));
+        const RateEstimate a = dshb::EstimateRate(flat);
+        const ZeroTimeText textA = dshb::ZeroTimeFor(a, 10 * dshb::kUnitsPerYuan, kTextNow);
+
+        // (b) rising only: a balance that does nothing but grow (a top-up that never stops).
+        std::vector<RateInputPoint> rising;
+        for (int i = 0; i < 6; ++i) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.4f", 10.0 + 0.5 * i);
+            rising.push_back(Dated(kAnchor + i * 120, buf));
+        }
+        const RateEstimate b = dshb::EstimateRate(rising);
+        const ZeroTimeText textB = dshb::ZeroTimeFor(b, 1250 * (dshb::kUnitsPerYuan / 100), kTextNow);
+
+        // (c) a single point: the store's own shape for a balance that never moved.
+        std::vector<RateInputPoint> one;
+        one.push_back(Dated(kAnchor, "10.0000"));
+        const RateEstimate c = dshb::EstimateRate(one);
+        const ZeroTimeText textC = dshb::ZeroTimeFor(c, 10 * dshb::kUnitsPerYuan, kTextNow);
+
+        // (d) two flat points only 4 s apart: no significance bar applies to the
+        //     "not consuming" conclusion (it is an observation, not an estimate).
+        std::vector<RateInputPoint> brief;
+        brief.push_back(Dated(kAnchor, "10.0000"));
+        brief.push_back(Dated(kAnchor + 4, "10.0000"));
+        const RateEstimate d = dshb::EstimateRate(brief);
+
+        const bool ok = a.status == RateStatus::NotConsuming && a.rateYuanPerMinute == 0.0 &&
+                        a.rawRateYuanPerMinute == 0.0 && a.decreasingSteps == 0 && a.risingSteps == 0 &&
+                        a.spanSeconds == 540 && textA.text == expected &&
+                        textA.kind == ZeroTimeKind::Dash && textA.minutesToZero < 0 &&
+                        std::string(dshb::RateStatusName(a.status)) == "NotConsuming" &&
+                        b.status == RateStatus::NotConsuming && b.rateYuanPerMinute == 0.0 &&
+                        b.risingSteps == 5 && b.decreasingSteps == 0 && textB.text == expected &&
+                        textB.kind == ZeroTimeKind::Dash &&
+                        c.status == RateStatus::NotConsuming && c.rateYuanPerMinute == 0.0 &&
+                        c.spanSeconds == 0 && textC.kind == ZeroTimeKind::Dash &&
+                        d.status == RateStatus::NotConsuming && d.spanSeconds == 4 &&
+                        d.rateYuanPerMinute == 0.0 &&
+                        std::string(dshb::RateStatusName(RateStatus::NotConsuming)) != "Rising";
+        h->Req("case4", "no decreasing step at all -> rate zero, NotConsuming, wording is the dash",
+               "(a) flat, span 540 s: " + EstimateSummary(a) + ", text=" + Show(textA.text) +
+                   ", minutesToZero=" + Num(textA.minutesToZero) + " (none claimed); " +
+                   "(b) rising only, span 600 s: " + EstimateSummary(b) + ", text=" +
+                   Show(textB.text) + "; (c) ONE point (span 0 s, the store's own shape for a "
+                   "balance that never moved): " + EstimateSummary(c) + " -> " +
+                   dshb::ZeroTimeKindName(textC.kind) + "; (d) two flat points 4 s apart (no "
+                   "significance bar applies to an observation): status=" +
+                   dshb::RateStatusName(d.status) + ", span=" +
+                   Num(static_cast<long long>(d.spanSeconds)) + "s, rate=" +
+                   F6(d.rateYuanPerMinute) + "; the old status name was \"Rising\" for all of "
+                   "these, which is why it was renamed; expected=" + Show(expected),
                ok);
     }
 
     // -----------------------------------------------------------------------
-    // (5) A time span under 5 minutes -> Insignificant however many points there are.
-    //     设计 §7.3「窗口跨度 < 5 分钟」。
+    // (5) The two hard bars of §7.3: a span under 5 minutes -> Insignificant, and fewer
+    //     than 3 decreasing steps -> Insignificant. Both with the numbers that were
+    //     measured and refused (the raw rate is kept as a diagnostic on purpose).
+    //     ★ The bar is exactly 3: 2 steps refuse, 3 steps pass (case3 is the 3).
     // -----------------------------------------------------------------------
     {
-        // 12 points, obvious drain, but only 110 seconds of time: a beautiful slope that
-        // must be refused. (12 points is more than the store even holds.)
-        const std::vector<RateInputPoint> series = SteadySeries("10.0000", 0.02, 12, 10);
-        const RateEstimate e = dshb::EstimateRate(series);
-        const ZeroTimeText text = dshb::ZeroTimeFor(e, 9 * dshb::kUnitsPerYuan, kTextNow);
-        const bool ok = e.status == RateStatus::Insignificant && e.usablePoints == 12 &&
-                        e.spanSeconds == 110 && e.spanSeconds < dshb::kRateMinSpanSeconds &&
-                        text.kind == ZeroTimeKind::NoPrediction;
-        h->Req("case5", "a span under 5 minutes -> Insignificant no matter how many points",
-               "points=" + Num(e.pointsSeen) + ", span=" +
-                   Num(static_cast<long long>(e.spanSeconds)) + "s < " +
-                   Num(static_cast<long long>(dshb::kRateMinSpanSeconds)) + "s, " +
-                   EstimateSummary(e) + ", text=" + Show(text.text),
+        // (a) 12 points, obvious drain, but only 110 seconds of time.
+        const std::vector<RateInputPoint> shortSpan = SteadySeries("10.0000", 0.02, 12, 10);
+        const RateEstimate a = dshb::EstimateRate(shortSpan);
+        const ZeroTimeText textA = dshb::ZeroTimeFor(a, 9 * dshb::kUnitsPerYuan, kTextNow);
+
+        // (b) one decreasing step over a perfectly good 10-minute span.
+        std::vector<RateInputPoint> oneStep;
+        oneStep.push_back(Dated(kAnchor, "10.0000"));
+        oneStep.push_back(Dated(kAnchor + 150, "9.9800"));
+        for (int i = 2; i < 5; ++i) oneStep.push_back(Dated(kAnchor + 150 * i, "9.9800"));
+        const RateEstimate b = dshb::EstimateRate(oneStep);
+        const ZeroTimeText textB = dshb::ZeroTimeFor(b, 998 * (dshb::kUnitsPerYuan / 100), kTextNow);
+
+        // (c) two decreasing steps: still one short of the bar.
+        std::vector<RateInputPoint> twoSteps;
+        twoSteps.push_back(Dated(kAnchor, "10.0000"));
+        twoSteps.push_back(Dated(kAnchor + 200, "9.8000"));
+        twoSteps.push_back(Dated(kAnchor + 400, "9.6000"));
+        twoSteps.push_back(Dated(kAnchor + 600, "11.0000"));   // a rise: no third drop
+        const RateEstimate c = dshb::EstimateRate(twoSteps);
+
+        const std::wstring wantNoPrediction = L"暂无法预测";
+        const bool ok = a.status == RateStatus::Insignificant && a.rateYuanPerMinute == 0.0 &&
+                        a.rawRateYuanPerMinute > 0.0 && a.decreasingSteps == 11 &&
+                        a.spanSeconds == 110 && a.spanSeconds < dshb::kRateMinSpanSeconds &&
+                        textA.kind == ZeroTimeKind::NoPrediction && textA.text == wantNoPrediction &&
+                        b.status == RateStatus::Insignificant && b.decreasingSteps == 1 &&
+                        b.spanSeconds == 600 && b.rateYuanPerMinute == 0.0 &&
+                        textB.kind == ZeroTimeKind::NoPrediction &&
+                        c.status == RateStatus::Insignificant && c.decreasingSteps == 2 &&
+                        c.spanSeconds == 600 && c.risingSteps == 1 && c.rateYuanPerMinute == 0.0;
+        h->Req("case5", "a span under 5 minutes, or fewer than 3 decreasing steps -> Insignificant",
+               "(a) 12 points over " + Num(static_cast<long long>(a.spanSeconds)) + "s < " +
+                   Num(static_cast<long long>(dshb::kRateMinSpanSeconds)) + "s: " +
+                   EstimateSummary(a) + " (the raw rate " + F6(a.rawRateYuanPerMinute) +
+                   " yuan/min was measured and deliberately NOT reported), text=" +
+                   Show(textA.text) + "; (b) 1 decreasing step over 600 s: " + EstimateSummary(b) +
+                   ", text=" + Show(textB.text) + "; (c) 2 decreasing steps over 600 s: " +
+                   EstimateSummary(c) + " (the bar is " +
+                   Num(dshb::kRateMinDecreasingSamples) + ", and case3 shows 3 passing)",
                ok);
     }
 
     // -----------------------------------------------------------------------
     // (6) A series with points that have no time of their own -> Insignificant rather
-    //     than a fabricated number. 老 curve.json（没有 "at"）读回来就是这样。
+    //     than a fabricated rate. 老 curve.json（没有 "at"）读回来就是这样。
     //     ★ This is the case that forbids assuming the 10 s sampling interval.
     // -----------------------------------------------------------------------
     {
@@ -389,7 +581,8 @@ void RunChecks(Harness* h, bool verbose) {
         const RateEstimate a = dshb::EstimateRate(allUndated);
 
         // (b) ten dated points in an obvious drain, plus ONE undated point in the middle:
-        //     a subset would still "work", which is exactly why it must not be used.
+        //     the dated subset would fit perfectly (9 decreasing steps over 540 s), which
+        //     is exactly why it must not be used.
         std::vector<RateInputPoint> mixed = SteadySeries("10.0000", 0.02, 10, 60);
         mixed.insert(mixed.begin() + 5, Undated("9.5000"));
         const RateEstimate b = dshb::EstimateRate(mixed);
@@ -398,13 +591,14 @@ void RunChecks(Harness* h, bool verbose) {
         const bool ok = a.status == RateStatus::Insignificant && a.usablePoints == 0 &&
                         a.rateYuanPerMinute == 0.0 && a.undatedPoints == 1 &&
                         b.status == RateStatus::Insignificant && b.undatedPoints == 1 &&
-                        b.rateYuanPerMinute == 0.0 &&
+                        b.rateYuanPerMinute == 0.0 && b.decreasingSteps == 9 &&
+                        b.spanSeconds == 540 &&
                         text.kind == ZeroTimeKind::NoPrediction;
         h->Req("case6", "points without their own time -> Insignificant, never a fabricated rate",
                "all-undated: " + EstimateSummary(a) + " (one undated RUN, 6 points); "
                "one undated point among 10 dated ones: " + EstimateSummary(b) +
-                   " -- the dated subset would have fitted fine and is deliberately not used; "
-                   "text=" + Show(text.text),
+                   " -- note decreasingSteps=9 and span=540 s: the DATED subset would have "
+                   "produced a rate, and it is deliberately not used; text=" + Show(text.text),
                ok);
     }
 
@@ -413,7 +607,7 @@ void RunChecks(Harness* h, bool verbose) {
     //     设计 §7.3 末尾（rate -> rate_display 的弹簧）+ §9.6（不许突变/不许过冲）。
     // -----------------------------------------------------------------------
     {
-        const double target = -0.50;   // yuan/min, a step from 0
+        const double target = 0.50;    // yuan/min, a step up from 0 (rates are never negative)
         const double dt = 1.0 / 60.0;
         double display = 0.0;
         bool monotone = true;
@@ -425,14 +619,14 @@ void RunChecks(Harness* h, bool verbose) {
         std::vector<double> samples;
         for (int i = 0; i < kFrames; ++i) {
             const double next = dshb::RateSpringStep(display, target, dt);
-            // Monotone towards the target (never increases a negative-going step)...
-            if (next > previous + 1e-15) monotone = false;
+            // Monotone towards the target (never falls back on a rising step)...
+            if (next < previous - 1e-15) monotone = false;
             // ...and never past it.
-            if (next < target - 1e-12) overshoot = true;
+            if (next > target + 1e-12) overshoot = true;
             previous = next;
             display = next;
-            if (framesTo63 < 0 && display <= target * 0.63) framesTo63 = i + 1;
-            if (framesTo99 < 0 && display <= target * 0.99) framesTo99 = i + 1;
+            if (framesTo63 < 0 && display >= target * 0.63) framesTo63 = i + 1;
+            if (framesTo99 < 0 && display >= target * 0.99) framesTo99 = i + 1;
             if (i < 5 || i % 60 == 0) samples.push_back(display);
         }
 
@@ -450,8 +644,8 @@ void RunChecks(Harness* h, bool verbose) {
         const bool settles = residual < settleBar;
         // dt clamping: one absurd step (as after a sleep) must not jump to the target.
         const double huge = dshb::RateSpringStep(0.0, target, 3600.0);
-        const bool clamped = huge > target && huge < 0.0;
-        const bool backward = dshb::RateSpringStep(-0.25, target, -1.0) == -0.25;
+        const bool clamped = huge > 0.0 && huge < target;
+        const bool backward = dshb::RateSpringStep(0.25, target, -1.0) == 0.25;
 
         const bool ok = monotone && !overshoot && settles && tauInRange && clamped && backward;
         h->Req("case7", "the spring converges to the target, monotonically and without overshoot",
@@ -475,11 +669,11 @@ void RunChecks(Harness* h, bool verbose) {
     // -----------------------------------------------------------------------
     // (8) The other three branches of §7.4's mapping, and the documented format of the
     //     extrapolated line: 已用尽 / 超过 7 天 / 「按当前速度，约 X 小时后归零」+ 绝对时刻.
-    //     (The task numbers 7 checks; this one exists because a wording that is never
+    //     (The task numbers 6 checks; this one exists because a wording that is never
     //     exercised is a wording nobody has read. It is the §7.4 table, end to end.)
     // -----------------------------------------------------------------------
     {
-        // A significant drain of 2.00 yuan/min: 120 yuan left -> 60 minutes.
+        // A significant drain of 2.00 yuan/min: 240 yuan left -> 120 minutes.
         const std::vector<RateInputPoint> series = SteadySeries("130.0000", 2.00, 11, 60);
         const RateEstimate e = dshb::EstimateRate(series);
 
@@ -490,20 +684,15 @@ void RunChecks(Harness* h, bool verbose) {
 
         const std::wstring wantUsedUp = L"已用尽";
         const std::wstring wantOver = L"超过 7 天";
-        const std::wstring wantDash = L"\u2014";   // em dash U+2014 (never U+2015)
         const bool usedUpOk = usedUp.kind == ZeroTimeKind::UsedUp && usedUp.text == wantUsedUp;
         const bool overOk = overWeek.kind == ZeroTimeKind::OverSevenDays && overWeek.text == wantOver;
         // 240 yuan / 2.00 per min = 120 min = 2 hours. ★ The expected line is built from
         // the two halves the design doc names, because at 2 hours the remainder is
         // UNDER the 6-hour bar, so §7.4 requires the absolute local time to be in the
-        // same line: 「按当前速度，约 2 小时后归零」+「约 22:27」. An earlier version of this
-        // check demanded the bare relative string and failed a correct implementation --
-        // the fixture was wrong, not the code. The relative half stays spelled out in
-        // full (the exact Chinese wording of §7.4); only the clock half is computed.
+        // same line: 「按当前速度，约 2 小时后归零」+「约 22:27」.
         const std::wstring wantRelative = L"按当前速度，约 2 小时后归零";
         const bool twoHoursOk = twoHours.kind == ZeroTimeKind::Extrapolated &&
                                 twoHours.minutesToZero == 120 &&
-                                twoHours.text.rfind(wantRelative, 0) == 0 &&
                                 twoHours.text == wantRelative + L" · 约 " +
                                                       LocalClockFor(kTextNow + 120 * 60);
         // 6 yuan / 2.00 per min = 3 min: under 6 hours, so an absolute local time follows.
@@ -546,7 +735,8 @@ void RunChecks(Harness* h, bool verbose) {
         const bool owedNone = owed.kind == ZeroTimeKind::None && owed.text.empty();
 
         const bool ok = usedUpOk && overOk && twoHoursOk && shortOk && hysteresis &&
-                        branchRedraws && owedNone && e.status == RateStatus::Significant;
+                        branchRedraws && owedNone && e.status == RateStatus::Significant &&
+                        e.rateYuanPerMinute > 0.0;
         h->Req("case8", "the remaining 7.4 branches and the 10% redraw rule",
                "estimate=" + EstimateSummary(e) + "; balance 0 -> " + Show(usedUp.text) +
                    " (" + dshb::ZeroTimeKindName(usedUp.kind) + "); 30000 yuan -> " +
@@ -562,40 +752,88 @@ void RunChecks(Harness* h, bool verbose) {
                    std::string(owedNone ? "yes" : "NO"),
                ok);
     }
+
     // -----------------------------------------------------------------------
-    // (9) ★ A balance that is genuinely RISING (§7.2's recovery): every point of the rise
-    //     is a positive jump, so after the removal the surviving samples are the earlier
-    //     DECLINE only -- 3 points over 240 s, which is under the 5-minute bar.
-    //     ★ THIS CHECK RECORDS A CONFLICT rather than a happy path, and it is written to
-    //     assert what the code REALLY does, because that is what a probe is for:
-    //       - the owner's rules are "positive jumps are removed first and must never
-    //         contribute" + "insignificant when the span is under 5 minutes";
-    //       - together they mean a rising balance can never produce a rate, so §7.4's
-    //         「速率 ≤ 0 ->「—」」 branch is unreachable via a POSITIVE rate: the only route
-    //         to the dash is a FLAT balance (rate exactly 0), which case4 covers.
-    //     So this case asserts Insignificant / 「暂无法预测」, NOT the dash. If the owner
-    //     wants a rising balance to read as the dash instead, the rule to change is the
-    //     span bar (or jump handling for a wholly-rising window) -- see the report.
+    // (9) The shape the OLD probe used as its top-up fixture: one point raised by +50.00
+    //     while the points after it keep the OLD, lower level. That is NOT a top-up --
+    //     it means the balance fell back by 50.02 yuan between two readings, i.e. a real
+    //     50-yuan spend. The estimator now says so (5.018 yuan/min), and this check
+    //     freezes that reading so nobody "restores" the old fixture and old expectation.
+    //     ★ The old expectation (0.02 yuan/min, |error| <= 1e-6) was an artefact of OLS:
+    //     the fitted line only saw the endpoints, and dropping the raised point hid the
+    //     50-yuan step between the raised point and the next one.
     // -----------------------------------------------------------------------
     {
-        std::vector<RateInputPoint> series;
-        series.push_back(Dated(kAnchor, "10.0000"));
-        series.push_back(Dated(kAnchor + 120, "9.8000"));
-        series.push_back(Dated(kAnchor + 240, "9.6000"));
-        series.push_back(Dated(kAnchor + 360, "11.0000"));   // +1.40 top-up: a jump, removed
-        series.push_back(Dated(kAnchor + 480, "11.2000"));   // rising: also a jump, removed
-        series.push_back(Dated(kAnchor + 600, "11.4000"));   // rising: also a jump, removed
-        const RateEstimate e = dshb::EstimateRate(series);
-        const ZeroTimeText text = dshb::ZeroTimeFor(e, 11 * dshb::kUnitsPerYuan, kTextNow);
-        const std::wstring wantInsignificant = L"暂无法预测";
-        const bool ok = e.status == RateStatus::Insignificant && e.rateYuanPerMinute == 0.0 &&
-                        e.usablePoints == 3 && e.spanSeconds == 240 &&
-                        text.kind == ZeroTimeKind::NoPrediction && text.text == wantInsignificant;
-        h->Req("case9", "a rising balance: every rise is a jump, so the survivor is under the bar",
-               "series 10.00, 9.80, 9.60, 11.00, 11.20, 11.40 over 600s -> " + EstimateSummary(e) +
-                   ", text=" + Show(text.text) +
-                   ". CONFLICT RECORDED: §7.4's dash (rate <= 0) cannot be reached by a "
-                   "positive rate under these rules; only a flat balance reaches it (case4)",
+        const std::vector<RateInputPoint> plain = SteadySeries("10.0000", 0.02, 11, 60);
+        std::vector<RateInputPoint> oldShape = plain;
+        oldShape[7].amountRaw += 50 * dshb::kUnitsPerYuan;   // raise ONE point, keep the rest
+        const RateEstimate e = dshb::EstimateRate(oldShape);
+        const DropWalk walk = WalkDrops(oldShape);
+        const double expectedRate = WalkRate(walk);
+        const double error = std::fabs(e.rateYuanPerMinute - expectedRate);
+        const bool ok = e.status == RateStatus::Significant && e.rateYuanPerMinute > 5.0 &&
+                        error <= 1e-9 && e.decreasingSteps == 9 && e.risingSteps == 1 &&
+                        e.usablePoints == 11 && e.spanSeconds == 600;
+        h->Req("case9", "one point raised by +50.00 with the OLD level after it is a real 50.02 yuan "
+                        "drop, and the rate says so",
+               EstimateSummary(e) + " (independent walk: " + F6(expectedRate) +
+                   " yuan/min, |error|=" + F6(error) + "; the biggest single step is 50.02 yuan, "
+                   "not a top-up: 9 drops totalling " +
+                   F6(static_cast<double>(walk.dropSumRaw) / static_cast<double>(dshb::kUnitsPerYuan)) +
+                   " yuan over " + Num(static_cast<long long>(walk.spanSeconds)) + " s). "
+                   "A REAL top-up is case2 (the new level continues afterwards)",
+               ok);
+        if (verbose) std::printf("  old fixture shape: %s\n", SeriesSummary(oldShape).c_str());
+    }
+
+    // -----------------------------------------------------------------------
+    // (10) The smoothing boundary the window cares about: "0 -> a positive rate" must NOT
+    //      be smoothed. It is a BRANCH change (§7.4: 分支变了 -> 一定重画), and smoothing
+    //      it walks through rates so small that the extrapolation is "over 7 days" for a
+    //      measurable number of frames -- printed below. Between two POSITIVE rates the
+    //      spring is used, and then it never overshoots.
+    // -----------------------------------------------------------------------
+    {
+        const double target = 0.02;        // yuan/min, the case1/2/3 kind of rate
+        const double balance = 10.0;       // yuan
+        const double dt = 1.0 / 60.0;
+        int artifactFrames = 0;
+        double display = 0.0;
+        std::wstring firstArtifact;
+        for (int i = 0; i < 600; ++i) {
+            display = dshb::RateSpringStep(display, target, dt);
+            RateEstimate e;
+            e.status = RateStatus::Significant;
+            e.rateYuanPerMinute = display;
+            const ZeroTimeText text = dshb::ZeroTimeFor(
+                e, static_cast<int64_t>(balance * dshb::kUnitsPerYuan), kTextNow);
+            if (text.kind == ZeroTimeKind::OverSevenDays) {
+                ++artifactFrames;
+                if (firstArtifact.empty()) firstArtifact = text.text;
+            }
+        }
+        // The seeded alternative (what the window does): land on the target at once.
+        RateEstimate seeded;
+        seeded.status = RateStatus::Significant;
+        seeded.rateYuanPerMinute = target;
+        const ZeroTimeText seededText = dshb::ZeroTimeFor(
+            seeded, static_cast<int64_t>(balance * dshb::kUnitsPerYuan), kTextNow);
+        // Between two positive rates the spring IS used, monotonically and without overshoot.
+        const double mid = dshb::RateSpringStep(0.02, 0.05, dt);
+        const bool steadySpring = mid > 0.02 && mid < 0.05;
+
+        const bool ok = artifactFrames > 0 && artifactFrames < 60 &&
+                        firstArtifact == L"超过 7 天" &&
+                        seededText.kind == ZeroTimeKind::Extrapolated &&
+                        seededText.minutesToZero == 500 && steadySpring;
+        h->Req("case10", "smoothing a 0 -> positive rate would flash 「超过 7 天」: the window seeds it instead",
+               "naive smoothing from 0 to " + F6(target) + " yuan/min: the extrapolation says " +
+                   Show(firstArtifact) + " for the first " + Num(artifactFrames) +
+                   " frame(s) (" + F4(artifactFrames / 60.0) + " s at 60 Hz) before it settles; "
+                   "seeded (what display-layer AdvanceRate does): " + Show(seededText.text) +
+                   " (minutesToZero=" + Num(seededText.minutesToZero) + ") immediately; "
+                   "between two positive rates the spring runs: one frame 0.02 -> 0.05 gives " +
+                   F6(mid) + " (strictly inside, never past the target)",
                ok);
     }
 }
