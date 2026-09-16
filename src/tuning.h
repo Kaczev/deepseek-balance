@@ -109,9 +109,6 @@ inline constexpr int kUnreadableAfterFailures = 5;
 // ★ 所有者定的自适应节奏：取值**有变化**就把间隔缩短 1 秒（最快 3 秒），
 //   **没变化**就延长 1 秒（最慢 10 秒）。
 
-
-
-
 inline constexpr float kNumberShiftRate = 0.90f;   // 整块数字横向滑动：每帧把残差乘上它（同 kRollRate 的风格）
 inline constexpr float kNumberShiftSnapDip = 0.05f;   // 横向残差 < 它就直接吸附（免得永远差一点点）
 
@@ -161,8 +158,8 @@ inline constexpr float kCurveWidthDip = 8.0f;
 // 曲线的上下界（实体区内坐标，0 = 面板顶）。曲线在这两条线之间铺满。
 // 参考：数字墨迹占 48..81；标题在 8 上下；底部预估文案在 103 上下。
 // 想更宽就把两个数字拉开（例如 40 / 90）；想更窄就收拢（例如 55 / 75）。
-inline constexpr float kCurveBandTopDip = 45.0f;
-inline constexpr float kCurveBandBottomDip = 85.0f;
+inline constexpr float kCurveBandTopDip = 30.0f;
+inline constexpr float kCurveBandBottomDip = 100.0f;
 
 
 // ---- 曲线的滚动动画（规格 §3；所有者给的公式）----

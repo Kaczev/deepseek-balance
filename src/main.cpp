@@ -94,6 +94,7 @@ bool g_countdownGiven = false;  // --countdown=N：导帧时给倒计时一个�
 int g_countdownSeconds = 0;
 std::string g_apiKey;           // 只在内存里，绝不写日志
 bool g_clickTest = false;         // --click-test：注入三次手势
+int64_t g_lastSymClickMs = 0;      // 上次点击符号的墙钟毫秒（双击判定用）
 bool g_pauseTest = false;
 bool g_noCurve = false;           // --no-curve：关掉氛围曲线（A/B 对比用）
 int  g_historyDemo = 0;           // --history-demo=N：合成 N 个曲线点（导帧验证用）
@@ -215,6 +216,19 @@ void FinishLeftGesture(int x, int y) {
                 static_cast<int>(sr.t), static_cast<int>(sr.r), static_cast<int>(sr.b),
                 inside ? L"是" : L"否");
     if (!inside) return;
+    // ★ 双击才切换（所有者：单击太容易误触）。两次干净点击（非拖动、非长按）都要落在符号上，
+    //   且间隔不超过系统双击时间。
+    {
+        const int64_t nowMs = NowWallMs();
+        const int64_t dbl = static_cast<int64_t>(GetDoubleClickTime());
+        if (g_lastSymClickMs == 0 || (nowMs - g_lastSymClickMs) > dbl) {
+            g_lastSymClickMs = nowMs;
+            SelfTestLog(L"[click] 第一次点击符号：%.0fms 内再点一次才切换", static_cast<double>(dbl));
+            return;
+        }
+        g_lastSymClickMs = 0;
+        SelfTestLog(L"[click] 双击确认，切换");
+    }
     const std::string next = g_display.NextCurrency();
     if (next.empty()) {
         SelfTestLog(L"[click] 当前只有一个币种：忽略");
