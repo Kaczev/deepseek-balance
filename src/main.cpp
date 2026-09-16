@@ -265,6 +265,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case dshb::kMsgActivate:
         // 有人又双击了一次 exe（A11）。这个窗口不抢焦点、也不进 Alt+Tab，
         // 所以"提到前台"没有落点，改为闪一次描边作为可见反馈。
+        // 记一行：双击第二次时的可见反馈因此可验证（以前类名不匹配，静默失败）
+        SelfTestLog(L"[single] 收到重复启动通知：闪一次描边");
         if (g_renderer) g_renderer->BeginActivationFlash(g_elapsed);
         SelfTestLog(L"[single] 收到重复启动通知，已触发激活反馈 t=%.3f", g_elapsed);
         return 0;
