@@ -62,9 +62,18 @@ void LayoutProbe(const char* tag, float a, float b, float c, float d) {
 
 // 数字绘制模式（见 renderer.h）：定义必须在 dshb 作用域里，不能落进上面的匿名 namespace，
 // 否则 main.cpp 链接时找不到 dshb::g_digitDrawMode。
+
 int g_digitDrawMode = 0;
+
+// 氛围曲线开关：--no-curve 关掉它，用于 A/B 对比（关掉后文字位置必须逐像素不变）
+bool g_curveEnabled = true;
+
+// 氛围曲线（D1）：一条与数据无关的正弦线，画在**所有文字之前** = 数字后面。
+// 采样密度 1 像素一个点，所以肉眼看到的是连续曲线，不会出现折角
 namespace { float g_lastLinePitch = 0.0f; }
 float LastLinePitchDip() { return g_lastLinePitch; }
+
+void SetCurveEnabled(bool on) { g_curveEnabled = on; }
 
 void SetLayoutProbe(bool on) {
     g_layoutProbe = on;
@@ -368,6 +377,54 @@ void DrawCentered(ID2D1RenderTarget* rt, const std::wstring& text, IDWriteTextFo
 //   鏁板瓧鏄富瑙掞紝鎵€浠ュ畠鏈€澶э紱鏍囬灏忋€佹斁宸︿笂锛涙竻闆堕浼版斁搴曢儴銆?
 //   甯佺绗﹀彿**鏀惧悗缂€**锛?00.00楼锛夆€斺€旀墍鏈夎€呮槑纭寚瀹氾紝涓嶆敼銆?
 //   鏇茬嚎鏄?*姘涘洿**锛屼笌鏁板瓧鍙犲姞鍦ㄥ悓涓€涓尯鍩燂紙D 闃舵锛夛紝涓嶆槸"鍏堝湪鏇茬嚎涓婃柟鍐嶆斁鏁板瓧"銆?
+void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas) {
+    if (!g_curveEnabled) return;
+    const float s = canvas.scale;
+    const float x0 = kMarginDip * s;
+    const float x1 = (kMarginDip + kEntityWidthDip) * s;
+    const float cy = (kMarginDip + kCurveCenterYDip) * s;
+    const float amp = kCurveAmplitudeDip * s;
+
+    ID2D1Factory* fac = nullptr;
+    rt->GetFactory(&fac);
+    if (!fac) return;
+    ID2D1PathGeometry* geo = nullptr;
+    if (FAILED(fac->CreatePathGeometry(&geo)) || !geo) {
+        fac->Release();
+        return;
+    }
+    ID2D1GeometrySink* sink = nullptr;
+    if (FAILED(geo->Open(&sink)) || !sink) {
+        geo->Release();
+        fac->Release();
+        return;
+    }
+    const float span = (x1 > x0) ? (x1 - x0) : 1.0f;
+    bool first = true;
+    for (float x = x0; x <= x1; x += 1.0f) {
+        const float u = (x - x0) / span;
+        const float y = cy - amp * std::sin(2.0f * 3.14159265f * kCurvePeriods * u);
+        if (first) {
+            sink->BeginFigure(D2D1::Point2F(x, y), D2D1_FIGURE_BEGIN_HOLLOW);
+            first = false;
+        } else {
+            sink->AddLine(D2D1::Point2F(x, y));
+        }
+    }
+    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+    sink->Close();
+    sink->Release();
+
+    ID2D1SolidColorBrush* cb = nullptr;
+    if (SUCCEEDED(rt->CreateSolidColorBrush(
+            StraightRgba(kCurveColorR, kCurveColorG, kCurveColorB, kCurveAlpha), &cb)) && cb) {
+        rt->DrawGeometry(geo, cb, kCurveWidthDip * s);
+        cb->Release();
+    }
+    geo->Release();
+    fac->Release();
+}
+
 void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const WidgetFrame& f) {
     if (g_sceneMode != SceneMode::Normal) return;
 
@@ -734,6 +791,9 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
     }
 
     // 姝ｆ枃锛圕 闃舵锛夛細鏍囬銆佹暟瀛椼€佺鍙枫€佹竻闆堕浼?
+    // 氛围曲线：必须在文字之前画（= 数字后面）
+    PaintAmbientCurve(rt, canvas);
+
     PaintWidgetText(rt, canvas, g_widgetFrame);
 
     // 璋冭瘯娴眰锛圔6锛夛細鍙湪甯﹁皟璇曞紑鍏虫椂鏈夊唴瀹广€傜敾鍦ㄧ敾甯冨乏涓婅锛?

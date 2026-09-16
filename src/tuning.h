@@ -151,6 +151,18 @@ inline constexpr float kBorderColorG = 0xb2 / 255.0f;
 inline constexpr float kBorderColorB = 0xb7 / 255.0f;
 inline constexpr float kBorderWidthDip = 4.0f;
 
+// ---- 氛围曲线（D 段）----
+// D1：先画一条与数据无关的正弦线，只证明"能画出平滑曲线"。
+// 颜色取边缘文字那个中性色，透明度先给氛围档；D2 会专门调透明度。
+inline constexpr float kCurveColorR = 0xaf / 255.0f;
+inline constexpr float kCurveColorG = 0xb2 / 255.0f;
+inline constexpr float kCurveColorB = 0xb7 / 255.0f;
+inline constexpr float kCurveAlpha = 0.35f;
+inline constexpr float kCurveWidthDip = 2.0f;
+inline constexpr float kCurveAmplitudeDip = 14.0f;
+inline constexpr float kCurveCenterYDip = 65.0f;   // 实体区内的中线 y（65 = 绝对 145 = 数字墨迹中线）
+inline constexpr float kCurvePeriods = 2.5f;
+
 // ★ 状态主色：原来那支蓝 #6C89F6。**保留**，后面演示各种状态时用；
 //   面板与文字已改成上面的中性色，所以它现在不参与面板底色。
 inline constexpr float kStatePrimaryR = 108.0f / 255.0f;

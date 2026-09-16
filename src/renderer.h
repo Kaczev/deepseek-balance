@@ -113,6 +113,9 @@ extern int g_digitDrawMode;
 // 最近一次绘制时量到的行距 h（相邻两个数字的间距，DIP）。0 = 还没画过。
 float LastLinePitchDip();
 void SetLayoutProbe(bool on);
+
+    // 氛围曲线开关（--no-curve：关掉后文字位置必须逐像素不变，用于 A/B 对比）
+    void SetCurveEnabled(bool on);
 void DumpLayoutProbe();
 
 }  // namespace dshb

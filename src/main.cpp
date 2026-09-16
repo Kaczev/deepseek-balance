@@ -91,7 +91,8 @@ bool g_countdownGiven = false;  // --countdown=N：导帧时给倒计时一个�
 int g_countdownSeconds = 0;
 std::string g_apiKey;           // 只在内存里，绝不写日志
 bool g_clickTest = false;         // --click-test：注入三次手势
-bool g_pauseTest = false;         // --pause-test：注入"锁屏/解锁"，验证 J4（不用真锁屏）
+bool g_pauseTest = false;
+bool g_noCurve = false;           // --no-curve：关掉氛围曲线（A/B 对比用）         // --pause-test：注入"锁屏/解锁"，验证 J4（不用真锁屏）
 double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
 double g_displayAmount = 0.0;   // 已弃用（所有者改为 --last）
 double g_lastAmount = -1.0;   // --last=L（-1 = 未给）
@@ -435,6 +436,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // 导帧夹具：导出路径不取样，所以倒计时没有真实来源，靠它给一个值。
             g_countdownGiven = true;
             g_countdownSeconds = _wtoi(argv[i] + 12);
+        } else if (wcscmp(argv[i], L"--no-curve") == 0) {
+            g_noCurve = true;
         } else if (wcscmp(argv[i], L"--pause-test") == 0) {
             g_pauseTest = true;
         } else if (wcscmp(argv[i], L"--click-test") == 0) {
@@ -836,6 +839,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 布局诊断只在这里开：它会在绘制路径里写文件，而每帧写文件会把进程弄崩
         // （实测 0xC0000409）。导出模式只画一帧，所以安全。
         if (g_layoutProbe) dshb::SetLayoutProbe(true);
+        // 氛围曲线默认开；--no-curve 关掉它，用于确认"关掉后文字位置逐像素不变"
+        dshb::SetCurveEnabled(!g_noCurve);
 
         // 让模拟数据源在"虚拟时间"里跑起来：否则导出的图没有数据，浮层也是空的。
         // 虚拟时间按 1/60 秒一步推进，所以导出是确定的、可重复的。
