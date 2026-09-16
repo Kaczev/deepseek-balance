@@ -158,8 +158,12 @@ inline constexpr float kCurveColorG = 0xb2 / 255.0f;
 inline constexpr float kCurveColorB = 0xb7 / 255.0f;
 inline constexpr float kCurveAlpha = 0.35f;
 inline constexpr float kCurveWidthDip = 8.0f;
-inline constexpr float kCurveAmplitudeDip = 14.0f;
-inline constexpr float kCurveCenterYDip = 65.0f;   // 实体区内的中线 y（65 = 绝对 145 = 数字墨迹中线）
+// 曲线的上下界（实体区内坐标，0 = 面板顶）。曲线在这两条线之间铺满。
+// 参考：数字墨迹占 48..81；标题在 8 上下；底部预估文案在 103 上下。
+// 想更宽就把两个数字拉开（例如 40 / 90）；想更窄就收拢（例如 55 / 75）。
+inline constexpr float kCurveBandTopDip = 45.0f;
+inline constexpr float kCurveBandBottomDip = 85.0f;
+
 
 // ---- 曲线的滚动动画（规格 §3；所有者给的公式）----
 // 第 k 帧每点纵坐标：P = L + (N − L) × (1 − rate^k)^c

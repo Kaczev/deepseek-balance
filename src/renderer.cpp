@@ -386,14 +386,14 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
     const float s = canvas.scale;
     const float x0 = kMarginDip * s;
     const float x1 = (kMarginDip + kEntityWidthDip) * s;
-    const float cy = (kMarginDip + kCurveCenterYDip) * s;
-    const float amp = kCurveAmplitudeDip * s;
+    const float bandTop = (kMarginDip + kCurveBandTopDip) * s;
+    const float bandBottom = (kMarginDip + kCurveBandBottomDip) * s;
 
     // 归一化坐标 -> 画布坐标：x 横跨实体区，y 从带子顶(0)到底(1)。
     // ★ 带子位置只由常量决定，**与币种无关**：换币种不重新布局，
     //   每个币种各自铺满同一条带子（所有者：切币种时曲线位置不变）。
     auto px = [&](float xn) { return x0 + xn * (x1 - x0); };
-    auto py = [&](float yn) { return (cy - amp) + yn * (2.0f * amp); };
+    auto py = [&](float yn) { return bandTop + yn * (bandBottom - bandTop); };
 
     // 要画的点列（归一化）。渲染层只管连线，不知道余额从哪来——按规格 §3，点已经
     // 是显示层算好的最终位置（横向滚动、纵向缓动都算完了），这里一个都不再改。
