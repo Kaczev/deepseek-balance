@@ -108,9 +108,9 @@ inline constexpr int kUnreadableAfterFailures = 5;
 
 // ★ 所有者定的自适应节奏：取值**有变化**就把间隔缩短 1 秒（最快 3 秒），
 //   **没变化**就延长 1 秒（最慢 10 秒）。
-inline constexpr int kApiIntervalMaxMs = 30000;
-inline constexpr int kApiIntervalMinMs = 10000;
-inline constexpr int kApiIntervalStepMs = 3000;
+
+
+
 
 inline constexpr float kNumberShiftRate = 0.90f;   // 整块数字横向滑动：每帧把残差乘上它（同 kRollRate 的风格）
 inline constexpr float kNumberShiftSnapDip = 0.05f;   // 横向残差 < 它就直接吸附（免得永远差一点点）
@@ -167,6 +167,9 @@ inline constexpr float kCurveCenterYDip = 65.0f;   // 实体区内的中线 y（
 // 横向同理：每点横坐标 = 基准横坐标 − 进度 × 一格，进度同样是帧号 k 的纯函数。
 // 初始值与数字滚动一致（同一套手感），之后你可以分别调。
 // ★ 必须是帧号 k 的纯函数（不要改成"每帧自乘的增量状态"）——否则导帧逐帧量不了。
+// 刷新节奏：固定 10 秒一个点（所有者规格 §2.3：不做自适应；自适应那三个常量已删）
+inline constexpr int kApiIntervalMs = 10000;
+
 inline constexpr float kCurveRollRate = 0.975f;
 inline constexpr float kCurveRollC = 10.0f;
 

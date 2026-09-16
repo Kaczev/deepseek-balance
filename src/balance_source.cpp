@@ -167,26 +167,18 @@ void BalanceSource::Run(BalanceSourceConfig cfg) {
             pending_.push_back(s);
             logs_.push_back(api::LogLine(r));   // J6：行内绝不含 Key
         }
-        // ---- 自适应节奏（所有者定的规则）----
-        // 有变化 -> 缩短 1 秒（最快 kApiIntervalMinMs）；没变化 -> 延长 1 秒（最慢 intervalMs）。
-        // 第一次成功样本没有可比对象：不动间隔，日志也要说明白（原来会误报"有变化"）。
+        // ---- 固定节奏（所有者规格 §2.3：10 秒获取一个点，不做自适应）----
+        // 日志仍然记录"值有没有变化"，因为它决定有没有新点（曲线滚动由新点触发）。
         if (r.status == api::Status::Ok) {
             const bool changed = !havePrev_ || !SameAmounts(prev_, s);
-            if (havePrev_) {
-                int cur = intervalMs_.load();
-                if (changed) cur = std::max(dshb::kApiIntervalMinMs, cur - dshb::kApiIntervalStepMs);
-                else         cur = std::min(cfg.intervalMs, cur + dshb::kApiIntervalStepMs);
-                intervalMs_.store(cur);
-            }
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                char ib[128];
+                char ib[160];
                 if (!havePrev_) {
-                    std::snprintf(ib, sizeof(ib), "interval -> %dms (first sample, no comparison)",
-                                  intervalMs_.load());
+                    std::snprintf(ib, sizeof(ib), "interval -> %dms fixed (first sample)", intervalMs_.load());
                 } else {
-                    std::snprintf(ib, sizeof(ib), "interval -> %dms (%s)", intervalMs_.load(),
-                                  changed ? "value changed, shorter" : "unchanged, longer");
+                    std::snprintf(ib, sizeof(ib), "interval -> %dms fixed (%s)", intervalMs_.load(),
+                                  changed ? "value changed -> new point" : "unchanged -> no point");
                 }
                 logs_.push_back(ib);
             }
