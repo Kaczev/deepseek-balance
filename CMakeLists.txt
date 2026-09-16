@@ -29,6 +29,7 @@ add_executable(dshb
     src/balance_source.cpp
     src/sample_history.cpp
     src/curve.cpp
+    src/curve_store.cpp
 )
 
 set_target_properties(dshb PROPERTIES WIN32_EXECUTABLE TRUE)
@@ -58,3 +59,10 @@ add_executable(apiprobe tools/apiprobe.cpp src/api_client.cpp src/json_min.cpp)
 target_compile_definitions(apiprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(apiprobe PRIVATE src)
 target_link_libraries(apiprobe PRIVATE winhttp)
+
+# store probe: curve data layer (12-point ring, append-on-change, curve.json,
+# invalidation). Offline, no network and no shared state; like apiprobe and tauprobe
+# it carries its own main() so the widget's argument parsing stays untouched.
+add_executable(storeprobe tools/storeprobe.cpp src/curve_store.cpp src/amount.cpp src/json_min.cpp)
+target_compile_definitions(storeprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_include_directories(storeprobe PRIVATE src)
