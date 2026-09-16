@@ -83,6 +83,8 @@ unsigned long long g_pressTick = 0;
 bool g_pressValid = false;
 bool g_currenciesGiven = false;   // --currencies=：合成一条多币种样本（验证切换用）
 std::string g_currenciesSpec;   // 形如 "CNY:19.20,USD:2.70"
+bool g_realApiPlanned = false;  // 进循环之前就定下"本次要不要用真接口"
+std::string g_apiKey;           // 只在内存里，绝不写日志
 bool g_clickTest = false;         // --click-test：注入三次手势
 double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
 double g_displayAmount = 0.0;   // 已弃用（所有者改为 --last）
@@ -735,6 +737,42 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         return premultiplied ? 0 : 8;
     }
 
+    // ---- 真接口"要不要用"在**进入循环之前**定下来（J1/J2）----
+    //
+    // ★ 为什么必须提前：假数据源在主循环里**先**喂一帧，真接口要到同一轮稍后才启动，
+    //   于是开头会闪出假值；如果第一次真请求慢或失败，那个假值就一直挂着
+    //   （实测：所有者打开后卡在 99.80 不动，正是这条顺序造成的）。
+    //   先决定、后喂数据，就不可能出现假值——打开就是 --.--，真值到了才出现数字。
+    {
+        wchar_t keyBuf[512]{};
+        bool haveKey = GetEnvironmentVariableW(L"DEEPSEEK_API_KEY", keyBuf, 512) > 0;
+        if (haveKey) {
+            SelfTestLog(L"[api] Key 取自环境变量 DEEPSEEK_API_KEY");
+        } else {
+            std::wstring fromStore;
+            if (ReadKeyFromDshCredentials(&fromStore)) {
+                wcsncpy_s(keyBuf, fromStore.c_str(), _TRUNCATE);
+                haveKey = true;
+                SelfTestLog(L"[api] Key 取自 DSH 凭据文件 refs.DEEPSEEK_API_KEY（不打印内容）");
+            }
+        }
+        g_states.SetNoKey(!haveKey);
+
+        const bool manualRun = g_currenciesGiven || g_fixedGiven || g_realGiven || g_lastGiven ||
+                               g_frames >= 0 || !g_seq.empty();
+        g_realApiPlanned = haveKey && !g_apiOff && !manualRun;
+        if (g_realApiPlanned) {
+            char narrow[1024]{};
+            const int nc = WideCharToMultiByte(CP_UTF8, 0, keyBuf, -1, narrow, sizeof(narrow),
+                                               nullptr, nullptr);
+            if (nc > 0) g_apiKey.assign(narrow);
+        } else if (!haveKey) {
+            SelfTestLog(L"[api] 未找到 Key（环境变量与 DSH 凭据都没有）：走 NoKey 态，不发请求");
+        } else {
+            SelfTestLog(L"[api] 本次不用真接口（--api=off 或手动/演示参数）");
+        }
+    }
+
     // ---- 离屏导帧模式：渲一帧到 PNG 就退出 ----
     // 用来做"用像素说话"的验收：居中错位、颜色、残影、粒子越界都靠它量。
     // 注意它渲染的是同一份绘制代码，所以屏幕上的错在 PNG 里也会错。
@@ -1178,56 +1216,25 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 所以换数据源不需要动它——这正是把这两件事分开的目的。
         {
             const dshb::Sample s = g_fake.NextIfDue(elapsed);
-            if (s.wallMs != 0 && !g_realApiOn && !g_currenciesGiven && !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0 && g_seq.empty()) {   // 钉值/真接口/合成样本时不喂
+            if (s.wallMs != 0 && !g_realApiPlanned && !g_currenciesGiven && !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0 && g_seq.empty()) {   // 钉值/真接口/合成样本时不喂
                 g_states.OnSample(s, s.wallMs);
             }
         }
 
-        // Key 缺失是启动时检查一次即可（设计 §4 的 NoKey 态）
-        {
-            static bool keyChecked = false;
-            if (!keyChecked) {
-                keyChecked = true;
-                // ★ 原来是 buf[8]：只够"判断有没有"，不够真的拿去发请求。
-                //   要发请求就必须完整读出来。Key 绝不写进任何日志（J6）。
-                wchar_t keyBuf[512]{};
-                bool haveKey = GetEnvironmentVariableW(L"DEEPSEEK_API_KEY", keyBuf, 512) > 0;
-                if (haveKey) {
-                    SelfTestLog(L"[api] Key 取自环境变量 DEEPSEEK_API_KEY");
-                } else {
-                    // 环境变量没有 -> 回落到 DSH 的全局凭据文件（旧版就是这么拿的）
-                    std::wstring fromStore;
-                    if (ReadKeyFromDshCredentials(&fromStore)) {
-                        wcsncpy_s(keyBuf, fromStore.c_str(), _TRUNCATE);
-                        haveKey = true;
-                        SelfTestLog(L"[api] Key 取自 DSH 凭据文件 refs.DEEPSEEK_API_KEY（不打印内容）");
-                    }
-                }
-                g_states.SetNoKey(!haveKey);
-
-                const bool manualRun = g_currenciesGiven || g_fixedGiven || g_realGiven || g_lastGiven || g_frames >= 0 ||
-                                       !g_seq.empty();
-                if (haveKey && !g_apiOff && !manualRun) {
-                    dshb::BalanceSourceConfig cfg{};
-                    cfg.host = g_apiHost;
-                    cfg.port = g_apiPort;
-                    cfg.plainHttp = g_apiPlainHttp;
-                    cfg.timeoutMs = g_apiTimeoutMs;
-                    cfg.intervalMs = g_apiIntervalMs;
-                    cfg.once = g_apiOnce;
-                    // 宽字符 -> UTF-8；api_client 只用它发请求，不打印
-                    char narrow[1024]{};
-                    const int nc = WideCharToMultiByte(CP_UTF8, 0, keyBuf, -1, narrow,
-                                                       sizeof(narrow), nullptr, nullptr);
-                    if (nc > 0) cfg.apiKey.assign(narrow);
-                    g_apiSource.Start(cfg);
-                    g_realApiOn = true;
-                    SelfTestLog(L"[api] 真接口已启动：host=%ls port=%d 间隔=%dms 超时=%dms",
-                                g_apiHost.c_str(), g_apiPort, g_apiIntervalMs, g_apiTimeoutMs);
-                } else if (!haveKey) {
-                    SelfTestLog(L"[api] 未找到 DEEPSEEK_API_KEY：走 NoKey 态，不发请求");
-                }
-            }
+        // 真接口的启动（Key 与"要不要用"都在进循环之前做完了，见上面那块）
+        if (g_realApiPlanned && !g_realApiOn) {
+            dshb::BalanceSourceConfig cfg{};
+            cfg.host = g_apiHost;
+            cfg.port = g_apiPort;
+            cfg.plainHttp = g_apiPlainHttp;
+            cfg.timeoutMs = g_apiTimeoutMs;
+            cfg.intervalMs = g_apiIntervalMs;
+            cfg.once = g_apiOnce;
+            cfg.apiKey = g_apiKey;   // 循环之前读好的，绝不打印
+            g_apiSource.Start(cfg);
+            g_realApiOn = true;
+            SelfTestLog(L"[api] 真接口已启动：host=%ls port=%d 起始间隔=%dms 超时=%dms",
+                        g_apiHost.c_str(), g_apiPort, g_apiIntervalMs, g_apiTimeoutMs);
         }
 
         // 布局诊断：**每帧绘制结束、回到这里之后**才写文件（不在绘制路径里写，

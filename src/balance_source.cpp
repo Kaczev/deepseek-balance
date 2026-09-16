@@ -134,6 +134,7 @@ void BalanceSource::Run(BalanceSourceConfig cfg) {
         }
         // ---- 自适应节奏（所有者定的规则）----
         // 有变化 -> 缩短 1 秒（最快 kApiIntervalMinMs）；没变化 -> 延长 1 秒（最慢 intervalMs）。
+        // 第一次成功样本没有可比对象：不动间隔，日志也要说明白（原来会误报"有变化"）。
         if (r.status == api::Status::Ok) {
             const bool changed = !havePrev_ || !SameAmounts(prev_, s);
             if (havePrev_) {
@@ -144,9 +145,14 @@ void BalanceSource::Run(BalanceSourceConfig cfg) {
             }
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                char ib[96];
-                std::snprintf(ib, sizeof(ib), "interval -> %dms (%s)", intervalMs_.load(),
-                              changed ? "value changed, shorter" : "unchanged, longer");
+                char ib[128];
+                if (!havePrev_) {
+                    std::snprintf(ib, sizeof(ib), "interval -> %dms (first sample, no comparison)",
+                                  intervalMs_.load());
+                } else {
+                    std::snprintf(ib, sizeof(ib), "interval -> %dms (%s)", intervalMs_.load(),
+                                  changed ? "value changed, shorter" : "unchanged, longer");
+                }
                 logs_.push_back(ib);
             }
             prev_ = s;
