@@ -69,7 +69,14 @@ void DisplayedAmount::SelectCurrency(const std::string& code) {
         lastSwitchTarget_ = yuan;    // 回传给 main.cpp 记日志（这一层不能写日志）
         return;
     }
+    // ★ 这个币种在最近的样本里**没有数据**：显示 --.--，但符号仍然换成它的
+    //   （所有者：没有数据就显示 --.--，符号要变——否则看不出自己在看哪个币种）。
+    hasValue_ = false;
+    trips_.clear();
+    places_.clear();
+    animating_ = false;
     tripsDirty_ = true;
+    lastSwitchTarget_ = -1.0;
 }
 
 std::string DisplayedAmount::NextCurrency() const {
@@ -93,6 +100,17 @@ void DisplayedAmount::OnSample(const Sample& s) {
     availableCurrencies_.clear();
     for (const CurrencyAmount& e : s.entries) {
         if (e.ok) availableCurrencies_.push_back(e.currency);
+    }
+    // ★ 可切换的币种 = 本次样本里**有数据的** + 我们**知道怎么显示的**（CNY/USD）。
+    //   所有者：切到没有数据的币种就显示 --.--，但符号要变。
+    //   所以即使账户只有 CNY，也必须能切到 USD（显示 --.-- 加 $）——
+    //   否则这个功能在单币种账户上根本看不出效果。
+    for (const char* known : {"CNY", "USD"}) {
+        bool has = false;
+        for (const std::string& c : availableCurrencies_) {
+            if (c == known) { has = true; break; }
+        }
+        if (!has) availableCurrencies_.push_back(known);
     }
     Amount picked = s.total;
     std::string pickedCode = s.currency;
@@ -371,12 +389,13 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     const bool haveNumber = amount.hasValue() && currencyKnown;
     f.showAmount = haveNumber;
     if (haveNumber) {
-        f.amountText = amount.TextToShow();     // 滚动期间是冻结的目标文本
-        f.currencySymbol = currencySymbol ? currencySymbol : L"";
+        f.amountText = amount.TextToShow();
     } else {
         f.amountText = "--.--";                // 占位符，不是 0.00
-        f.currencySymbol = L"";
     }
+    // ★ 符号与数字**分开决定**（所有者）：只要币种是确定的，即使没有数字也要显示符号，
+    //   否则切到没数据的币种时看不出自己在看哪个币种。
+    f.currencySymbol = currencyKnown ? (currencySymbol ? currencySymbol : L"") : L"";
 
     // 每一位的纵坐标交给渲染层。空则渲染层退回整串绘制。
     f.places = amount.places();

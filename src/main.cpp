@@ -84,7 +84,7 @@ bool g_pressValid = false;
 bool g_currenciesGiven = false;   // --currencies=：合成一条多币种样本（验证切换用）
 std::string g_currenciesSpec;   // 形如 "CNY:19.20,USD:2.70"
 bool g_realApiPlanned = false;  // 进循环之前就定下"本次要不要用真接口"
-bool g_clickDemo = false;       // --click-demo：自动每 2 秒点一次符号（演示用，不是测试）
+
 bool g_countdownGiven = false;  // --countdown=N：导帧时给倒计时一个固定值（导帧不取样）
 int g_countdownSeconds = 0;
 std::string g_apiKey;           // 只在内存里，绝不写日志
@@ -211,10 +211,13 @@ static void FinishLeftGesture(int x, int y) {
     }
     g_display.SelectCurrency(next);
     const double switched = g_display.lastSwitchTarget();
+    const wchar_t* symNow = (g_display.shownCurrency() == "CNY") ? L"¥"
+                          : ((g_display.shownCurrency() == "USD") ? L"$" : L"(无)");
     if (switched >= 0.0) {
-        SelfTestLog(L"[click] 币种切换 -> %hs，实际数字立刻换成 %.2f", next.c_str(), switched);
+        SelfTestLog(L"[click] 切换 -> %hs：符号=%ls 数字=%.2f", next.c_str(), symNow, switched);
     } else {
-        SelfTestLog(L"[click] 币种切换 -> %hs（这次样本里没有该币种，只换符号）", next.c_str());
+        SelfTestLog(L"[click] 切换 -> %hs：符号=%ls 数字=--.--（该币种本次没有数据）",
+                    next.c_str(), symNow);
     }
 }
 
@@ -398,8 +401,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_selftestB = true;
         } else if (wcscmp(argv[i], L"--layout-probe") == 0) {
             g_layoutProbe = true;
-        } else if (wcscmp(argv[i], L"--click-demo") == 0) {
-            g_clickDemo = true;
+        } else if (wcscmp(argv[i], L"--click-demo") == 0) {   // 已移除（所有者不要演示窗）
+            SelfTestLog(L"[argv] --click-demo 已移除（所有者：不要演示窗口），忽略");
         } else if (wcsncmp(argv[i], L"--countdown=", 12) == 0) {
             // 导帧夹具：导出路径不取样，所以倒计时没有真实来源，靠它给一个值。
             g_countdownGiven = true;
@@ -934,10 +937,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 组装正文（和真实运行时同一条路径），这样导出的图就是屏幕上会看到的图
         {
             const dshb::ConnState st = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
-            const bool currencyKnown = g_states.hasGood() && g_states.lastGood().CurrencyKnown();
+            const bool currencyKnown = g_states.hasGood() && (g_display.shownCurrency() == "CNY" || g_display.shownCurrency() == "USD");
             renderer.SetWidgetFrame(dshb::BuildWidgetFrame(
                 st, g_display, currencyKnown,
-                g_states.hasGood() ? g_states.lastGood().CurrencySymbolW() : L""));
+                ((g_display.shownCurrency() == "CNY") ? L"\u00A5"
+                 : ((g_display.shownCurrency() == "USD") ? L"$" : L""))));
         }
 
         if (g_debug) {
@@ -1339,20 +1343,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         if (!manualMode) g_display.OnSample(g_states.lastGood());
         // --click-test：注入三次手势，验证"只有单击才切换"这条规则。
         // 走的是和真实鼠标**同一个**判定函数，不是旁路。
-        if (g_clickTest || g_clickDemo) {
+        if (g_clickTest) {
             static int ctStage = 0;
             static double ctAt = 1.0;
-            // --click-demo：三次手势之后，继续每 2 秒来一次干净单击，便于肉眼看切换
-            if (g_clickDemo && ctStage >= 3 && elapsed >= ctAt) {
-                const dshb::SymbolRect sr2 = dshb::CurrencySymbolRect();
-                if (sr2.valid) {
-                    const int mx = static_cast<int>((sr2.l + sr2.r) * 0.5f);
-                    const int my = static_cast<int>((sr2.t + sr2.b) * 0.5f);
-                    g_pressX = mx; g_pressY = my; g_pressTick = GetTickCount64(); g_pressValid = true;
-                    FinishLeftGesture(mx, my);
-                    ctAt = elapsed + 6.0;   // 必须长于一次滚动（2 秒只能看到中间态，实测踩过）
-                }
-            }
+
             if (ctStage < 3 && elapsed >= ctAt) {
                 const dshb::SymbolRect sr = dshb::CurrencySymbolRect();
                 if (sr.valid) {
@@ -1381,10 +1375,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 组装这一帧要显示的东西，交给渲染层。渲染层不关心余额是怎么来的。
         {
             const dshb::ConnState st = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
-            const bool currencyKnown = g_states.hasGood() && g_states.lastGood().CurrencyKnown();
+            const bool currencyKnown = g_states.hasGood() && (g_display.shownCurrency() == "CNY" || g_display.shownCurrency() == "USD");
             renderer.SetWidgetFrame(dshb::BuildWidgetFrame(
                 st, g_display, currencyKnown,
-                g_states.hasGood() ? g_states.lastGood().CurrencySymbolW() : L""));
+                ((g_display.shownCurrency() == "CNY") ? L"\u00A5"
+                 : ((g_display.shownCurrency() == "USD") ? L"$" : L""))));
         }
 
         LARGE_INTEGER a, b, freq;
