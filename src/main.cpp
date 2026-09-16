@@ -945,6 +945,12 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         }
 
         if (g_debug) {
+            // --debug：每 6 帧记一次"动画中的显示值"与"目标值"。
+            // 两者不同 -> 正在滚动；一次相同 -> 已经落定。用来验证"不是突变"。
+            static int dbgTick = 0;
+            if (++dbgTick % 6 == 0) {
+                SelfTestLog(L"[dbg] 显示值=%.4f 目标值=%.4f", g_display.value(), g_display.target());
+            }
             const int64_t nowWall = static_cast<int64_t>(NowWallMs());
             const dshb::ConnState st = g_states.Evaluate(nowWall);
             const dshb::Sample& last = g_states.lastGood();
@@ -1240,6 +1246,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             const dshb::Sample s = g_fake.NextIfDue(elapsed);
             if (s.wallMs != 0 && !g_realApiPlanned && !g_currenciesGiven && !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0 && g_seq.empty()) {   // 钉值/真接口/合成样本时不喂
                 g_states.OnSample(s, s.wallMs);
+                // ★ 显示层**只在新样本到达时**喂（见下面删掉的那行每帧喂入）。
+                //   每帧重复喂同一条样本，会让 L 恒等于 R（D=0）——滚动动画永远不动，
+                //   看起来就是数字突变（所有者实测：18.27 -> 18.12 无滚动）。
+                g_display.OnSample(g_states.lastGood());
             }
         }
 
@@ -1279,6 +1289,12 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
         // 调试浮层：把状态机的判断摊开给人看。**它只显示，不参与任何逻辑。**
         if (g_debug) {
+            // --debug：每 6 帧记一次"动画中的显示值"与"目标值"。
+            // 两者不同 -> 正在滚动；一次相同 -> 已经落定。用来验证"不是突变"。
+            static int dbgTick = 0;
+            if (++dbgTick % 6 == 0) {
+                SelfTestLog(L"[dbg] 显示值=%.4f 目标值=%.4f", g_display.value(), g_display.target());
+            }
             const int64_t nowWall = static_cast<int64_t>(NowWallMs());
             const dshb::ConnState st = g_states.Evaluate(nowWall);
             const bool focused = (GetForegroundWindow() == g_hwnd);
@@ -1340,7 +1356,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             dshb::SetCountdownText(std::to_wstring(secsLeft).c_str());
         }
 
-        if (!manualMode) g_display.OnSample(g_states.lastGood());
+        // ★ 这里原来每帧都喂一次 g_display.OnSample(g_states.lastGood())，已删除：
+        //   同一条样本重复喂 -> lastReal_ 与 target_ 永远相等 -> 行程为 0 -> 没有滚动，
+        //   只剩突变。（假数据源与真接口现在都在"新样本到达"处分发。）
         // --click-test：注入三次手势，验证"只有单击才切换"这条规则。
         // 走的是和真实鼠标**同一个**判定函数，不是旁路。
         if (g_clickTest) {
