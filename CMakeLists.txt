@@ -27,6 +27,8 @@ add_executable(dshb
     src/api_client.cpp
     src/json_min.cpp
     src/balance_source.cpp
+    src/sample_history.cpp
+    src/curve.cpp
 )
 
 set_target_properties(dshb PROPERTIES WIN32_EXECUTABLE TRUE)

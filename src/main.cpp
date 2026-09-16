@@ -19,6 +19,7 @@
 #include <windows.h>
 #include <objbase.h>    // CoInitializeEx / COINIT_APARTMENTTHREADED
 #include <shellapi.h>   // CommandLineToArgvW
+#include "curve.h"       // --curve-selftest
 #include <wtsapi32.h>   // 锁屏/解锁通知（J4）
 
 #include <cmath>
@@ -436,6 +437,21 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // 导帧夹具：导出路径不取样，所以倒计时没有真实来源，靠它给一个值。
             g_countdownGiven = true;
             g_countdownSeconds = _wtoi(argv[i] + 12);
+        } else if (wcscmp(argv[i], L"--curve-selftest") == 0) {
+            // Numeric self-test for the monotone interpolation (D3/D6).
+            // No pixels involved: exactness + no-overshoot are pure properties.
+            std::string rep;
+            const bool ok = dshb::SelfTestMonotoneCurve(&rep);
+            SelfTestLog(L"[curve] --- monotone interpolation self-test ---");
+            size_t pos = 0;
+            while (pos < rep.size()) {
+                size_t eol = rep.find('\n', pos);
+                if (eol == std::string::npos) eol = rep.size();
+                SelfTestLog(L"[curve] %hs", rep.substr(pos, eol - pos).c_str());
+                pos = eol + 1;
+            }
+            SelfTestLog(ok ? L"[curve] RESULT: all properties hold" : L"[curve] RESULT: FAILED");
+            g_runSeconds = 0.2;   // 跑完就退
         } else if (wcscmp(argv[i], L"--no-curve") == 0) {
             g_noCurve = true;
         } else if (wcscmp(argv[i], L"--pause-test") == 0) {

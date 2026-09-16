@@ -158,7 +158,7 @@ inline constexpr float kCurveColorR = 0xaf / 255.0f;
 inline constexpr float kCurveColorG = 0xb2 / 255.0f;
 inline constexpr float kCurveColorB = 0xb7 / 255.0f;
 inline constexpr float kCurveAlpha = 0.35f;
-inline constexpr float kCurveWidthDip = 2.0f;
+inline constexpr float kCurveWidthDip = 8.0f;
 inline constexpr float kCurveAmplitudeDip = 14.0f;
 inline constexpr float kCurveCenterYDip = 65.0f;   // 实体区内的中线 y（65 = 绝对 145 = 数字墨迹中线）
 inline constexpr float kCurvePeriods = 2.5f;
