@@ -121,6 +121,23 @@ RateEstimate EstimateRate(const std::vector<RateInputPoint>& pointsOldestFirst) 
         result.note = "no point carries a usable amount";
         return result;
     }
+    // ★ 时间上界的窗口（tuning.h 的 kRateWindowSeconds）：只保留最近这一段内的点。
+    //   没有它，"下降量之和 ÷ 跨度"会被抖动点稀释 —— 每个抖动点只贡献 1 分钱，
+    //   却把跨度拉长，于是速率一路衰减、预估值一路攀升（所有者实测到"超过 7 天"）。
+    //   至少保留一个点；一个都不满足时不动（不让"算不出来"凭空出现）。
+    //   0 = 关闭。
+    if (kRateWindowSeconds > 0 && usable.size() > 1) {
+        const int64_t newestAt = usable.back().at;
+        std::size_t firstKept = 0;
+        while (firstKept + 1 < usable.size() &&
+               newestAt - usable[firstKept].at > kRateWindowSeconds) {
+            ++firstKept;
+        }
+        if (firstKept > 0) {
+            usable.erase(usable.begin(),
+                         usable.begin() + static_cast<std::ptrdiff_t>(firstKept));
+        }
+    }
     result.usablePoints = static_cast<int>(usable.size());
     result.spanSeconds = usable.size() > 1 ? usable.back().at - usable.front().at : 0;
 

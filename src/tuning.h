@@ -161,6 +161,13 @@ inline constexpr int kRateMinDecreasingSamples = 3;
 // ★ 显著的**最短**时间跨度（秒）= 5 分钟（设计 §7.3「窗口跨度 < 5 分钟 ->
 //   不显著」）。注意这是**时间跨度**，不是点数：10 个点挤在 4 秒里同样不显著。
 inline constexpr int64_t kRateMinSpanSeconds = 300;
+// ★ 速率只看最近这一段（秒）。为什么需要：速率 = 下降量之和 ÷ 跨度，而跨度是
+//   "最旧到最新"的时间差。余额在 ±0.01 之间抖动时，每个抖动点都算一个下降台阶
+//   （分子只加 1 分钱）却把跨度拉长，于是速率被稀释、底部那行"按当前速度，约 X 小时后
+//   归零"会自己往上爬（所有者实测：纯抖动、零真实消耗，7.4 小时 -> 31.4 小时 -> 超过 7 天）。
+//   只取最近这一段，既堵住稀释，也让文案里的"当前速度"名副其实。
+//   0 = 关闭（恢复"所有点都进窗口"的旧口径）。必须 >= kRateMinSpanSeconds 才有意义。
+inline constexpr int64_t kRateWindowSeconds = 1800;
 
 // ★ 清零预估的封顶（分钟）= 7 天（设计 §7.4「超过 7 天」）。超过就只说
 //   "超过 7 天"，不给一个没人信的精确值。
@@ -303,14 +310,14 @@ inline constexpr float kGlowInLipAlpha = 0.280f;  // 轮廓内沿处的 alpha（
 inline constexpr float kGlowInVertDip = 17.0f;
 inline constexpr float kGlowInVertAlpha = 0.150f;
 // 整板底噪：面板内处处一层极淡的 alpha，作用是"整体被染了一点"，不提供亮度。
-inline constexpr float kGlowInFloorAlpha = 0.025f;
+inline constexpr float kGlowInFloorAlpha = 0.060f;   // 整板底噪：这是"被照亮的表面"而不是"一条边"的关键
 
 // ---- 5.5 内蒙光的强度倍率 k(R,D) —— 单独暴露，改它不用动剖面 ----
 //   k(R,D) = (kGlowInK0 + kGlowInK1 * R) * (1 - kGlowInD * D)
 //   R 越大越亮（最多 +67%），D 越大越暗（最多 -60%）。
 // ★ 这是所有者唯一需要动的"亮度"旋钮：剖面（5.4）一个数都不用改。
 //   它乘在**整条剖面**上，所以形状不随状态变化（形状变了 = 换了一种状态语言）。
-inline constexpr float kGlowInK0 = 0.60f;   // R = 0 时的基准强度
+inline constexpr float kGlowInK0 = 1.00f;   // R = 0 时的基准强度（所有者 2026-09-17：先加大看看）
 inline constexpr float kGlowInK1 = 0.40f;   // R = 1 时额外加多少
 inline constexpr float kGlowInD = 0.60f;    // D = 1 时暗掉的比例
 // 读不到余额（按 D = 1 处理）时观感取"甲"：冷白光**仍在**，不是"褪尽"
