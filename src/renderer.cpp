@@ -4,6 +4,7 @@
 // 鏁板瓧銆佹洸绾裤€侀鑹层€佸績璺抽兘鏄悗闈㈡楠ょ殑浜嬶紙瀹炴柦姝ラ C/D/E锛夈€?
 
 #include "renderer.h"
+#include "heartbeat.h"   // kBeatAMax：窗口区域要留出心跳的行程
 #include "curve.h"   // 单调三次插值（氛围曲线）
 #include "roll_axis.h"
 #include "widget_display.h"   // WidgetFrame / CurvePoint（含每点的颜色）/ AmbienceColor
@@ -1492,6 +1493,13 @@ bool Renderer::ApplyInputRegion(bool particlesSpillout) {    if (!impl_ || !hwnd
         top = m;
         right = m + static_cast<int>(kEntityWidthDip * size_.scale + 0.5f);
         bottom = m + static_cast<int>(kEntityHeightDip * size_.scale + 0.5f);
+        // ★ 心跳位移：面板内容最多上下移动 kBeatAMax DIP，而 SetWindowRgn 会**同时裁剪绘制**
+        //   （不只是命中测试），所以区域必须留出这段行程 —— 否则位移到最低点时面板下边缘
+        //   被系统切掉（所有者在屏幕上实测到的那条）。代价是边缘多算 kBeatAMax 像素可点，
+        //   相对于 80 DIP 的透明余量可以忽略。
+        const int slack = static_cast<int>(kBeatAMax * size_.scale + 0.5f);
+        top -= slack;
+        bottom += slack;
     }
     const int radius = particlesSpillout
         ? 0
