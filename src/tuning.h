@@ -108,9 +108,9 @@ inline constexpr int kUnreadableAfterFailures = 5;
 
 // ★ 所有者定的自适应节奏：取值**有变化**就把间隔缩短 1 秒（最快 3 秒），
 //   **没变化**就延长 1 秒（最慢 10 秒）。
-inline constexpr int kApiIntervalMaxMs = 10000;
-inline constexpr int kApiIntervalMinMs = 3000;
-inline constexpr int kApiIntervalStepMs = 1000;
+inline constexpr int kApiIntervalMaxMs = 30000;
+inline constexpr int kApiIntervalMinMs = 10000;
+inline constexpr int kApiIntervalStepMs = 3000;
 
 inline constexpr float kNumberShiftRate = 0.90f;   // 整块数字横向滑动：每帧把残差乘上它（同 kRollRate 的风格）
 inline constexpr float kNumberShiftSnapDip = 0.05f;   // 横向残差 < 它就直接吸附（免得永远差一点点）
@@ -167,6 +167,14 @@ inline constexpr float kCurvePeriods = 2.5f;
 // 这一套同时解决三种跳变：刻度重算导致的上下跳、端点点进出导致的横向滑、以及"过渡到平线"。
 // 刻度**不改**：每个币种照样按自己窗口内的极值铺满整条带子（所有者：线要完美铺在带子里）。
 inline constexpr float kCurveSmoothRate = 0.88f;
+inline constexpr float kCurveSmoothSnapFrac = 0.002f;
+
+// 氛围曲线的时间轴（D3 口径，所有者定）：
+//   * 窗口 5 分钟（原来 10 分钟）
+//   * **名义步长 30 秒/点**：不管实际间隔是 10 还是 30 秒，画出来每点间距都一样，
+//     于是曲线以恒定速度向左移动——30 秒正好走一个点的间距（所有者：曲线要一直动）。
+inline constexpr int64_t kCurveWindowMs = 5 * 60 * 1000;
+inline constexpr int64_t kCurveNominalStepMs = 30 * 1000;
 inline constexpr float kCurveSmoothSnap = 0.002f;
 
 // ★ 状态主色：原来那支蓝 #6C89F6。**保留**，后面演示各种状态时用；

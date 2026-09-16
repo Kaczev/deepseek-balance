@@ -3,6 +3,7 @@
 #include "sample_history.h"
 
 #include <ctime>
+#include <cstdio>
 
 namespace {
 // 采样历史（D3）：显示层自己记——每一个帧组装点都自动带上曲线，
@@ -429,22 +430,30 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     } else {
         f.amountText = "--.--";                // 占位符，不是 0.00
     }
-    // 氛围曲线（D3）：从采样历史装配归一化点。规则：
-    //   * 横向 10 分钟窗口，铺满实体区
-    //   * 纵向按**该币种**本窗口内的极值铺满带子 -> 换币种带子位置不变
+    // 氛围曲线（D3）：从采样历史装配归一化点。规则（所有者定）：
+    //   * 窗口 5 分钟；**名义步长 30 秒/点** -> 每点间距恒定，曲线匀速左移
+    //   * 横轴的头 = 已确认采样 + 自提交以来经过的时间（最多走一个点的间距）
+    //     -> 曲线**一直在动**；头右侧是"还不知道的未来"，用最后确认值拉平，
+    //        下一个点到来时再由缓动平滑修正
+    //   * 纵向按**该币种**本窗口内的极值铺满固定带子（换币种不改布局、刻度不变）
     //   * 没有数据 / 只有 1 点 / 极值相同 -> 平线（curveHasData = false）
-    //   * 两端补"保持点"（值等于端点值）-> 单调三次在等值相邻点切线为 0，
-    //     于是曲线**平滑收平成水平**，不会在数据边界出现折角
     {
         const std::string& cur = amount.shownCurrency();
-        // 横轴锚在**最近一次已确认的采样**上（所有者：曲线最右端就是上一个采样值）。
-        // 用"现在"做锚会多出一段假平尾——我们并不知道"现在"的余额。
-        const int64_t anchor = amount.lastSampleWallMs();
-        const int64_t now = (anchor > 0) ? anchor : (static_cast<int64_t>(std::time(nullptr)) * 1000);
-        const int64_t winMs = 10 * 60 * 1000;
+        const int64_t nowWall = static_cast<int64_t>(std::time(nullptr)) * 1000;
+        const int64_t commitWall = amount.lastSampleWallMs();
+        const int64_t anchor = (commitWall > 0) ? commitWall : nowWall;
         std::vector<dshb::HistoryPoint> hp =
-            (cur.empty() || !haveNumber) ? std::vector<dshb::HistoryPoint>{}
-                                            : g_hist.Window(cur, now, winMs, 120);
+            (cur.empty() || !haveNumber)
+                ? std::vector<dshb::HistoryPoint>{}
+                : g_hist.Window(cur, anchor, kCurveWindowMs, 24);
+
+        const double stepFrac =
+            static_cast<double>(kCurveNominalStepMs) / static_cast<double>(kCurveWindowMs);   // 30/300 = 0.1
+        double xHead = 1.0 - (static_cast<double>(nowWall - anchor) /
+                              static_cast<double>(kCurveNominalStepMs)) * stepFrac;
+        if (xHead < 0.0) xHead = 0.0;
+        if (xHead > 1.0) xHead = 1.0;
+
         if (hp.size() >= 2) {
             double lo = hp.front().total.ToDouble();
             double hi = lo;
@@ -455,28 +464,21 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
             }
             const double span = hi - lo;
             if (span > 0.0) {
+                auto ynorm = [&](double v) { return static_cast<float>(1.0 - (v - lo) / span); };
                 f.curve.clear();
-                // ★ 保持点只在**严格早于**第一个样本时才补：
-                //   两者 x 相同会让单调插值拒绝整条曲线（x 必须严格递增），
-                //   表现为曲线变成带子顶部的一条平线（实测踩过）。
-                const double xFirst =
-                    static_cast<double>(hp.front().wallMs - (now - winMs)) / static_cast<double>(winMs);
-                const double xLast =
-                    static_cast<double>(hp.back().wallMs - (now - winMs)) / static_cast<double>(winMs);
-                if (xFirst > 0.002) {
-                    f.curve.push_back({0.0f, static_cast<float>(1.0 - (hp.front().total.ToDouble() - lo) / span)});
+                for (size_t i = 0; i < hp.size(); ++i) {
+                    const size_t back = hp.size() - 1 - i;          // 距最新几个点
+                    const double x = xHead - static_cast<double>(back) * stepFrac;
+                    if (x < 0.0) continue;                          // 出窗口的丢掉
+                    f.curve.push_back({static_cast<float>(x), ynorm(hp[i].total.ToDouble())});
                 }
-                for (const dshb::HistoryPoint& p : hp) {
-                    double x = static_cast<double>(p.wallMs - (now - winMs)) / static_cast<double>(winMs);
-                    if (x < 0.0) x = 0.0;
-                    if (x > 1.0) x = 1.0;
-                    const double yn = 1.0 - (p.total.ToDouble() - lo) / span;
-                    f.curve.push_back({static_cast<float>(x), static_cast<float>(yn)});
+                // 头右侧（未知的未来）用最后确认值拉平；头本身也在列表里，
+                // 因此这里补右侧点即可。左侧不补：窗口外本来就没有数据，
+                // 曲线自然从最旧的点开始（不再是"假装一直有数据"）。
+                if (!f.curve.empty() && xHead < 0.999) {
+                    f.curve.push_back({1.0f, f.curve.back().y});
                 }
-                if (xLast < 0.998) {
-                    f.curve.push_back({1.0f, static_cast<float>(1.0 - (hp.back().total.ToDouble() - lo) / span)});
-                }
-                f.curveHasData = true;
+                if (f.curve.size() >= 2) f.curveHasData = true;
             }
         }
     }

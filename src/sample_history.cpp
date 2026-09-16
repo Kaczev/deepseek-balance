@@ -1,5 +1,7 @@
 #include "sample_history.h"
 
+#include <algorithm>
+
 namespace dshb {
 
 void SampleHistory::Add(const Sample& s) {
@@ -51,6 +53,12 @@ std::vector<HistoryPoint> SampleHistory::Window(const std::string& currency, int
         if (e.wallMs < from || e.wallMs > nowMs) continue;
         all.push_back(HistoryPoint{e.wallMs, e.total});
     }
+
+    // ★ 按时间排序后再返回：调用方（曲线装配）假定升序，而插入顺序并不保证升序
+    //   （实测踩过：导帧时夹具点插在合成历史之后，于是最新点跑到列表首位，
+    //     曲线被画成左右颠倒）。
+    std::sort(all.begin(), all.end(),
+              [](const HistoryPoint& a, const HistoryPoint& b) { return a.wallMs < b.wallMs; });
 
     if (maxPoints == 0 || all.size() <= maxPoints) return all;
 
