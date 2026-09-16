@@ -42,6 +42,33 @@ void DisplayedAmount::MarkUnreadable() {
 // 记住的是**名字**，所以下一次样本里顺序变了也切得对。
 void DisplayedAmount::SelectCurrency(const std::string& code) {
     selectedCurrency_ = code;
+    currencyShown_ = code;
+
+    // ★ 立刻换掉**实际数字**，不等下一次样本。
+    //   理由（实测踩过）：真实账户 10 秒才一个样本、夹具根本不发新样本，
+    //   等下去符号和数字都不会动；而且符号只在这里更新才跟得上。
+    //   金额取自最近一次样本里的同币种条目，按"新目标"处理 -> 轮子滚过去并停住。
+    for (const CurrencyAmount& e : lastEntries_) {
+        if (!e.ok || e.currency != code) continue;
+        const double yuan = e.total.ToDouble();
+        latest_ = yuan;
+        if (e.total.raw != 0) {
+            zeroPending_ = false;
+            zeroConfirmed_ = false;
+        }
+        rollFromValue_ = hasValue_ ? value_ : yuan;
+        lastReal_ = hasValue_ ? target_ : yuan;
+        target_ = yuan;          // R：新的实际数字
+        frames_ = 0;
+        animating_ = true;
+        tripsDirty_ = true;
+        if (!hasValue_) {
+            value_ = yuan;
+            hasValue_ = true;
+        }
+        lastSwitchTarget_ = yuan;    // 回传给 main.cpp 记日志（这一层不能写日志）
+        return;
+    }
     tripsDirty_ = true;
 }
 
@@ -62,6 +89,7 @@ void DisplayedAmount::OnSample(const Sample& s) {
     // ---- 币种选择 ----
     // 清单来自样本；没选中（或选中的这个币种这次没出现）就用接口给的优先条目。
     // 按名字找而不是按下标：接口不保证数组顺序（设计 §2.2）。
+    lastEntries_ = s.entries;   // 留着给"点符号切换"用
     availableCurrencies_.clear();
     for (const CurrencyAmount& e : s.entries) {
         if (e.ok) availableCurrencies_.push_back(e.currency);

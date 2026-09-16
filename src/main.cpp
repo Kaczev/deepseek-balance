@@ -210,7 +210,12 @@ static void FinishLeftGesture(int x, int y) {
         return;
     }
     g_display.SelectCurrency(next);
-    SelfTestLog(L"[click] 币种切换 -> %hs", next.c_str());
+    const double switched = g_display.lastSwitchTarget();
+    if (switched >= 0.0) {
+        SelfTestLog(L"[click] 币种切换 -> %hs，实际数字立刻换成 %.2f", next.c_str(), switched);
+    } else {
+        SelfTestLog(L"[click] 币种切换 -> %hs（这次样本里没有该币种，只换符号）", next.c_str());
+    }
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1345,7 +1350,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                     const int my = static_cast<int>((sr2.t + sr2.b) * 0.5f);
                     g_pressX = mx; g_pressY = my; g_pressTick = GetTickCount64(); g_pressValid = true;
                     FinishLeftGesture(mx, my);
-                    ctAt = elapsed + 2.0;
+                    ctAt = elapsed + 6.0;   // 必须长于一次滚动（2 秒只能看到中间态，实测踩过）
                 }
             }
             if (ctStage < 3 && elapsed >= ctAt) {

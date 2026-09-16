@@ -104,6 +104,8 @@ public:
     const std::string& selectedCurrency() const { return selectedCurrency_; }
     // 当前**实际显示**的币种（选了哪个就显示哪个；没选则是接口的优先条目）
     const std::string& shownCurrency() const { return currencyShown_; }
+    // 上一次切换币种实际换成的金额（-1 = 那次没有该币种）。给 main.cpp 记日志用。
+    double lastSwitchTarget() const { return lastSwitchTarget_; }
     // 当前样本里可选的币种清单（顺序按接口给的）。少于 2 个时切换没有意义。
     std::vector<std::string> availableCurrencies() const { return availableCurrencies_; }
     // 下一个币种（在当前清单里循环）。清单不足 2 个时返回空串。
@@ -139,6 +141,8 @@ private:
     std::string selectedCurrency_;                 // 空 = 用接口给的优先条目
     std::vector<std::string> availableCurrencies_;  // 最近一次样本里的币种清单
     std::string currencyShown_;                     // 当前显示的币种
+    std::vector<CurrencyAmount> lastEntries_;       // 最近一次样本的条目（切换时要用金额）
+    double lastSwitchTarget_ = -1.0;
 
     // 这一段的起点值，用于自检报告"走了多少比例"
     double rollFromValue_ = 0.0;
