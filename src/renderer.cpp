@@ -1011,6 +1011,10 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
         brush->Release();
     }
 
+    // 内蒙光：必须在**面板底色之后、边框之前** —— 它是背景的一部分，不是罩在边框上的
+    // 一层雾。原来画在边框之后，边框会被强烈的光晕染（所有者实测："边缘没有贴合"）。
+    PaintInnerGlow(rt, g_widgetFrame, glow->Pick(rt, canvas, g_widgetFrame, isExport));
+
     // 面板边框：颜色 #afb2b7、线宽 2 DIP（常量在 tuning.h）
     {
         ID2D1SolidColorBrush* bb = nullptr;
@@ -1047,7 +1051,8 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
     // ★ 内蒙光（"E 蒙光.md" §1）：面板自己背景的**最下面一层** ——
     //   晚于面板底色（否则整层被底板盖掉）、早于其余一切（边框、激活环、曲线、正文）。
     //   这就是所有者说的"比文字和曲线更早渲染、是面板自己的背景最底下的一部分"。
-    PaintInnerGlow(rt, g_widgetFrame, glow->Pick(rt, canvas, g_widgetFrame, isExport));
+    // （内蒙光已上移到面板边框**之前**绘制 —— 顺序见下面 FillRoundedRectangle 之后那一处。
+    //   原来它在边框之后，导致边框被光罩住：所有者实测发现，2026-09-17。）
 
     PaintAmbientCurve(rt, canvas, g_widgetFrame);
 
@@ -1102,12 +1107,22 @@ double NowSeconds() {
 //  ★ 为什么强度倍率 k 不烘进去：k 随 R/D 每帧都可能动，烘进去就得每帧重烘 ——
 //    而 k 正好可以走画笔的不透明度（"E 施工单.md" 甲.4 的"单独暴露的强度倍率"）。
 //
-// ★ 这是**唯一的**剖面定义：烘遮罩用它，探针（tools/storeprobe.cpp 的
-//   ambience 一节）也用同一支函数核对，所以"文档里的数"与"屏幕上的像素"
-//   不可能各说一套。它不碰任何 D2D 状态，可以被离线链接。
+// 内蒙光的 alpha 剖面：**只作用在面板轮廓之内**。
+//  ★ 这是**唯一的**剖面定义：烘遮罩用它，探针也用同一支函数核对，所以"文档里的数"
+//    与"屏幕上的像素"不可能各说一套。它不碰任何 D2D 状态，可以被离线链接。
+//
+//  距离场约定（写清楚，这里的符号错过一次）：
+//    先算 `d = sqrt(max(dx,0)^2 + max(dy,0)^2) + min(max(dx,dy),0) - kCornerRadiusDip`，
+//    这个表达式的符号是 **d < 0 在轮廓内、d = 0 在轮廓上、d > 0 在轮廓外**。
+//    （圆角矩形里面时 dx、dy 都 <= 0，于是根号项为 0、min 项取较大的那个负数，
+//      再减半径 —— 结果是负的；出到外面根号项转正，结果就是正的。）
+//    所以 `insideDip = -d` 才是"离轮廓多远（仅面板内有意义）"。
+//
+//  ⚠ 回归：这一段原来写的是 `const float outside = <上面那个 d>; if (outside > 0) return 0;`
+//    —— 把符号读反了。后果是**面板内一律返回 0、面板外整张画布都上色**，
+//    而且越往外越亮（d 越负 -> -d 越大 -> 斜坡越大），形状变成了外光晕，
+//    底噪也加到了轮廓之外。所有者看到的"边缘没有贴合、出界了"就是这个。
 float InnerGlowAlphaAt(float xDip, float yDip) {
-    // 到面板圆角矩形轮廓的距离（> 0 = 面板外）。与设计阶段的 Python 证据图、
-    // 与 "E 蒙光.md" §2 的距离场定义完全相同。
     const float cx = kMarginDip + kEntityWidthDip * 0.5f;
     const float cy = kMarginDip + kEntityHeightDip * 0.5f;
     const float hw = kEntityWidthDip * 0.5f - kCornerRadiusDip;
@@ -1116,18 +1131,22 @@ float InnerGlowAlphaAt(float xDip, float yDip) {
     const float dy = std::fabs(yDip - cy) - hh;
     const float ax = (dx > 0.0f) ? dx : 0.0f;
     const float ay = (dy > 0.0f) ? dy : 0.0f;
-    const float outside = std::sqrt(ax * ax + ay * ay) +
-                          ((dx > dy) ? dy : dx) - kCornerRadiusDip;
-    if (outside > 0.0f) return 0.0f;            // 面板外一律 0：本层是**内**蒙光
-    const float inside = -outside;
+    const float sdf = std::sqrt(ax * ax + ay * ay) +
+                      ((dx > dy) ? dy : dx) - kCornerRadiusDip;
+    const float insideDip = -sdf;               // > 0 仅当点在轮廓之内
+    if (insideDip <= 0.0f) return 0.0f;         // 面板外（含轮廓上）一律 0
 
-    float a = kGlowInFloorAlpha;                // 整板底噪：处处 0.025
-    if (inside < kGlowInLipDip) {               // 内唇：贴边 5 DIP，二次衰减
-        const float t = 1.0f - inside / kGlowInLipDip;
+    // 三个项**都只在面板内**累加，各自的定义域写在旁边：
+    //   整板底噪：整个面板内部处处都有（这是"内蒙光"，不是边缘光）
+    //   内唇    ：只在贴边 kGlowInLipDip 那一圈
+    //   底部透光：只在离面板底边 kGlowInVertDip 以内
+    float a = kGlowInFloorAlpha;
+    if (insideDip < kGlowInLipDip) {
+        const float t = 1.0f - insideDip / kGlowInLipDip;
         a += kGlowInLipAlpha * t * t;
     }
     const float fromBottom = (kMarginDip + kEntityHeightDip) - yDip;
-    if (fromBottom >= 0.0f && fromBottom < kGlowInVertDip) {   // 底部透光：17 DIP
+    if (fromBottom >= 0.0f && fromBottom < kGlowInVertDip) {
         const float t = 1.0f - fromBottom / kGlowInVertDip;
         a += kGlowInVertAlpha * t * t;
     }
@@ -1332,11 +1351,32 @@ void PaintInnerGlow(ID2D1RenderTarget* rt, const WidgetFrame& f, ID2D1Bitmap* ti
     if (!(f.ambientIntensity > 0.0f)) return;   // k = 0：这一帧不画（关掉蒙光的那一帧）
     const D2D1_SIZE_F size = tinted->GetSize();
     const D2D1_RECT_F dest = D2D1::RectF(0.0f, 0.0f, size.width, size.height);
+    // ★ 硬边界：蒙光只允许画在**面板矩形之内**。
+    //   为什么要有它：遮罩自己声称"轮廓之外一律为 0"，但屏幕上实测到面板下沿之外
+    //   3 像素仍有蒙光色（#161b31，约 20%）—— 也就是说画上去的东西与遮罩不一致。
+    //   在查清那一步之前，这里先用一个绝对的裁剪把它兜住：无论漏光从哪来，物理上画不出去。
+    //   裁剪矩形与面板同源（同一个 kMarginDip / 实体区尺寸），并且跟着当前变换走，
+    //   所以心跳位移时它一起移动，不会把光切掉。
+    const float sFromBitmap =
+        size.width / static_cast<float>(2 * kMarginDip + kEntityWidthDip);
+    const D2D1_RECT_F clip = D2D1::RectF(
+        kMarginDip * sFromBitmap, kMarginDip * sFromBitmap,
+        (kMarginDip + kEntityWidthDip) * sFromBitmap,
+        (kMarginDip + kEntityHeightDip) * sFromBitmap);
+    rt->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     rt->DrawBitmap(tinted, &dest, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+    rt->PopAxisAlignedClip();
 }
 
 // 临时诊断：曲线采样点的实测范围（只在 DSHB_CURVE_DEBUG 时非空）。
 const std::string& CurveDebugText() { return g_curveDebug; }
+
+// 探针用：把烘焙出来的遮罩字节给出去（生产路径不调用）。
+const std::vector<unsigned char>& InnerGlowMaskPixelsForProbe(const CanvasSize& canvas) {
+    static std::vector<unsigned char> cache;
+    if (cache.empty()) cache = InnerGlowMaskPixels(canvas);
+    return cache;
+}
 
 const InnerGlowBakeCounters& InnerGlowBakeStats() { return g_glowBake; }
 
@@ -1575,7 +1615,8 @@ bool Renderer::ApplyInputRegion(bool particlesSpillout) {    if (!impl_ || !hwnd
         //   被系统切掉（所有者在屏幕上实测到的那条）。代价是边缘多算 kBeatAMax 像素可点，
         //   相对于 80 DIP 的透明余量可以忽略。
         const int slack = static_cast<int>(kBeatAMax * size_.scale + 0.5f);
-        top -= slack;
+        // ★ 只向下留余量：心跳位移是单边的（dip >= 0，只往下），上沿不需要余量。
+        //   上沿留余量会把画布上本来就存在、以前被裁掉的内容露出来（我引进过一次）。
         bottom += slack;
     }
     const int radius = particlesSpillout

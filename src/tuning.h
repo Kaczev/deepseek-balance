@@ -304,13 +304,13 @@ inline constexpr double kLowBalanceThresholdYuan = 10.0;
 // ---- 5.4 内蒙光的剖面（alpha 形状，与亮度无关）----
 // 面板内部贴边的一圈"内唇"：从边框内沿向心衰减到 0。
 // 它碰不到任何元素（文字最短内缩 12 DIP > 5 DIP），所以它可以做到最亮。
-inline constexpr float kGlowInLipDip = 5.0f;      // 衰减距离（DIP）
-inline constexpr float kGlowInLipAlpha = 0.280f;  // 轮廓内沿处的 alpha（满强度）
+inline constexpr float kGlowInLipDip = 70.0f;      // 衰减距离（DIP）
+inline constexpr float kGlowInLipAlpha = 0.30f;  // 轮廓内沿处的 alpha（满强度）
 // 底部透光：从面板底边往上的一条竖向渐变（下亮上暗），17 DIP 内衰减到 0。
-inline constexpr float kGlowInVertDip = 17.0f;
-inline constexpr float kGlowInVertAlpha = 0.150f;
+inline constexpr float kGlowInVertDip = 50.0f;
+inline constexpr float kGlowInVertAlpha = 0.30f;
 // 整板底噪：面板内处处一层极淡的 alpha，作用是"整体被染了一点"，不提供亮度。
-inline constexpr float kGlowInFloorAlpha = 0.060f;   // 整板底噪：这是"被照亮的表面"而不是"一条边"的关键
+inline constexpr float kGlowInFloorAlpha = 0.10f;   // 整板底噪：这是"被照亮的表面"而不是"一条边"的关键
 
 // ---- 5.5 内蒙光的强度倍率 k(R,D) —— 单独暴露，改它不用动剖面 ----
 //   k(R,D) = (kGlowInK0 + kGlowInK1 * R) * (1 - kGlowInD * D)
@@ -318,15 +318,15 @@ inline constexpr float kGlowInFloorAlpha = 0.060f;   // 整板底噪：这是"�
 // ★ 这是所有者唯一需要动的"亮度"旋钮：剖面（5.4）一个数都不用改。
 //   它乘在**整条剖面**上，所以形状不随状态变化（形状变了 = 换了一种状态语言）。
 inline constexpr float kGlowInK0 = 1.00f;   // R = 0 时的基准强度（所有者 2026-09-17：先加大看看）
-inline constexpr float kGlowInK1 = 0.40f;   // R = 1 时额外加多少
-inline constexpr float kGlowInD = 0.60f;    // D = 1 时暗掉的比例
+inline constexpr float kGlowInK1 = 0.00f;   // R = 1 时额外加多少
+inline constexpr float kGlowInD = 0.00f;    // D = 1 时暗掉的比例
 // 读不到余额（按 D = 1 处理）时观感取"甲"：冷白光**仍在**，不是"褪尽"
 // （一块死板子本身就是"出事了"的信号，v0.2 设计 §7.1 禁止）。
 // 想要"连光一起褪尽"就把 kGlowInD 改成 0.88（D=1 时 k 从 0.36 降到 0.088），
 // 剖面与几何一个数都不用动。
 // D = 1 时 C 是饱和度为 0 的近白；纯中性灰在近黑底上容易读成"玻璃上的灰"，
 // 所以朝基准蓝混一点点，让它读成"冷光"。
-inline constexpr float kGlowInD1Warm = 0.12f;
+inline constexpr float kGlowInD1Warm = 0.00f;
 
 // ---- 5.6 颜色与强度的缓动 ----
 // 颜色逐通道缓动：外观旋钮，与数字滚动共用同一套"帧号 k 的纯函数"手感。
