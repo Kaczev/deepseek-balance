@@ -1127,8 +1127,12 @@ float InnerGlowAlphaAt(float xDip, float yDip) {
     const float cy = kMarginDip + kEntityHeightDip * 0.5f;
     const float hw = kEntityWidthDip * 0.5f - kCornerRadiusDip;
     const float hh = kEntityHeightDip * 0.5f - kCornerRadiusDip;
-    const float dx = std::fabs(xDip - cx) - hw;
-    const float dy = std::fabs(yDip - cy) - hh;
+    float dx = std::fabs(xDip - cx) - hw;
+    float dy = std::fabs(yDip - cy) - hh;
+    // ★ kGlowCornerRot180（所有者 2026-09-17 指令）：只把**角象限**里的圆角旋转 180 度。
+    //   现象的准确描述是"圆角是内凹的"（凹凸方向反了），旋转 180 度即把凹变凸。
+    //   四段直边不受影响：那里 dx 或 dy ≤ 0，条件不成立。
+    if (kGlowCornerRot180 && dx > 0.0f && dy > 0.0f) { dx = -dx; dy = -dy; }
     const float ax = (dx > 0.0f) ? dx : 0.0f;
     const float ay = (dy > 0.0f) ? dy : 0.0f;
     const float sdf = std::sqrt(ax * ax + ay * ay) +
@@ -1173,7 +1177,12 @@ std::vector<uint8_t> InnerGlowMaskPixels(const CanvasSize& canvas) {
                 for (int sx = 0; sx < 2; ++sx) {
                     const float px = (static_cast<float>(x) + 0.25f + 0.5f * sx) * invScale;
                     const float py = (static_cast<float>(y) + 0.25f + 0.5f * sy) * invScale;
-                    sum += InnerGlowAlphaAt(px, py);
+                    // ★ kGlowFlip180：把采样点绕画布中心旋转 180 度。画布中心与面板中心
+                    //   重合（都是 (237.5,144.5)），所以这等价于"两对对角互换"，正是所有者要的。
+                    const float wDip = static_cast<float>(w) * invScale;
+                    const float hDip = static_cast<float>(h) * invScale;
+                    sum += kGlowFlip180 ? InnerGlowAlphaAt(wDip - px, hDip - py)
+                                        : InnerGlowAlphaAt(px, py);
                 }
             }
             const float a = sum * 0.25f;

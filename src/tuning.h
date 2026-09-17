@@ -304,6 +304,18 @@ inline constexpr double kLowBalanceThresholdYuan = 10.0;
 // ---- 5.4 内蒙光的剖面（alpha 形状，与亮度无关）----
 // 面板内部贴边的一圈"内唇"：从边框内沿向心衰减到 0。
 // 它碰不到任何元素（文字最短内缩 12 DIP > 5 DIP），所以它可以做到最亮。
+// ★ 把整张蒙光遮罩旋转 180 度（= 左下角与右上角互换、左上角与右下角互换）。
+//   所有者 2026-09-17 在挂件上实测：内唇的圆角方向是反的，旋转 180 度即可贴合。
+//   ★ 代价（我实测的）：这张遮罩唯一的不对称就是底部透光（kGlowInVertDip），
+//     旋转后底部透光会跑到面板顶部。若你看到顶部被照亮而底部不亮，就是它。
+//   false = 关掉，恢复旋转前。
+inline constexpr bool kGlowFlip180 = false;   // 整层旋转（不是所有者要的那个，留作对照）
+
+// ★ 把**圆角本身**旋转 180 度（所有者 2026-09-17 的指令）：只在四个角的象限里，
+//   把距离改成从角的另一侧量 —— 也就是那一小块的"弧的方向"反过来。
+//   边（直的那四段）完全不受影响。false = 关掉，恢复原样。
+inline constexpr bool kGlowCornerRot180 = true;
+
 inline constexpr float kGlowInLipDip = 70.0f;      // 衰减距离（DIP）
 inline constexpr float kGlowInLipAlpha = 0.30f;  // 轮廓内沿处的 alpha（满强度）
 // 底部透光：从面板底边往上的一条竖向渐变（下亮上暗），17 DIP 内衰减到 0。
