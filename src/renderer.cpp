@@ -1132,17 +1132,18 @@ float InnerGlowAlphaAt(float xDip, float yDip) {
     // ★ kGlowCornerRot180（所有者 2026-09-17 指令）：只把**角象限**里的圆角旋转 180 度。
     //   现象的准确描述是"圆角是内凹的"（凹凸方向反了），旋转 180 度即把凹变凸。
     //   四段直边不受影响：那里 dx 或 dy ≤ 0，条件不成立。
-    if (kGlowCornerRot180 && dx > 0.0f && dy > 0.0f) {
-        // ★ 平滑过渡，而不是在象限边界硬切。原来直接取负，于是在 dx=0 / dy=0 两条线
-        //   上出现直角台阶（所有者 2026-09-17 在四个角都看到了，并圈出了那两条边）。
-        //   现在用"离象限边界多远"（= min(dx,dy)）在 kCornerRadiusDip 之内做 smoothstep：
-        //   边界处权重 0（与直边连续）、深入角内权重 1（保留填平的效果）。
-        const float edge = (dx < dy) ? dx : dy;          // >= 0，越大越深入角
-        float w = edge / kCornerRadiusDip;
-        if (w > 1.0f) w = 1.0f;
-        w = w * w * (3.0f - 2.0f * w);                   // smoothstep
-        dx = dx * (1.0f - 2.0f * w);
-        dy = dy * (1.0f - 2.0f * w);
+    if (kGlowCornerRot180) {
+        // ★ 让遮罩的角退化成**方角**：距离场只认那四条直边，不再有圆弧。
+        //   为什么这样做（所有者 2026-09-17 的两条实测）：
+        //     · 圆角处应当是**最亮**的（内唇在贴边处达到峰值），可是按圆角算距离时，
+        //       角上的 insideDip 比直边处更大 -> 内唇贡献更小 -> 角反而更暗；
+        //     · 我先前"只在角象限取负"的写法还在 dx=0 / dy=0 上留了直角台阶。
+        //   方角距离场两件事一起解决：角与直边**同一条公式**（连续、无台阶），
+        //   角上到边的距离最短（内唇最亮）。窗口的圆角由窗口区域负责裁，不受影响。
+        // 从**面板真正的边**量：hw/hh 是"边到角圆心"的距离，还要加上圆角半径才是边。
+        // （上一版漏了 + kCornerRadiusDip，于是内唇整圈往内缩了 12 px，边上反而没有光。）
+        dx = std::fabs(xDip - cx) - (hw + kCornerRadiusDip);
+        dy = std::fabs(yDip - cy) - (hh + kCornerRadiusDip);
     }
     const float ax = (dx > 0.0f) ? dx : 0.0f;
     const float ay = (dy > 0.0f) ? dy : 0.0f;
