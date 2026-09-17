@@ -1151,8 +1151,14 @@ float InnerGlowAlphaAt(float xDip, float yDip) {
     //   这里不能再减一次 kCornerRadiusDip —— 上一版减了两次，整圈内唇被推内 12 px，
     //   于是边中点完全没有光、只有角上还剩一点（所有者 2026-09-17 看到"边不亮"）。
     const float radiusTerm = kGlowCornerRot180 ? 0.0f : kCornerRadiusDip;
-    const float sdf = std::sqrt(ax * ax + ay * ay) +
-                      ((dx > dy) ? dy : dx) - radiusTerm;
+    // const float sdf = std::sqrt(ax * ax + ay * ay) +
+    //                   ((dx > dy) ? dy : dx) - radiusTerm;
+    // ★★ 这里必须是 **max**，不是 min：dx/dy 都是"到内缩矩形各边的有符号距离"，
+    //   取**较大者**才是"离最近的那条边有多远"；取较小者会变成"离最远的那条边"，
+    //   于是亮带被推到离边 70 px 的地方、而贴边处没有光。
+    //   所有者 2026-09-17 在屏幕上看到的一切（角上亮、边上不亮、角看着反向）都由这一个
+    //   符号而来：代码是 min，而注释与标准圆角矩形距离场都是 max。
+    const float sdf = ((dx > dy) ? dx : dy) - radiusTerm;
     const float insideDip = -sdf;               // > 0 仅当点在轮廓之内
     if (insideDip <= 0.0f) return 0.0f;         // 面板外（含轮廓上）一律 0
 

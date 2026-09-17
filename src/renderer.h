@@ -157,6 +157,10 @@ const InnerGlowBakeCounters& InnerGlowBakeStats();
 // 默认空字符串；只有 DSHB_CURVE_DEBUG 时才有内容。
 const std::string& CurveDebugText();
 
+// 烘焙出来的内蒙光遮罩的**原始字节**（探针核对剖面用，见
+// .dsh/scratch/amb/profprobe.cpp）。空 = 没烘过。生产路径不调用它。
+const std::vector<unsigned char>& InnerGlowMaskPixelsForProbe(const CanvasSize& canvas);
+
 // 单次调用到底重烘了没有（探针用：它按帧重放一次滑行，需要区分"贴缓存"与"重烘"）。
 // 实现读的是和 Pick 同一个计数器，所以它不会说谎。
 bool GlowTintBakedOnLastPick();
