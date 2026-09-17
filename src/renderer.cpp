@@ -99,12 +99,6 @@ struct GlowCache {
 // 本翻译单元私有的（内蒙光的**声明**区故意留在它外面，见上面）。
 namespace {
 
-// 氛围曲线开关：--no-curve 关掉它，用于 A/B 对比（关掉后文字位置必须逐像素不变）
-
-// 甯冨眬璇婃柇寮€鍏筹紙涓存椂锛夈€傚畾涔夊繀椤诲湪浣跨敤瀹冪殑 SetLayoutProbe 涔嬪墠鈥斺€擟++ 閲?
-// 鍚嶅瓧瑕佸厛澹版槑锛岃繖涓€鏉℃垜鍦ㄥ埆澶勫凡缁忚俯杩囦竴娆★紝涓嶅啀韪┿€?
-bool g_layoutProbe = false;
-
 // 鈽呪槄 涓ゆ潯鐢ㄨ鎹㈡潵鐨勮鐭╋細
 //   1. **缁濅笉鍦ㄧ粯鍒惰矾寰勯噷鍋氭枃浠?I/O**銆傝瘯杩囦袱娆★紝涓ゆ閮藉穿锛?xC0000409锛夛紝
 //      杩?瀵煎嚭妯″紡涓嬪彧鐢讳竴甯ф墍浠ュ畨鍏?杩欎釜鎯虫硶涔熸槸閿欑殑銆?
@@ -160,7 +154,6 @@ float LastLinePitchDip() { return g_lastLinePitch; }
 void SetCurveEnabled(bool on) { g_curveEnabled = on; }
 
 void SetLayoutProbe(bool on) {
-    g_layoutProbe = on;
     g_probe.enabled = on;
 }
 
@@ -418,46 +411,6 @@ void MeasureCharOrigins(const std::wstring& text, IDWriteTextFormat* fmt,
     layout->Release();
 }
 
-// 閲忓崟涓瓧绗︾殑瀹藉害锛圖IP锛夈€傞€愪綅婊氬姩瑕佹妸姣忎竴浣嶇敾鍦ㄥ悇鑷殑鏍煎瓙閲岋紝
-// 鎵€浠ラ渶瑕佹瘡涓瓧绗﹀崟鐙殑浣嶇疆鈥斺€旀暣浣撻噺瀹藉害鐨勬柟娉曞湪杩欓噷涓嶅鐢ㄣ€?
-float MeasureCharWidth(wchar_t ch, IDWriteTextFormat* fmt) {
-    if (!fmt) return 0.0f;
-    const wchar_t s[2] = {ch, 0};
-    return MeasureTextWidth(std::wstring(s), fmt);
-}
-
-// 骞虫粦缂撳姩锛氶€愪綅婊氬姩鐨勮鎰熷叏鍦ㄨ繖閲屻€傜嚎鎬т細鏄惧緱鏈烘鍙戦椃锛?
-// 杩欐潯鏇茬嚎涓ょ鎱€佷腑闂村揩锛屽儚榻胯疆鎷ㄨ繃涓€鏍笺€?
-double Smoothstep(double x) {
-    if (x <= 0.0) return 0.0;
-    if (x >= 1.0) return 1.0;
-    return x * x * (3.0 - 2.0 * x);
-}
-
-// 鍦ㄤ竴琛岄噷鐢讳竴娈垫枃瀛楋紝妯悜灞呬腑瀵归綈鍒?centerX锛堢敾甯冨潗鏍囷級
-void DrawCentered(ID2D1RenderTarget* rt, const std::wstring& text, IDWriteTextFormat* fmt,
-                  float centerX, float topY, const D2D1_COLOR_F& color, float scale) {
-    if (text.empty() || !fmt) return;
-    IDWriteFactory* dw = DebugWriteFactory();
-    if (!dw) return;
-
-    ID2D1SolidColorBrush* brush = nullptr;
-    if (FAILED(rt->CreateSolidColorBrush(color, &brush)) || !brush) return;
-
-    IDWriteTextLayout* layout = nullptr;
-    if (SUCCEEDED(dw->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), fmt,
-                                       static_cast<float>(rt->GetSize().width), 256.0f,
-                                       &layout)) &&
-        layout) {
-        const float w = MeasureTextWidth(text, fmt);
-        rt->DrawTextLayout(D2D1::Point2F(centerX - w * 0.5f, topY), layout, brush,
-                           D2D1_DRAW_TEXT_OPTIONS_NONE);
-        layout->Release();
-    }
-    brush->Release();
-    (void)scale;
-}
-
 // 姝ｆ枃锛圕 闃舵锛夛細鏍囬鍏肩姸鎬佽銆佷綑棰濇暟瀛椼€佸竵绉嶇鍙枫€佹竻闆堕浼般€?
 //
 // 鎺掑竷鐞嗙敱锛堣璁?搂9.2锛岀鍙蜂綅缃粡鎵€鏈夎€呮寚瀹氾級锛?
@@ -482,22 +435,10 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
     // 是显示层算好的最终位置（横向滚动、纵向缓动都算完了），这里一个都不再改。
     std::vector<std::pair<float, float>> pts;
 
-    // ★ 每个采样点自己的颜色（"E 蒙光.md" §3.1 末句：节点恰好是那一刻的氛围颜色，
-    //   节点之间渐变过去）。渲染层拿到的只有**每个控制点的颜色**，段内怎么分配由
-    //   这里决定：按**段**插值，而不是按 u 插值 —— 单调三次在 u 上不是匀速的，
-    //   按 u 插值会让颜色在某些段里跑得比曲线本身快。
-    //   segOf[i] = 采样点 i 落在哪一段（控制点 k → k+1），tLocal[i] = 该段内的比例。
-    std::vector<AmbienceColor> colOf;
-    std::vector<float> segStartX;
-
     if (!f.curveHasData || f.curve.size() < 2) {
         // 没有数据 = 平的（所有者规则），画在带子中线，用**当前 C**。
         pts.push_back({0.0f, 0.5f});
         pts.push_back({1.0f, 0.5f});
-        colOf.push_back(f.ambientColor);
-        colOf.push_back(f.ambientColor);
-        segStartX.push_back(0.0f);
-        segStartX.push_back(0.0f);
     } else {
         // 单调三次插值（curve.h）：我们只在采样时刻知道余额，区间内的形状是插出来的；
         // 单调插值保证不过冲（普通样条会画出从未出现过的余额）。
@@ -512,46 +453,14 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
         dshb::MonotoneCurve mc;
         mc.Build(xs, ys);
         const int steps = 300;
-        // 每段的起止 u：按控制点的 x 划分（x 是单调的，显示层保证）。
-        std::vector<float> uStart(f.curve.size(), 0.0f);
-        for (std::size_t k = 1; k < f.curve.size(); ++k) {
-            const float dx = f.curve[k].x - f.curve[k - 1].x;
-            uStart[k] = (dx > 0.0f) ? (uStart[k - 1] + dx) : uStart[k - 1];
-        }
-        const float uSpan = (uStart.back() > 0.0f) ? uStart.back() : 1.0f;
-        for (std::size_t k = 0; k < uStart.size(); ++k) uStart[k] /= uSpan;
-
-        std::size_t seg = 0;
         for (int i = 0; i <= steps; ++i) {
             const float u = static_cast<float>(i) / static_cast<float>(steps);
             pts.push_back({u, static_cast<float>(mc.Eval(static_cast<double>(u)))});
-            // 找到这个采样点所在的段（段号只增不减：下面用 while 前进）。
-            while (seg + 2 < uStart.size() && u >= uStart[seg + 1]) ++seg;
-            const float a = uStart[seg];
-            const float b = (seg + 1 < uStart.size()) ? uStart[seg + 1] : 1.0f;
-            const float t = (b > a) ? ((u - a) / (b - a)) : 0.0f;
-            const CurvePoint& n0 = f.curve[seg];
-            const CurvePoint& n1 = f.curve[(seg + 1 < f.curve.size()) ? (seg + 1) : seg];
-            // 两个端点里只要有一个没有颜色，就用**当前 C** 画这一段：
-            //   老文件里的点没有颜色（写颜色字段之前存的），那是"没测过"，
-            //   用当前色是唯一不编造历史的画法（widget_display.h CurvePoint::hasColor）。
-            const AmbienceColor c0 = n0.hasColor ? AmbienceColor{n0.cr, n0.cg, n0.cb}
-                                                 : f.ambientColor;
-            const AmbienceColor c1 = n1.hasColor ? AmbienceColor{n1.cr, n1.cg, n1.cb}
-                                                 : f.ambientColor;
-            AmbienceColor c;
-            c.r = c0.r + (c1.r - c0.r) * t;
-            c.g = c0.g + (c1.g - c0.g) * t;
-            c.b = c0.b + (c1.b - c0.b) * t;
-            colOf.push_back(c);
-            segStartX.push_back(px(u));
         }
     }
     if (pts.size() < 2) return;
 
-    // ★ 每段单独画：段的几何与原来**逐点相同**（同一份采样、同一份单调三次求值），
-    //   所以曲线的位置一个像素都没动，动的只有落在它上面的颜色。
-    //   工厂与几何对象各只取一次，循环里只重开一次 sink（300 段/帧，不建 300 个对象）。
+    // 工厂与几何对象各只取一次（每帧一条曲线，不建多余对象）。
     ID2D1Factory* fac = nullptr;
     rt->GetFactory(&fac);
     if (!fac) return;
@@ -1645,11 +1554,8 @@ double Renderer::ActivationFlash(double nowSeconds) const {
     return FlashPulse(nowSeconds, flashStart_);
 }
 
-bool Renderer::ApplyInputRegion(bool particlesSpillout) {    if (!impl_ || !hwnd_) return false;
-    if (spillout_ == particlesSpillout && spillout_ == true) {
-        // 宸茬粡鎵╁埌鍏ㄧ敾甯冿紝涓嶇敤閲嶅璁剧疆
-    }
-
+bool Renderer::ApplyInputRegion(bool particlesSpillout) {
+    if (!impl_ || !hwnd_) return false;
     // 鍖哄煙鍧愭爣鏄獥鍙ｅ潗鏍囷紙鏃犺竟妗嗙獥鍙ｇ殑绐楀彛鐭╁舰 == 瀹㈡埛鍖猴級
     int left = 0, top = 0, right = size_.widthPx, bottom = size_.heightPx;
     if (!particlesSpillout) {

@@ -5,7 +5,7 @@
 # so the fake data source cannot exercise it. The real API returns an unchanged
 # balance for minutes, which is why a 70 s run against it proves nothing.
 #
-# Usage:  pwsh -File build\cadence-test.ps1 [-Seconds 48] [-Delta 0.01] [-Port 18611]
+# Usage:  pwsh -File tools\cadence-test.ps1 [-Seconds 48] [-Delta 0.01] [-Port 18611]
 param(
     [int]$Seconds = 48,
     [double]$Delta = 0.01,

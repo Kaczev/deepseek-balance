@@ -24,7 +24,4 @@ inline constexpr wchar_t kInstanceMutexName[] = L"Global\\deepseek-balance-v0.2"
 //   返回 false = 已经有实例在跑，本进程应当退出（已经尝试通知它闪一下）。
 bool AcquireSingleInstance();
 
-// 在已有实例里调用：把"有人想再开一个"的消息接上，触发一次可见反馈。
-void SetActivateTarget(HWND hwnd);
-
 }  // namespace dshb

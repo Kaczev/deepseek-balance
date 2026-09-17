@@ -265,9 +265,6 @@ public:
     // The newest n points, oldest -> newest; fewer when the store holds fewer.
     std::vector<CurveStorePoint> Newest(std::size_t n) const;
 
-    // §2.2: the display layer takes the newest 11 of these.
-    std::vector<CurveStorePoint> DisplayPoints() const { return Newest(kCapacity - 1); }
-
     std::size_t size() const { return count_ < kCapacity ? count_ : kCapacity; }
     bool empty() const { return size() == 0; }
     int64_t lastUpdate() const { return updateAt_; }

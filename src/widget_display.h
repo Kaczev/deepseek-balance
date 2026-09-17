@@ -159,10 +159,13 @@ public:
     double Update(double dtSeconds);
 
     // ---- 消耗速率（设计 §7.3 的弹簧 / §7.4 的底部文案）----
-    // ★ 速率在这里**每帧从曲线存储重算**：输入就是本文件那个 g_curveStore 里的点，
-    //   取"当前显示的币种"，用每个点**自己的**时间戳（没有时间的点就是不显著，
-    //   绝不拿全局 update_at 顶替）。结果是纯函数 EstimateRate 的输出，弹簧按帧的
-    //   dt 把它平滑成 rateDisplay，两者都留在成员里，BuildWidgetFrame 拿来算底部那行字。
+    // ★ 速率在这里**每帧重算**：输入是 .cpp 里那份曲线存储的点，但**取的是每个点
+    //   自己的第一个可用条目**（CurveValueOf 的口径，和曲线画的那条序列同源），
+    //   不是"当前显示的币种"——"当前显示的币种"是另一个函数
+    //   RateInputForCurrency 的口径，这几行说的不是它。
+    //   每个点用它**自己的**时间戳（没有时间的点就是不显著，绝不拿全局 update_at 顶替）。
+    //   结果是纯函数 EstimateRate 的输出，弹簧按帧的 dt 把它平滑成 rateDisplay，
+    //   两者都留在成员里，BuildWidgetFrame 拿来算底部那行字。
     const RateEstimate& rateEstimate() const { return rateEstimate_; }
     double rateDisplay() const { return rateDisplay_; }
 
@@ -216,8 +219,6 @@ public:
     const std::string& shownCurrency() const { return currencyShown_; }
     // 上一次切换币种实际换成的金额（-1 = 那次没有该币种）。给 main.cpp 记日志用。
     double lastSwitchTarget() const { return lastSwitchTarget_; }
-    // 当前样本里可选的币种清单（顺序按接口给的）。少于 2 个时切换没有意义。
-    std::vector<std::string> availableCurrencies() const { return availableCurrencies_; }
     // 下一个币种（在当前清单里循环）。清单不足 2 个时返回空串。
     std::string NextCurrency() const;
     // 最近一次**已提交**采样的墙钟毫秒：曲线的横轴锚在它上面（右端 = 最近一次确认的值）。
@@ -229,20 +230,11 @@ public:
     // 是否正在追一个还没到位的目标（渲染层据此决定轮子要不要转）
     bool rolling() const { return hasValue_ && std::fabs(std::fabs(target_) - value_) > 0.0; }   // value_ 是幅值
 
-    // 距离目标的剩余比例，仅用于日志与自检（渲染不再需要）
-    double remaining() const {
-        const double span = rollFromValue_ - target_;
-        return (span == 0.0) ? 0.0 : (value_ - target_) / span;
-    }
-
     // 滚动期间应当显示哪一段文本。
     // ★ 数字文本只由**目标值**决定，不按每帧插值后的数值重算——那样每帧换一套
     //   数字，看起来就是一闪一闪（实测确认过）。竖直偏移（由当前值驱动）负责"动"，
     //   文本负责"内容"，两者不能同时变。
     std::string TextToShow() const;
-
-    // 是否处于"连续两次采样都是 0"的确认态
-    bool zeroConfirmed() const { return zeroConfirmed_; }
 
 private:
     bool hasValue_ = false;

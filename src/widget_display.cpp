@@ -755,47 +755,34 @@ double DisplayedAmount::UpdateValue(double dtSeconds) {
 //   可 99.10 跌到 99.00 时**十位根本不会变**，轮子就该稳稳停在 9 上。
 //   所以相位来自"这一位从哪走到哪"，而不是相对整十的绝对位置。
 //
-// 行程的起止都取整数（floor），并且全体共用同一个进度 phase，所以：
-//   · 静止时 phase==1，每位正好落在自己的数字上（读数清晰）
-//   · 只有自己这一位要变的轮子才动，别的纹丝不动
-//   · 该动的位同时开始、同时结束
-// 每一位的滚动位置（所有者给的映射，这里按整数坐标实现）。
+// 行程的起止都取整数（floor），并且**每一位自己管自己地滚**。
 //
-//   L = 上次变化时的实际数字，R = 这次的实际数字
-//   D_n = floor(R/n) − floor(L/n)        这一位要走几格（0 = 完全不动）
-//   coord_n(k) = floor(L/n) + D_n × (1 − rate^k)
+//   L = 上次变化时的实际数字，R = 这次的实际数字，n = 这一位的位权
+//   起点格 = floor(L/n)（取整数：否则静止时轮子停在两个数字之间，实测踩过）
+//   终点格 = kRollDDiffFloor ? floor(L/n) + floor((R − L)/n) : floor(R/n)
+//   D_n    = 终点格 − 起点格                    这一位要走几格（0 = 完全不动）
+//   coord_n(k) = 起点格 + D_n × (1 − rate^k)^c
 //
-//   · rate^k 用"一个量每帧自乘"实现，不做幂运算（所有者的要求）
-//   · k→∞ 时 coord 正好落在 floor(R/n)：整数 -> 读数清晰
+//   · rate^k 用"一个量每帧自乘"实现，不做幂运算（所有者的要求）；c 是 kRollCurveC
+//   · k→∞ 时 coord 正好落在终点格：整数 -> 读数清晰
 //   · D_n == 0 的位从头到尾不动（所以"下降时十位应跟个位一样"成立）
-//   · 全体同时开始、按同一条 rate 曲线收敛，所以一起到位
 //
-// ★ D 为什么不是 floor((R−L)/n)：起点不在整数格上时会漏步。
+// ★ D 的取整口径由 kRollDDiffFloor（tuning.h）选，默认是后者：
+//   floor(R/n) − floor(L/n) 而不是 floor((R−L)/n)。差别在"起点不在整数格上"时——
 //   例：L=99.50, R=100.00, n=10 -> floor(0.50/10)=0（十位不动），
 //   可十位的数字要从 9 变成 0，必须走 1 步；floor(R/n)−floor(L/n)=10−9=1 ✓
-// 每一位**自己管自己**地滚。
 //
-//   每位记着：当前坐标 coord、目标坐标 target（整数）。每帧：
-//       剩余 = (target − coord) × rate     // 剩余量每帧乘一次 rate，避免幂运算
-//       |剩余| < kRollSnapGrid  -> coord = target（**这一位**自己收尾）
-//       否则                    -> coord = target − 剩余
+//   每位记着：当前坐标 coord、起点格 from、这一位要走几格 D、自己的 rate^k。
+//   每帧：
+//       剩余 = (from + D) − coord              // 这一位还差多少格
+//       这一位的 rate^k 自乘一次 -> coord = from + D × (1 − rate^k)^c
+//       |剩余| < kRollSnapGrid  -> coord = from + D（**这一位**自己收尾）
 //
-//   · 截断是**每位独立判断**的：某一位先到位就先停，不被别的位拖住
-//   · 新值到来时只改 target，coord 从当前位置继续走 -> 不会跳
+//   · 收尾是**每位独立判断**的：某一位先到位就先停，不被别的位拖住
+//     （所以起点格也取 floor：吸附之后位次落在整数上，"正好是自己的数字"成立）
+//   · 新值到来时只改各自的 from / D，coord 从当前位置继续走 -> 不会跳
 //     （全体共用一个 rate^k 时，中途来新值要重置共用状态，所有轮子被拽回起点，
 //       所有者看到的"突变"正是如此；他 rate=0.99 一轮要 7.6 秒，而序列每 3 秒换值）
-// 每一位自己管自己地滚。位置公式（所有者给的）：
-//
-//     coord_n(k) = L + D_n × (1 − rate^k)^c        D_n = floor((R − L)/n)
-//
-// 实现要点：
-//   · 每位自带 ratePower = rate^k，每帧自乘一次（不做幂运算）
-//   · 截断**每位独立**：这一位自己的剩余距离 < kRollSnapGrid 就放到位
-//   · 新值到来只改终点，起点取"这一位当前坐标" -> 不会跳
-//     （全体共用一个 rate^k 时，中途来新值要重置共用状态、所有轮子被拽回起点，
-//       所有者看到的"突变"就是这样来的）
-//   · D 的取整口径由 kRollDDiffFloor 选：所有者的 floor((R−L)/n)，
-//     或 floor(R/n) − floor(L/n)（起点不在整数格上时不会多走一格）
 void DisplayedAmount::AdvancePlaces(double dtSeconds, const std::string& amountText) {
     (void)dtSeconds;
     if (!hasValue_ || amountText.empty()) {

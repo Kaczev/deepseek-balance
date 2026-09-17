@@ -5,7 +5,6 @@ namespace dshb {
 namespace {
 
 HANDLE g_mutex = nullptr;
-HWND g_activateTarget = nullptr;
 
 }  // namespace
 
@@ -27,11 +26,6 @@ bool AcquireSingleInstance() {
         return false;
     }
     return true;
-}
-
-void SetActivateTarget(HWND hwnd) {
-    g_activateTarget = hwnd;
-    (void)g_activateTarget;
 }
 
 }  // namespace dshb

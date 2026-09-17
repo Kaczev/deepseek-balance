@@ -23,9 +23,6 @@ struct AppPaths {
     std::wstring config;       // dataDir\config.json     —— 窗口位置等设置
     bool writable = false;     // 目录是否真的能建、能写
     std::wstring unwritableReason;   // 不能写时的原因（进日志用）
-
-    // 采样文件保留多久（小时）。计算窗口是 2 小时，留 24 小时足够回溯。
-    static constexpr int kRetentionHours = 24;
 };
 
 // 解析并试探可写性。多次调用返回同一份结果。

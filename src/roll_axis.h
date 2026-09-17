@@ -75,9 +75,6 @@ inline int PlaceOfSlot(const std::string& amountText, int slot) {
     return (slot < dot) ? (dot - 1 - slot) : -(slot - dot);
 }
 
-// 该位次在 1 元里有多少"格"。个位 = 1，十位 = 10，十分位 = 0.1 …（仅用于打印说明）
-inline double GridPerYuan(int place) { return std::pow(10.0, static_cast<double>(place)); }
-
 // 纵实际坐标 = DisplayAmount / 10^place，单位「格」。
 //
 // 精确做法：raw 的单位是 1/10000 元，所以

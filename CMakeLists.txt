@@ -24,7 +24,6 @@ add_executable(dshb
     src/sampling.cpp
     src/state_machine.cpp
     src/widget_display.cpp src/heartbeat.cpp
-    src/heartbeat.cpp
     src/api_client.cpp
     src/json_min.cpp
     src/balance_source.cpp
@@ -48,7 +47,8 @@ target_link_libraries(dshb PRIVATE
 target_sources(dshb PRIVATE src/app.manifest)
 set_property(TARGET dshb PROPERTY VS_DPI_AWARE "PerMonitor")
 # ---------------------------------------------------------------------------
-# 鐙珛鎺㈤拡锛氬彧鎵撳嵃杩愬姩鏇茬嚎锛屼笉纰板叡浜姸鎬併€?# 鑷鍧楅噷鐘舵€佹搷浣滃お澶氾紝瑙傚療涓棿閲忓鏄撹嚜宸辩畻閿欙紱鍗曠嫭鐨勬帰閽堟病鏈夎繖绉嶄綑鍦般€?# ---------------------------------------------------------------------------
+# 鐙珛鎺㈤拡锛氬彧鎵撳嵃杩愬姩鏇茬嚎锛屼笉纰板叡浜姸鎬併€?# 鑷鍧楅噷鐘舵€佹搷浣滃お澶氾紝瑙傚療涓棿閲忓鏄撹嚜宸辩畻閿欙紱鍗曠嫭鐨勬帰閽堟病鏈夎繖绉嶄綑鍦般€?
+# ---------------------------------------------------------------------------
 add_executable(tauprobe tools/tauprobe.cpp src/widget_display.cpp src/heartbeat.cpp src/state_machine.cpp src/amount.cpp src/curve_store.cpp src/json_min.cpp src/rate_estimator.cpp)
 add_executable(coordprobe tools/coordprobe.cpp src/amount.cpp)
 target_compile_definitions(tauprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
@@ -75,3 +75,14 @@ target_include_directories(storeprobe PRIVATE src)
 add_executable(rateprobe tools/rateprobe.cpp src/rate_estimator.cpp src/amount.cpp)
 target_compile_definitions(rateprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(rateprobe PRIVATE src)
+
+# beat probe: the heartbeat displacement waveform (src/heartbeat.h/.cpp) -- peak to peak,
+# per-frame jump, phase continuity, rise time, determinism and recovery. The waveform is a
+# pure function of (seconds, history, fade), so this target needs only src/heartbeat.cpp;
+# psapi is the one extra library, for the working-set readout of the probe's own K table.
+# Offline, no store, no network, no widget, and its own main() so the widget's argument
+# parsing stays untouched.
+add_executable(beatprobe tools/beatprobe.cpp src/heartbeat.cpp)
+target_compile_definitions(beatprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_include_directories(beatprobe PRIVATE src)
+target_link_libraries(beatprobe PRIVATE psapi)

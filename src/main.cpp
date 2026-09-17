@@ -62,9 +62,9 @@ bool g_rollLoop = false;         // --roll=loop：每 2 秒来回跳一次，用
 // --fixed-amount=N: 把余额钉在 N，不再取样、不再变化。0 = 关闭。
 // 用途：做动画时内容必须先站住不动，否则分不清画面变化是动画造成的还是新采样造成的。
 double g_fixedAmount = 0.0;
-// --real=N：手动设定**实际数字**（采样值）。--display=M：手动设定**显示数字**并冻结。
+// --real=N：手动设定**实际数字**（采样值）。
 // --no-anim：显示数字不做指数平滑（跟着实际数字立刻到位）。
-// 三者都是为了"停在一个状态上看清楚"，不做自动动画。
+// 两者都是为了"停在一个状态上看清楚"，不做自动动画。
 bool g_realGiven = false;
 bool g_lastGiven = false;
 bool g_fixedGiven = false;
@@ -111,7 +111,6 @@ int  g_curveFrame = -1;           // --curve-frame=k：把滚动计时器冻在�
 int  g_beatFrame = -1;            // --beat-frame=k：把心跳仿真时刻放到 k/60 秒（-1 = 未给）
          // --pause-test：注入"锁屏/解锁"，验证 J4（不用真锁屏）
 double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
-double g_displayAmount = 0.0;   // 已弃用（所有者改为 --last）
 double g_lastAmount = -1.0;   // --last=L（-1 = 未给）
 int g_frames = -1;              // --frames=k：已经运算了多少帧（-1 = 未给）
 // --seq=v0,v1,v2 ...：每 --step 秒把实际数字换成下一个（L 自动取上一次的实际数字）。
@@ -518,8 +517,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_selftestB = true;
         } else if (wcscmp(argv[i], L"--layout-probe") == 0) {
             g_layoutProbe = true;
-        } else if (wcscmp(argv[i], L"--click-demo") == 0) {   // 已移除（所有者不要演示窗）
-            SelfTestLog(L"[argv] --click-demo 已移除（所有者：不要演示窗口），忽略");
         } else if (wcsncmp(argv[i], L"--countdown=", 12) == 0) {
             // 导帧夹具：导出路径不取样，所以倒计时没有真实来源，靠它给一个值。
             g_countdownGiven = true;
@@ -680,8 +677,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_lastGiven = true;
         } else if (wcsncmp(argv[i], L"--frames=", 9) == 0) {
             g_frames = _wtoi(argv[i] + 9);
-        } else if (wcsncmp(argv[i], L"--display=", 10) == 0) {
-            g_displayAmount = _wtof(argv[i] + 10);
         } else if (wcscmp(argv[i], L"--no-anim") == 0) {
             g_noAnim = true;
         } else if (wcsncmp(argv[i], L"--phase=", 8) == 0) {
