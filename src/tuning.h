@@ -317,12 +317,12 @@ inline constexpr bool kGlowFlip180 = false;   // 整层旋转（不是所有者�
 inline constexpr bool kGlowCornerRot180 = false;
 
 inline constexpr float kGlowInLipDip = 30.0f;      // 衰减距离（DIP）
-inline constexpr float kGlowInLipAlpha = 0.2f;  // 原0.3 // 轮廓内沿处的 alpha（满强度）
+inline constexpr float kGlowInLipAlpha = 0.2f;  // 轮廓内沿处的 alpha（满强度）
 // 底部透光：从面板底边往上的一条竖向渐变（下亮上暗），17 DIP 内衰减到 0。
 inline constexpr float kGlowInVertDip = 80.0f;
-inline constexpr float kGlowInVertAlpha = 0.3f; // 原0.3
+inline constexpr float kGlowInVertAlpha = 0.3f;
 // 整板底噪：面板内处处一层极淡的 alpha，作用是"整体被染了一点"，不提供亮度。
-inline constexpr float kGlowInFloorAlpha = 0.1f; // 原0.1  // 整板底噪：这是"被照亮的表面"而不是"一条边"的关键
+inline constexpr float kGlowInFloorAlpha = 0.1f;  // 整板底噪：这是"被照亮的表面"而不是"一条边"的关键
 
 // ---- 5.5 内蒙光的强度倍率 k(R,D) —— 单独暴露，改它不用动剖面 ----
 //   k(R,D) = (kGlowInK0 + kGlowInK1 * R) * (1 - kGlowInD * D)

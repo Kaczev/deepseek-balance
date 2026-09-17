@@ -1560,18 +1560,27 @@ bool Renderer::ApplyInputRegion(bool particlesSpillout) {
     int left = 0, top = 0, right = size_.widthPx, bottom = size_.heightPx;
     if (!particlesSpillout) {
         const int m = static_cast<int>(kMarginDip * size_.scale + 0.5f);
-        left = m;
-        top = m;
-        right = m + static_cast<int>(kEntityWidthDip * size_.scale + 0.5f);
-        bottom = m + static_cast<int>(kEntityHeightDip * size_.scale + 0.5f);
-        // ★ 心跳位移：面板内容最多上下移动 kBeatAMax DIP，而 SetWindowRgn 会**同时裁剪绘制**
+        const int ew = static_cast<int>(kEntityWidthDip * size_.scale + 0.5f);
+        const int eh = static_cast<int>(kEntityHeightDip * size_.scale + 0.5f);
+        // ★ 区域必须盖住**整条边框**，不只是轮廓：DrawRoundedRectangle 是居中描边，
+        //   4 DIP 的线有 2 DIP 画在轮廓**外面**。以前区域正好等于轮廓，于是这条区域把
+        //   外半边切掉了 —— 所有者实测（2026-09-18）：屏幕上左右边框各只有 2 px 亮带，
+        //   导出 PNG 里却是完整的 4 px（导帧路径不设区域）。上/下/左/右看起来还不一样宽，
+        //   因为区域的四条边与画布边缘的距离天生不等（下沿另有心跳余量）。
+        const int stroke = static_cast<int>(kBorderWidthDip * 0.5f * size_.scale + 0.5f);
+        left = m - stroke;
+        top = m - stroke;
+        right = m + ew + stroke;
+        bottom = m + eh + stroke;
+        // ★ 心跳位移：面板内容最多往下移动 kBeatAMax DIP，而 SetWindowRgn 会**同时裁剪绘制**
         //   （不只是命中测试），所以区域必须留出这段行程 —— 否则位移到最低点时面板下边缘
         //   被系统切掉（所有者在屏幕上实测到的那条）。代价是边缘多算 kBeatAMax 像素可点，
         //   相对于 80 DIP 的透明余量可以忽略。
-        const int slack = static_cast<int>(kBeatAMax * size_.scale + 0.5f);
         // ★ 只向下留余量：心跳位移是单边的（dip >= 0，只往下），上沿不需要余量。
-        //   上沿留余量会把画布上本来就存在、以前被裁掉的内容露出来（我引进过一次）。
-        bottom += slack;
+        //   （这里以前写的是 "上沿留余量会把画布上本来就存在、以前被裁掉的内容露出来" ——
+        //    那条内容其实是**蒙光外溢**，它早就被 336f047 的遮罩限制在面板内了，
+        //    所以现在上沿唯一能露出来的东西是边框自己那 2 DIP，那正是我们要露的。）
+        bottom += static_cast<int>(kBeatAMax * size_.scale + 0.5f);
     }
     const int radius = particlesSpillout
         ? 0
