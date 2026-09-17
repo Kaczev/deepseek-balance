@@ -1363,9 +1363,26 @@ void PaintInnerGlow(ID2D1RenderTarget* rt, const WidgetFrame& f, ID2D1Bitmap* ti
         kMarginDip * sFromBitmap, kMarginDip * sFromBitmap,
         (kMarginDip + kEntityWidthDip) * sFromBitmap,
         (kMarginDip + kEntityHeightDip) * sFromBitmap);
+    // ★ 真正的贴合：用**面板自己的圆角几何**当遮罩，而不是外接矩形。
+    //   烘焙出来的遮罩在角上和这条圆角轮廓并不一致（所有者实测：左下角看起来像是用了
+    //   对面那个角的弧）。用几何遮罩之后，蒙光能在哪里出现由**几何**决定：
+    //   与边框用的是同一个 kCornerRadiusDip，所以两者的圆角必然重合。
+    ID2D1Factory* fac = nullptr;
+    rt->GetFactory(&fac);
+    ID2D1RoundedRectangleGeometry* maskGeo = nullptr;
+    if (fac) {
+        const float r = kCornerRadiusDip * sFromBitmap;
+        fac->CreateRoundedRectangleGeometry(D2D1::RoundedRect(clip, r, r), &maskGeo);
+    }
+    if (maskGeo) {
+        const D2D1_LAYER_PARAMETERS lp = D2D1::LayerParameters(
+            D2D1::InfiniteRect(), maskGeo, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        rt->PushLayer(lp, nullptr);
+    }
     rt->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     rt->DrawBitmap(tinted, &dest, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
     rt->PopAxisAlignedClip();
+    if (maskGeo) { rt->PopLayer(); maskGeo->Release(); }
 }
 
 // 临时诊断：曲线采样点的实测范围（只在 DSHB_CURVE_DEBUG 时非空）。
