@@ -1132,7 +1132,18 @@ float InnerGlowAlphaAt(float xDip, float yDip) {
     // ★ kGlowCornerRot180（所有者 2026-09-17 指令）：只把**角象限**里的圆角旋转 180 度。
     //   现象的准确描述是"圆角是内凹的"（凹凸方向反了），旋转 180 度即把凹变凸。
     //   四段直边不受影响：那里 dx 或 dy ≤ 0，条件不成立。
-    if (kGlowCornerRot180 && dx > 0.0f && dy > 0.0f) { dx = -dx; dy = -dy; }
+    if (kGlowCornerRot180 && dx > 0.0f && dy > 0.0f) {
+        // ★ 平滑过渡，而不是在象限边界硬切。原来直接取负，于是在 dx=0 / dy=0 两条线
+        //   上出现直角台阶（所有者 2026-09-17 在四个角都看到了，并圈出了那两条边）。
+        //   现在用"离象限边界多远"（= min(dx,dy)）在 kCornerRadiusDip 之内做 smoothstep：
+        //   边界处权重 0（与直边连续）、深入角内权重 1（保留填平的效果）。
+        const float edge = (dx < dy) ? dx : dy;          // >= 0，越大越深入角
+        float w = edge / kCornerRadiusDip;
+        if (w > 1.0f) w = 1.0f;
+        w = w * w * (3.0f - 2.0f * w);                   // smoothstep
+        dx = dx * (1.0f - 2.0f * w);
+        dy = dy * (1.0f - 2.0f * w);
+    }
     const float ax = (dx > 0.0f) ? dx : 0.0f;
     const float ay = (dy > 0.0f) ? dy : 0.0f;
     const float sdf = std::sqrt(ax * ax + ay * ay) +
