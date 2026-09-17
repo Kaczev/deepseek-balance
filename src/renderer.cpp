@@ -1147,8 +1147,12 @@ float InnerGlowAlphaAt(float xDip, float yDip) {
     }
     const float ax = (dx > 0.0f) ? dx : 0.0f;
     const float ay = (dy > 0.0f) ? dy : 0.0f;
+    // ★ kGlowCornerRot180（方角场）时，dx/dy 已经是从**真正的边**量的距离，
+    //   这里不能再减一次 kCornerRadiusDip —— 上一版减了两次，整圈内唇被推内 12 px，
+    //   于是边中点完全没有光、只有角上还剩一点（所有者 2026-09-17 看到"边不亮"）。
+    const float radiusTerm = kGlowCornerRot180 ? 0.0f : kCornerRadiusDip;
     const float sdf = std::sqrt(ax * ax + ay * ay) +
-                      ((dx > dy) ? dy : dx) - kCornerRadiusDip;
+                      ((dx > dy) ? dy : dx) - radiusTerm;
     const float insideDip = -sdf;               // > 0 仅当点在轮廓之内
     if (insideDip <= 0.0f) return 0.0f;         // 面板外（含轮廓上）一律 0
 
