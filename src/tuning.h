@@ -363,4 +363,82 @@ inline constexpr double kAmbienceDtMaxSeconds = 0.05;
 //  "光晕透明度 1.5 s"那个数。
 inline constexpr float kGlowInTauSeconds = 1.5f;
 
+// ---------------------------------------------------------------------------
+// 6. 心跳（震动 / 气喘吁吁）—— 一节跳动 = 一个包络，节拍 = 一个计时器
+// ---------------------------------------------------------------------------
+//  模型（所有者 2026-09-18 定，同日第三次修订）：
+//      位移  Δ = A(R,D) · Shape(τ)        τ = 现在 - 这一拍的触发时刻
+//      包络  Shape 见下面 6.1（形状与 R/D 无关）
+//      响应  e(R) = 1 - (1 - R)^1.5        ← 6.3，R 不再线性地进公式
+//      幅度  A = A_base + (A_max - A_base)·e(R)·(1-D) + (A_min - A_base)·D
+//      周期  T = T_base + (T_min - T_base)·e(R)·(1-D) + (T_max - T_base)·D
+//      计时  ★ 记的是"下一次**应当**跳动的时刻" t_j：
+//              t_j = triggerSeconds + T(当前的 R, D)      ← 每帧重算，不把 t_j 存下来
+//              now >= t_j  ->  跳一次
+//  ★ 幅度那一项里 A_max 配 R、A_min 配 D（与周期相反）：**剧烈 = 跳得猛，枯竭 = 跳得弱**。
+//  ★ 两条律的四个端点（实算，写在 6.2 / 6.3 里）：R 那一项由 (1-D) 缩放、D 那一项独立，
+//    所以 (R=1,D=0) 与 (R=0,D=1) 是**两个相反的方向**，不是同一个"极端"；(1,1) 时 R 那一
+//    项被 (1-D)=0 乘掉，于是回到 A_base / T_base + 15。
+//  实现放在 `src/heartbeat.h/.cpp`（纯函数、无状态）；**所有可调的数都在这一节**。
+//
+//  ★ 为什么 R 要过一道 e(R)（这次修订的由来）：R 按 5.6 的 R(t) = a^t 衰减得很快，
+//    而线性项下"变红"只对应很短的一段 R，于是屏幕上的观感是**变红了却并不快**
+//    （R = 0.5 时旧式 T = 7.75 s、R = 0.25 时 11.4 s —— 血色退去的那几秒里节拍几乎没变快）。
+//    e(R) >= R（R ∈ [0,1]，只在 0 与 1 处取等），于是同样的 R 现在更"剧烈"：
+//      R = 0.25 -> e = 0.3503（旧 0.25）    R = 0.5 -> e = 0.6464（旧 0.5）    R = 0.9 -> e = 0.9684
+//  ★ 为什么记 due 而不是"累计走了多久"：T 每帧都在随 R 变，拿"已过时间"去比一个正在变的
+//    T，参照系自己会动。记 due 之后 T 变短就**立刻**把下一拍拉近（这正是"变红要马上快起来"
+//    要的行为），而已经跳完的那一拍不受影响。
+//  ★ 幅度 A 仍然是**触发那一刻**采样的值：它只在包络里用，而包络是 (τ, 这一拍) 的函数。
+
+// ---- 6.1 一拍的形状 ----
+//  两个高斯脉冲之和。★ 两个脉冲都按**中心**给参数，而且**两个中心相等**：中心 = 触发之后
+//  多久达到峰值。这一条是整个波形最容易写错的地方 —— 把第一个中心放在 τ = 0 时，触发那一
+//  刻位移就已经是 3.61 px（A_max 的 72%），首帧跳变最坏 73.5%（上升段根本没被 60 Hz 采到）；
+//  两个中心都在 95 ms 时，同一指标是 33.94%（探针 case2 扇 1200 相位实测）。
+inline constexpr double kBeatSigma1 = 0.055;   // s   第一个高斯脉冲的 sigma
+inline constexpr double kBeatSigma2 = 0.050;   // s   第二个高斯脉冲的 sigma
+inline constexpr double kBeatMu1 = 0.095;      // s   第一个高斯脉冲的**中心**
+inline constexpr double kBeatMu2 = 0.095;      // s   第二个高斯脉冲的**中心**
+inline constexpr double kBeatB2 = 0.50;        //     第二个脉冲的幅度比
+// 两个中心重合 -> 连续域峰值恰好是 1 + b2；包络按它归一化，"幅度 = 几 px"才成立。
+inline constexpr double kBeatShapePeak = 1.0 + kBeatB2;   // = 1.5
+// 一拍的长度：末端取第二个中心之后 5 个 sigma（那里残留约 2.3e-5，按 0 处理）。
+// ★ 必须 < kBeatTMin，否则最快那一档两拍会叠在一起（下面的 static_assert 守着）。
+inline constexpr double kBeatLen = kBeatMu2 + 5.0 * kBeatSigma2;   // = 0.345 s
+
+// ---- 6.2 幅度（px）----
+//  A = A_base + (A_max - A_base)·e(R)·(1-D) + (A_min - A_base)·D
+//  四个端点（按上式实算）：
+//      A(0,0) = 4   常态
+//      A(1,0) = 6   ← 最剧烈时**最大**（由 A_max 决定）
+//      A(0,1) = 2   ← 最枯竭时**最小**（由 A_min 决定）
+//      A(1,1) = 4   ← R 那一项被 (1-D)=0 乘掉，回到常态
+//  ★ 与周期相反：周期里 A 与 T 的 min/max 配对是反的（T 用 T_min 配 R），这是所有者有意的 ——
+//    **剧烈 = 跳得又快又猛；枯竭 = 跳得又慢又弱**。
+inline constexpr double kBeatAMax = 6.0;       // 最剧烈（R = 1、D = 0）一端的幅度
+inline constexpr double kBeatAMin = 2.0;       // 最枯竭（R = 0、D = 1）一端的幅度
+inline constexpr double kBeatABase = 4.0;      // 常态（R = 0、D = 0）时的幅度
+static_assert(kBeatAMin <= kBeatABase && kBeatABase <= kBeatAMax,
+              "sanity: A_min <= A_base <= A_max, otherwise the two terms fight");
+
+// ---- 6.3 周期（s）与响应曲线 ----
+//  ★ 这里给的是**周期**不是频率：真正被计的是秒（所有者 2026-09-18 的决定）。
+//  T = T_base + (T_min - T_base)·e(R)·(1-D) + (T_max - T_base)·D
+//  四个端点：T(0,0) = 15（常态） T(1,0) = 0.5（最剧烈，最快） T(0,1) = 30（最枯竭，最慢）
+//            T(1,1) = 15.5
+inline constexpr double kBeatTMax = 30.0;      // 最枯竭（R = 0、D = 1）一端的周期
+inline constexpr double kBeatTMin = 0.5;       // 最剧烈（R = 1、D = 0）一端的周期
+inline constexpr double kBeatTBase = 15.0;     // 常态：R = 0、D = 0
+static_assert(kBeatTMin > kBeatLen,
+              "sanity: the shortest period must exceed one beat, or two beats overlap");
+
+// 响应曲线的指数（e(R) = 1 - (1-R)^kBeatRPow）。1.0 = 线性；> 1 让**小的 R 也更有效**
+// （曲线在 R 小的一侧被抬高），这正是这次修订要的效果。改它 = 改"变红之后多久开始快起来"。
+inline constexpr double kBeatRPow = 1.5;
+
+// ---- 6.4 计时到帧的换算 ----
+//  `--beat-frame=k` 的换算：k 帧 = k/60 秒（与 kCurveFrameHz 同源，两个都写在这里）。
+inline constexpr double kBeatFrameHz = 60.0;
+
 }  // namespace dshb

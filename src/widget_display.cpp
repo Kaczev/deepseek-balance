@@ -1216,35 +1216,46 @@ void DisplayedAmount::SetBeatSimFrame(int frame) {
 // 每帧推进心跳位移。
 //  ★ 冻结（暂停）时**不推进时间**：位移是 (时间, 这一拍) 的纯函数，时间不走位移就不变，
 //    这比"每帧记住一个值再锁住"更难写错。
-//  ★ 触发条件就是你给的计时：t = now − 上次触发，t >= T 就跳一次。**T 与 A 在触发那一刻
-//    采样、整拍不变**：R 现在每帧都在衰减（R(t) = kAmbienceDecayA^t），若每帧重算 T，
-//    那么"已经等了多久"和"要等多久"会同时变，参照系自己会动。
+//  ★ 计时就是你给的那一条：**due = now + T，now >= due 就跳一次**。T 每帧重算，所以
+//    R 一变短（余额突然掉一截）下一拍**立刻**被拉近——旧写法是"整拍采样、不变"，
+//    于是变红之后要等满旧拍才快起来（所有者实测到的问题）。
+//  ★ 已经跳完的那一拍不受影响：触发时刻只在真的跳了那一下才被改写，due 只往前拉不往后推
+//    （T 变大时 due 变远，那一拍就等久一点——这也是要的：不剧烈了就慢下来）。
 //  ★ 第一拍锚在**第一次调用的时候**（而不是"仿真时刻 0"）：调用它的那一刻 R/D 才是
 //    有意义的——`--ambience=R,D` 这类夹具在窗口建好之后才生效，若第一拍锚在 0、用夹具
-//    生效前的 R/D（R=0 ⇒ 周期 15 s）采样，夹具就算白设了（这个坑真的踩过一次：夹具写
-//    T=0.5 s，屏幕上却是 15 s 的节拍）。
+//    生效前的 R/D（R=0 ⇒ 周期 15 s）算，夹具就算白设了（这个坑真的踩过一次）。
 void DisplayedAmount::AdvanceBeat(double dtSeconds) {
     if (!AmbienceFrozenFlag()) beatSimSeconds_ += dtSeconds;
     if (!beatSeeded_) {
         beatSeeded_ = true;
-        TriggerBeatAt(beatSimSeconds_);
+        TriggerBeatAt(beatSimSeconds_);      // 第一帧就跳一次，而不是先干等一个周期
         ++beatCount_;
-    } else if (beatSimSeconds_ - beatBucket_.triggerSeconds >= beatBucket_.periodSeconds) {
-        TriggerBeatAt(beatSimSeconds_);
-        ++beatCount_;
+    } else {
+        // ★ 记的是"下一次应当跳动的时刻"，但**不把它存下来**：due = 上次触发 + 当前的 T。
+        //   T 变短就把 due 拉近 —— 变红之后下一拍立刻提前（这正是这次修订要的）。
+        //   ★ 因果别搞反：把 due 真的存下来、每帧写成 `now + T`，`now >= due` 就变成
+        //     "一帧要跨过 T"，而 T ≥ kBeatTMin = 0.5 s、一帧只有 1/60 s —— 第一拍之后再
+        //     也不跳（实测踩过，探针 case5e 专门钉这条）。所以 due 必须锚在**上次触发**上。
+        const double due = beatBucket_.triggerSeconds +
+                           BeatPeriodSeconds(ratioShown_, depthShown_);
+        if (beatSimSeconds_ >= due) {
+            TriggerBeatAt(beatSimSeconds_);
+            ++beatCount_;
+        }
     }
     beatOffsetDip_ = BeatOffsetFromBucket(beatSimSeconds_, beatBucket_);
 }
 
-// 触发一拍：采样这一拍的周期与幅度，并把触发时刻记为 at。
+// 触发一拍：记下触发时刻、采样这一拍的幅度与它的周期 T（t_j 每帧由这两者现算，不存 t_j）。
 void DisplayedAmount::TriggerBeatAt(double atSeconds) {
     beatBucket_.triggerSeconds = atSeconds;
-    beatBucket_.periodSeconds = BeatPeriodSeconds(ratioShown_, depthShown_);
     beatBucket_.amplitudePx = BeatAmplitudePx(ratioShown_, depthShown_);
+    beatBucket_.dueSeconds = BeatPeriodSeconds(ratioShown_, depthShown_);
     if (g_beatTrace) {
-        std::fprintf(stderr, "[trace] trigger t=%.6f period=%.6f amp=%.6f R=%.6f D=%.6f\n",
-                     atSeconds, beatBucket_.periodSeconds, beatBucket_.amplitudePx, ratioShown_,
-                     depthShown_);
+        std::fprintf(stderr, "[trace] trigger t=%.6f T=%.6f due_at=%.6f amp=%.6f R=%.6f D=%.6f\n",
+                     atSeconds, beatBucket_.dueSeconds,
+                     beatBucket_.triggerSeconds + beatBucket_.dueSeconds, beatBucket_.amplitudePx,
+                     ratioShown_, depthShown_);
     }
 }
 

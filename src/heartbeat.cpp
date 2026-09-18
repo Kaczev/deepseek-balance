@@ -39,18 +39,24 @@ double Clamp01(double x) { return std::clamp(x, 0.0, 1.0); }
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// 两条律（触发那一刻采样，整拍不变）
+// 响应曲线与两条律（触发那一刻采样）
 // ---------------------------------------------------------------------------
-double BeatAmplitudePx(double R, double D) {
+double BeatResponseCurve(double R) {
     const double r = Clamp01(R);
+    return 1.0 - std::pow(1.0 - r, kBeatRPow);
+}
+
+double BeatAmplitudePx(double R, double D) {
+    const double e = BeatResponseCurve(R);
     const double d = Clamp01(D);
-    return kBeatABase + (kBeatAMin - kBeatABase) * d + (kBeatAMax - kBeatABase) * r;
+    // ★ A_max 配 R、A_min 配 D（与周期相反）：剧烈 = 跳得又快又猛，枯竭 = 又慢又弱。
+    return kBeatABase + (kBeatAMax - kBeatABase) * e * (1.0 - d) + (kBeatAMin - kBeatABase) * d;
 }
 
 double BeatPeriodSeconds(double R, double D) {
-    const double r = Clamp01(R);
+    const double e = BeatResponseCurve(R);
     const double d = Clamp01(D);
-    return kBeatTBase + (kBeatTMax - kBeatTBase) * d + (kBeatTMin - kBeatTBase) * r;
+    return kBeatTBase + (kBeatTMin - kBeatTBase) * e * (1.0 - d) + (kBeatTMax - kBeatTBase) * d;
 }
 
 // ---------------------------------------------------------------------------

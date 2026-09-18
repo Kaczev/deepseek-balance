@@ -3,34 +3,40 @@
 // ===========================================================================
 //
 //  ★ 本模块是**纯函数**：不读时钟、不碰文件、不含 `Windows.h`、不碰 D2D、
-//    **没有全局可变状态**（连积分表都没有了，见下）。
-//    输入是"现在几点 + 计时器状态 + 这一拍的 (R, D)"，输出是一个像素位移。
-//    正因为没有隐藏状态，`tools/beatprobe.cpp` 能用合成状态把每条性质证明一遍，
-//    也能"导出单帧、离线重算"（这是本项目唯一的验证方式）。
+//    **没有全局可变状态**（连积分表都没有了）。输入是"现在几点 + 计时器状态 + 这一拍的
+//    (R, D)"，输出是一个像素位移。正因为没有隐藏状态，`tools/beatprobe.cpp` 能用合成状态
+//    把每条性质证明一遍，也能"导出单帧、离线重算"（这是本项目唯一的验证方式）。
+//
+//  ★ **所有可调的数都在 `src/tuning.h` 第 6 节**（形状、幅度、周期、帧率换算）。本头文件
+//    一个常量都不定义：它是"怎么算"，tuning.h 是"调多少"，两件事不混在一起。
 //
 // ---------------------------------------------------------------------------
-// 模型（所有者 2026-09-18 定）：**一次跳动 = 一个包络；节拍 = 一个计时器**
+// 模型（所有者 2026-09-18 定，同日第二次修订）：**一次跳动 = 一个包络；节拍 = 一个计时器**
 // ---------------------------------------------------------------------------
 //  位移：
 //      Δ = A(R, D) · Shape(τ)          τ = 现在 - 这一拍的触发时刻
 //  包络（两个高斯之和，形状与 R/D 无关）：
 //      Shape(τ) = [ G(τ; μ1, σ1) + b2 · G(τ; μ2, σ2) ] / (1 + b2)
 //      G(τ; μ, σ) = exp( -½ ((τ - μ)/σ)² )
-//  幅度与周期（都在**触发那一刻**采样，整拍不变）：
-//      A(R, D) = A_base + (A_min - A_base)·D + (A_max - A_base)·R
-//      T(R, D) = T_base + (T_max - T_base)·D + (T_min - T_base)·R
-//  计时（显示层每帧做，本模块只提供 BucketFor 与 Shape）：
-//      每帧 t = now - tTrigger；若 t >= TTrigger，则触发一次跳动、tTrigger = now、
-//      重新采样这一拍的 T 与 A。
+//  响应曲线（R 不再线性地进公式）：
+//      e(R) = 1 - (1 - R)^kBeatRPow          见 tuning.h 6.3
+//  两条律：
+//      A(R, D) = A_base + (A_min - A_base)·e(R)·(1-D) + (A_max - A_base)·D
+//      T(R, D) = T_base + (T_min - T_base)·e(R)·(1-D) + (T_max - T_base)·D
+//  计时（显示层每帧做，本模块只提供两条律与包络）：
+//      due = now + T(当前的 R, D)              ← 记的是"下一次**应当**跳动的时刻"
+//      now >= due  ->  跳一次，触发时刻记为 now
 //
 //  ★ 为什么"周期"而不是"频率"（所有者点名的理由）：真正被计的是**秒**。
 //    上一版用频率 F 与相位累积 φ = ∫F ds，那是为了"F 变化时相位不跳"付的代价：
 //    一张 0.19 MB 的 K 积分表、缓动 (1-rate^(60u))^c、恢复段 T_rec = 60·D·R、
-//    以及"拍号 = floor(φ)"的二分反解 —— 全部为那个目标服务。
-//    改成直接计时之后，那些东西一个都不需要了。
+//    以及"拍号 = floor(φ)"的二分反解 —— 改成直接计时之后那些东西一个都不需要了。
 //
-//  ★ 周期与幅度**在触发时采样**（不是每帧重算）：R 现在每帧都在衰减
-//    （R(t) = kAmbienceDecayA^t），若每帧重算 T，t 与 T 会同时变、参照系自己会动。
+//  ★ 为什么是"记 due"而不是"累计已过多久"：T 每帧都随 R 变，拿已过时间去比一个正在变的
+//    T，参照系自己会动。记 due 之后 T 变短就把下一拍**立刻**拉近 —— 这正是"一变红就该快
+//    起来"要的行为（旧写法是"整拍采样、不变"，于是变红之后要等满旧拍才快起来）。
+//
+//  ★ 幅度 A 仍然是**触发那一刻**采样的：它只在包络里用，而包络是 (τ, 这一拍) 的函数。
 //
 //  ★ 两拍不会叠：最短周期 T_min = 0.5 s > 一拍长度 kBeatLen = 0.345 s，
 //    所以任何时刻最多只有一拍在跳，位移就是**单拍**的位移（不是求和）。
@@ -45,54 +51,18 @@
 //      2. 持久化只存 reference（现在这是字面成立的：P 根本不含 Δ）。
 #pragma once
 
+#include "tuning.h"   // ★ 波形的每一个可调的数都在那里（tuning.h 第 6 节），本头文件不定义常量
+
 #include <cstddef>
 
 namespace dshb {
 
 // ---------------------------------------------------------------------------
-// 波形常量（形状）
+// 响应曲线与两条律（纯函数，R、D 会先夹到 [0,1]）
 // ---------------------------------------------------------------------------
-//  ★ 两个脉冲都按**中心**给参数，而且**两个中心相等**。中心 = 触发之后多久达到峰值。
-//    这一条是整个模块最容易写错的地方：把第一个中心放在 τ = 0 时，触发那一刻位移就已经
-//    是 3.61 px（A_max 的 72%），首帧落点最坏到 73.5% —— 上升段根本没被 60 Hz 采到。
-//    两个中心都放到 95 ms 之后，同一指标降到 33.94%（探针 case2 扫 1200 个起始相位实测）。
-inline constexpr double kBeatSigma1 = 0.055;   // s   第一个高斯脉冲的 sigma
-inline constexpr double kBeatSigma2 = 0.050;   // s   第二个高斯脉冲的 sigma
-inline constexpr double kBeatMu1 = 0.095;      // s   第一个高斯脉冲的**中心**
-inline constexpr double kBeatMu2 = 0.095;      // s   第二个高斯脉冲的**中心**
-inline constexpr double kBeatB2 = 0.50;        //     第二个脉冲的幅度比
-
-// 两个中心重合 -> 连续域峰值恰好是 1 + b2。归一化后"幅度 = 几 px"这句话才成立。
-inline constexpr double kBeatShapePeak = 1.0 + kBeatB2;   // = 1.5
-
-// 一次跳动的时长：末端取第二个中心之后 5 个 sigma（那里残留约 2.3e-5，按 0 处理）。
-// ★ 必须 < T_min = 0.5 s，否则最短周期下两拍会叠在一起。
-inline constexpr double kBeatLen = kBeatMu2 + 5.0 * kBeatSigma2;   // = 0.345 s
-
-// ---------------------------------------------------------------------------
-// 幅度（px）：A = A_base + (A_min - A_base)·D + (A_max - A_base)·R
-// ---------------------------------------------------------------------------
-inline constexpr double kBeatAMax = 5.0;       // 最剧烈（R = 1）时的幅度
-inline constexpr double kBeatAMin = 1.0;       // 最枯竭（D = 1、R = 0）时的幅度
-inline constexpr double kBeatABase = 3.0;      // 常态（R = 0、D = 0）时的幅度
-static_assert(kBeatAMin <= kBeatABase && kBeatABase <= kBeatAMax,
-              "sanity: A_min <= A_base <= A_max, otherwise the two terms fight");
-
-// ---------------------------------------------------------------------------
-// 周期（s）：T = T_base + (T_max - T_base)·D + (T_min - T_base)·R
-// ---------------------------------------------------------------------------
-inline constexpr double kBeatTMax = 30.0;      // 最慢：D = 1、R = 0（余额枯竭，几乎不动）
-inline constexpr double kBeatTMin = 0.5;       // 最快：R = 1（刚发生剧烈消耗）
-inline constexpr double kBeatTBase = 15.0;     // 常态：R = 0、D = 0
-static_assert(kBeatTMin > kBeatLen,
-              "sanity: the shortest period must exceed one beat, or two beats overlap");
-
-// 60 帧/秒：`--beat-frame=k` 的换算（k 帧 = k/60 秒），与 kCurveFrameHz 同源。
-inline constexpr double kBeatFrameHz = 60.0;
-
-// ---------------------------------------------------------------------------
-// 幅度律与周期律（纯函数，R、D 会先夹到 [0,1]）
-// ---------------------------------------------------------------------------
+//  e(R) = 1 - (1-R)^kBeatRPow。e(0) = 0、e(1) = 1，且 R ∈ (0,1) 时 e(R) > R
+//  （kBeatRPow > 1 时把曲线在 R 小的一侧抬高）。暴露出来是为了让探针能单独证明它。
+double BeatResponseCurve(double R);
 double BeatAmplitudePx(double R, double D);
 double BeatPeriodSeconds(double R, double D);
 
@@ -109,16 +79,21 @@ double BeatShapeNorm(double tauSeconds);
 // ---------------------------------------------------------------------------
 //  显示层每帧照着做（顺序就是这里写的顺序）：
 //      1. 推进仿真时钟（冻结时不推进）
-//      2. elapsed = simSeconds - triggerSeconds
-//      3. if (elapsed >= periodSeconds) { triggerSeconds = simSeconds;
-//                                          periodSeconds = BeatPeriodSeconds(R, D);
-//                                          amplitudePx   = BeatAmplitudePx(R, D); }
+//      2. t_j = triggerSeconds + BeatPeriodSeconds(当前的 R, D)      ← 每帧重算，不存
+//      3. if (simSeconds >= t_j) { triggerSeconds = simSeconds;
+//                                  dueSeconds    = BeatPeriodSeconds(R, D);   ← 记这一拍的 T
+//                                  amplitudePx   = BeatAmplitudePx(R, D); }
 //      4. offsetDip = BeatOffsetFromBucket(simSeconds, bucket)
-//  初始化：triggerSeconds = 0（所以第一帧就跳一次）、periodSeconds / amplitudePx 用当帧的 R/D 采样。
+//  初始化：triggerSeconds = dueSeconds = 0（于是第一帧就跳一次）。
+//
+//  ★ **t_j（下一次应当跳动的时刻）是算出来的，不是存下来的**。bucket 里存的是"上次触发的
+//    时刻"和"这一拍自己的周期"，t_j 每帧用**当前**的 R/D 现算。把 t_j 真的存下来、每帧写成
+//    `now + T` 是这一版写错过的地方：那使 `now >= t_j` 变成"一帧要跨过 0.5 s"，第一拍之后
+//    再也不跳（探针 case5e 专门钉这条：非触发帧上恒有 (now + T) - t_j > 0）。
 struct BeatBucket {
     double triggerSeconds = 0.0;   // 上次跳动触发的时刻（与 nowSeconds 同一计时基准）
-    double periodSeconds = 0.0;    // 这一拍的周期（触发时采样，整拍不变）
-    double amplitudePx = 0.0;      // 这一拍的幅度（触发时采样，整拍不变）
+    double dueSeconds = 0.0;       // 这一拍自己的周期 T（触发那一刻采样）；t_j = trigger + 它
+    double amplitudePx = 0.0;      // 这一拍的幅度（触发那一刻采样）
 };
 
 // 这一拍在 τ = nowSeconds - triggerSeconds 处的位移（DIP，> 0 = 往下）。
