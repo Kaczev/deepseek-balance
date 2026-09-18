@@ -166,18 +166,21 @@ namespace {
 CurveStore g_curveStore;
 
 // ---------------------------------------------------------------------------
-// 余额 -> 氛围颜色（"E 蒙光.md" §3）：D 用**当时**的余额算
+// 余额 + 剧烈程度 -> 氛围颜色（"E 蒙光.md" §3）：两个输入都用**那一刻**的值
 // ---------------------------------------------------------------------------
-//  ★ 为什么"存点的颜色"在这里自己算一次、而不是直接读 ambienceColor_：
-//    接口**只有余额**，而 D 是余额的纯函数，所以"那一刻的颜色"可以精确复原 ——
-//    存点时把余额喂进来就得到那一刻的颜色，不依赖任何渲染状态。
-//    R 那一半是"当时刚刚有多陡"，它不在余额里，所以这里取 R = 0；
-//    也就是说存下来的颜色是"D 的精确值 + R 取常态"。这个取舍写进了报告。
-//  ★ 声明必须在使用它的 FeedCurve 之前（C++ 的名字要先声明后使用）。
-AmbienceColor BalanceColorAt(double balanceYuan) {
+//  ★ 存进曲线点的颜色 = V(R_new, D)，其中：
+//      D     = 那个点的余额算出来的死态程度（余额的纯函数，可精确复原）；
+//      R_new = **追加这个点的那一刻新算出来的剧烈程度**（所有者 2026-09-18 的口径：
+//              "R_new。只不过如果它没有原本的 R 大，就会被盖掉而已"）。
+//    ★ 注意它**不是** R(t)：R(t) 是每帧衰减的实时量（内蒙光用那个），曲线点存的是
+//      "那一刻有多陡"这个事件量。两者在刷新那一刻数值相同，之后 R(t) 会自己凉下去。
+//  ★ 为什么调用方要把 R_new 传进来、而不是在这里自己算：它得读曲线存储（"这个点与
+//    上一个点"），而这里只拿得到余额。调用方（FeedCurve）拿得到存储，所以由它算。
+AmbienceColor BalanceColorAt(double balanceYuan, double ratio) {
     const double depth = BalanceDepth((balanceYuan < 0.0) ? 0.0 : balanceYuan);
-    return AmbienceTargetColor(0.0, depth);
+    return AmbienceTargetColor(ratio, depth);
 }
+
 
 std::string HexOf(const AmbienceColor& c) {
     auto byte = [](float x) {
@@ -327,6 +330,55 @@ bool CurveValueOfEntry(const CurveStorePoint& point, Amount* out) {
     return false;
 }
 
+// 存储里最近一步有多陡（元/分钟）：**只看最后两个可用点**。
+//   ★ 这是"这一步有多陡"的**唯一实现**（口径 = 曲线上真正画出来的那一对点）。
+//     三处使用者都在这里收口：曲线点的颜色（FeedCurve）、氛围的 R_new（AdvanceAmbience），
+//     以及给外面看的 LastStepPerMinute()（它只转发）。审计员 2026-09-18 实测过：这里
+//     曾经有两份逐字相同的 store 扫描加一份口径不同的样本间隔扫描，三者会各说各话。
+//   ★ 从最新往回找第一对"两个点都有时间、at 严格递增"的相邻点；金额取每个点的
+//     **第一个有值条目**（CurveValueOfEntry），与会话里选中的币种无关。
+//   ★ 存储里不足两个可用点（启动最初的第一个点）时返回 0 —— 那是"无从判断"。
+double StoreStepPerMinute() {
+    const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
+    if (points.size() < 2) return 0.0;
+    for (std::size_t i = points.size(); i-- > 1;) {
+        const CurveStorePoint& cur = points[i];
+        const CurveStorePoint& prev = points[i - 1];
+        if (!cur.atValid || !prev.atValid) continue;
+        const double dt = static_cast<double>(cur.at - prev.at);
+        if (!(dt > 0.0)) continue;
+        Amount curAmount;
+        Amount prevAmount;
+        if (!CurveValueOfEntry(cur, &curAmount)) continue;
+        if (!CurveValueOfEntry(prev, &prevAmount)) continue;
+        return StepPerMinute(prevAmount.ToDouble(), curAmount.ToDouble(), dt);
+    }
+    return 0.0;   // 没有可用的一步 = R = 0（"算不出来"，不是"在剧烈消耗"）
+}
+
+// 最近两次测出来的"这一步有多陡"（元/分钟），口径 = 存储里最后两个点。
+//   ★ 为什么需要它：主循环**滞后一拍**（CommitDelayed 把上一个样本交给显示层，最新的那个
+//     先压着）。`FeedCurve` 与 `AdvanceAmbience` 在**同一拍**里先后跑：
+//         FeedCurve(s_N)      —— 为刚交付的 s_N 测出这一步（上一个点 → s_N），颜色用它
+//         AdvanceAmbience     —— 同一拍稍后，此时屏幕上显示的**就是 s_N**
+//   ★ 氛围读 `current`（屏幕上正在显示的那一步），不读存储：存储此刻已经有更新的点了，
+//     直接读它会拿到"用户还看不到的那一步"，于是出现"数字几乎没动、面板却突然变红"
+//     （所有者 2026-09-18 指出并选定 S2）。
+struct StepMemory {
+    double current = 0.0;    // 最近一次交付的样本所测的那一步（= 屏幕上正在显示的那一步）
+    bool valid = false;
+};
+StepMemory g_stepMemory;
+
+// 屏幕上这一步有多陡（元/分钟）。
+//   ★ 只做一件事：把"最近交付的那一步"取出来。**不再抄一遍存储扫描** —— 这个项目已经
+//     吃过"同一件事两份实现"的亏（审计员 2026-09-18 实测：那两份 store 扫描逐字相同，
+//     而第三份的口径不同，差 2 倍）。
+//   ★ 没有历史（刚启动、还没交付过任何样本）时返回 0；调用方在那种情况下用
+//     `DisplayedAmount::LastStepPerMinute()`（那时两者本来就同值，见那里的说明）。
+bool AmbientStepKnown() { return g_stepMemory.valid; }
+double AmbientStepPerMinute() { return g_stepMemory.current; }
+
 // 纵向缓动：P = L + (N − L) × (1 − rate^k)^c（规格 §3 第 6 条，k = 帧号）。
 // ★ 走到终点（第 600 帧，整 10 秒）时直接取 N：公式在 k=600 处还剩 0.975^600 ≈ 2.5e-7
 //   的残量（折算约 7e-5 像素），而"动画结束在数据自己给出的位置上"正是验收项 2 要逐
@@ -374,10 +426,35 @@ void FeedCurve(const Sample& s) {
             obs.primaryCurrency, s.total.ToString2(), true});
     }
     // 样本的**墙钟秒**就是数据层的时间戳（规格 §2.3）。
-    // ★ 同时把这个点**自己那一刻**的氛围颜色存下去（"E 蒙光.md" §3.1）：
-    //   颜色由余额的纯函数给出（BalanceColorAt），所以"那一刻的颜色"是可复原的
-    //   —— 存下来的不是"当前渲染状态"，而是"这条数据在那一刻对应的颜色"。
-    g_curveStore.Append(obs, s.wallMs / 1000, HexOf(BalanceColorAt(s.total.ToDouble())));
+    // ★ 氛围颜色的口径（所有者 2026-09-18）：**段 P_N→P_(N+1) 的颜色 = 终止于 P_(N+1)
+    //   那一步的 R_new**，也就是"进入 P_(N+1) 的那一步"。
+    //   ★ 于是它只能**回填**：写 P_N 的时候"到 P_(N+1) 那一步"还不存在（要等 P_(N+1) 到达
+    //     才知道）。顺序是：
+    //       1. 这一拍先把新点追加进去（暂时不带颜色）
+    //       2. 量出"上一个点 → 这个新点"这一步（`StoreStepPerMinute()`，此刻存储的最后
+    //          两个点正好是它们）
+    //       3. 用这一步的颜色覆盖**上一个点**的颜色 —— 它右边那一段就是这一步
+    //   ★ 用"样本间隔"代替"存储里两点间隔"会错：余额没变的采样不成点，两者会越差越多
+    //     （审计员实测 10 s 采样、20 s 变化一次时差 2 倍）。
+    g_curveStore.Append(obs, s.wallMs / 1000, std::string());
+    const double step = StoreStepPerMinute();
+    const double ratio = SeverityRatio(step);
+    // 回填：把"终止于最新那个点的那一步"的颜色写到**它的前一个点**上 —— 那一段就是这一步。
+    // 颜色里的余额用前一个点自己的值（D 要按它自己的余额算，不能用最新那个点的）。
+    {
+        const std::vector<CurveStorePoint> pts = g_curveStore.Points();
+        if (pts.size() >= 2) {
+            Amount prevAmount;
+            if (CurveValueOfEntry(pts[pts.size() - 2], &prevAmount)) {
+                g_curveStore.SetColorOfPrevNewest(
+                    HexOf(BalanceColorAt(prevAmount.ToDouble(), ratio)));
+            }
+        }
+    }
+    // ★ 这一步刚测出来，留给**下一次**用：主循环滞后一拍，所以下一次刷新时屏幕上
+    //   正在显示的就是这一步，氛围要用它（见 StepMemory 的说明）。
+    g_stepMemory.current = step;   // 原始量（元/分钟），不是夹过的 R
+    g_stepMemory.valid = true;
 
     // ★ 判定"追加了一个点"看的是**存储自己的状态**，不是 Append() 返回值的含义：
     //   点数变了，或者环里的内容变了（容量 12 到顶时 size() 不动，但最老的点会被挤掉）。
@@ -484,7 +561,8 @@ void BuildFrameCurve(WidgetFrame* f) {
     // 左侧拉平（规格 §2.2、验收 3）：显示的点还不够 11 个时，最早那个点左边的区间
     // "看做与它同值"。滚动中同理——最左那个点滑出画面后，左端由次左点拉平。
     // ★ 这个补位点不对应任何存储点，所以它**没有**自己的颜色（hasColor = false）：
-    //   渲染层会用当前 C 画它左边那一段。给它硬套一个颜色等于发明一个测量值。
+    //   渲染层会沿用它右边那个真点的颜色（见 renderer.cpp 的 PaintAmbientCurve）——
+    //   那段本来就没有独立的测量值，硬套一个颜色等于发明一个测量值。
     if (xs[from] > 0.0) {
         CurvePoint lead{};
         lead.x = 0.0f;
@@ -959,27 +1037,9 @@ double DisplayedAmount::Update(double dtSeconds) {
 //    比它与墙钟的严格一致更重要。
 //
 //  ★ 只有"抬升"会改写 t（R_new > R(t) 才抬），所以 t 是单调不减的，不存在负时间。
-double DisplayedAmount::LastStepPerMinute() const {
-    const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
-    if (points.size() < 2) return 0.0;
-
-    // 从最新往回找一对"两个点都有值、都有时间、时间递增"的相邻点。
-    // 中间夹着没有时间的老点（老文件）是常态，所以这里要往后走而不是直接放弃。
-    for (std::size_t i = points.size(); i-- > 1;) {
-        const CurveStorePoint& cur = points[i];
-        const CurveStorePoint& prev = points[i - 1];
-        if (!cur.atValid || !prev.atValid) continue;
-        const double dt = static_cast<double>(cur.at - prev.at);
-        if (!(dt > 0.0)) continue;
-
-        Amount curAmount;
-        Amount prevAmount;
-        if (!CurveValueOfEntry(cur, &curAmount)) continue;
-        if (!CurveValueOfEntry(prev, &prevAmount)) continue;
-        return StepPerMinute(prevAmount.ToDouble(), curAmount.ToDouble(), dt);
-    }
-    return 0.0;   // 没有可用的一步 = R = 0（"算不出来"，不是"在剧烈消耗"）
-}
+//  ★ 这个成员函数现在**只是转发** StoreStepPerMinute()（文件上方那个自由函数）：
+//    同一件事只允许一份实现，否则迟早出现"两个地方各算一次、结果不一样"。
+double DisplayedAmount::LastStepPerMinute() const { return StoreStepPerMinute(); }
 
 void DisplayedAmount::AdvanceAmbience(double dtSeconds) {
     // ---- 0) 暂停 = 冻结 ----
@@ -992,7 +1052,11 @@ void DisplayedAmount::AdvanceAmbience(double dtSeconds) {
 
     // ---- 1) 数据这一次给出的高度：R_new = clamp(min{max(s, 2B), 0} / 2B, 0, 1) ----
     //  ★ 这里只算"高度"，不把它直接当成 R：R 由时间决定（见文件上面那一段模型说明）。
-    ambienceRatioTarget_ = SeverityRatio(LastStepPerMinute());
+    //  ★ s 取的是**屏幕上正在显示的那一步**（主循环滞后一拍），不是存储里最新那对点：
+    //    否则会出现"数字几乎没动、面板却突然变红"（所有者 2026-09-18 指出并选定 S2）。
+    //    刚启动还没交付过样本时退回 `LastStepPerMinute()`（那时两种取法同值）。
+    ambienceRatioTarget_ =
+        SeverityRatio(AmbientStepKnown() ? AmbientStepPerMinute() : LastStepPerMinute());
 
     // ---- 2) R(t) = a^t：先让时间走这一步，再让刷新去抬高它 ----
     const double dt = (dtSeconds < 0.0) ? 0.0
@@ -1050,7 +1114,11 @@ void DisplayedAmount::AdvanceAmbience(double dtSeconds) {
         glowIntensity_ += static_cast<float>((kTarget - glowIntensity_) * a);
     }
     if (glowIntensity_ < 0.0f) glowIntensity_ = 0.0f;
-    if (glowIntensity_ > 1.0f) glowIntensity_ = 1.0f;
+    // ★ 只夹下界（所有者 2026-09-18 的公式 max{0, ...}）：**上界不夹**。
+    //   原来这里还写着 `if (> 1.0f) = 1.0f`，于是 k₀ = 1.00 时 (k₀ + k₁·R) 那一项永远
+    //   加不上去 —— "剧烈时更亮"在数值上根本表达不出来。剖面峰值覆盖率只有 0.60，
+    //   所以 k 在 1.0 到约 1.67 之间都还在图层通道的范围内，不需要靠夹上界来防溢出。
+
 }
 
 // 导帧夹具：这一帧用给定的 (R, D) 画。见头文件里的理由（验收要求四帧可复现）。

@@ -619,11 +619,25 @@ bool CurveStore::Append(const CurveObservation& obs, int64_t nowSeconds,
     buf_[next_] = std::move(point);
     next_ = (next_ + 1) % kCapacity;
     ++count_;
-
     lastPrimaryText_ = primary->text;
     lastPrimaryCurrency_ = obs.primaryCurrency;
     updateAt_ = nowSeconds;     // §2.3: "仅更新 update_at"
     updateAtValid_ = true;
+    return true;
+}
+
+// 给"最新那个点的**前一个**点"写颜色。
+// ★ 为什么需要这个口子：段 P_N→P_(N+1) 的颜色 = **终止于 P_(N+1) 那一步**的 R_new
+//   （所有者 2026-09-18 的口径）。而写 P_N 的时候那一步还不存在 —— 它要等 P_(N+1) 到达
+//   才知道。所以顺序是"先把新点落进去、再量出那一步、回头给前一个点上色"，回填的就是它。
+// ★ 最新那个点自己在被回填之前**没有颜色**：它右边那一段暂时是空白的，等下一个点到达时
+//   才上色 —— 这与主循环滞后一拍是同一个节奏。
+// ★ 这不是"改历史数据"：值、时间、条目一个都不动，只写颜色这一个字段。
+// ★ 点数不足 2 时返回 false（没有"前一个点"可写）。
+bool CurveStore::SetColorOfPrevNewest(const std::string& colorHex) {
+    if (count_ < 2) return false;
+    const std::size_t prev = (next_ + kCapacity - 2) % kCapacity;
+    buf_[prev].color = IsHexColor(colorHex) ? colorHex : std::string();
     return true;
 }
 

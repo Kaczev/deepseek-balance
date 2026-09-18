@@ -50,10 +50,10 @@
 //  检查清单（编号就是下面 case 的编号）
 //  ---------------------------------------------------------------------------
 //    case0   自检：一条故意失败的检查真的会被格式化成 FAIL 行、真的被计数
-//    case1   包络：1 个极大 / 0 个极小、峰值 1.0（τ=μ 处，A_max 下 5 px）、
+//    case1   包络：1 个极大 / 0 个极小、峰值 1.0（τ=μ 处，A_max 那个高度）、
 //            区间外恰好 0（−1e-9 与 kBeatLen+1e-9 两点）、kBeatLen 处的残留
 //    case2   单帧最大跳变：1200 起始相位 × 24 帧，占幅度的百分比 ≤ 35%（三种工况）
-//    case3   幅度律 A(R,D)：49 点网格对公式、四个角 3/5/1/1（规格）、对 D 线性、
+//    case3   幅度律 A(R,D)：49 点网格对公式、四个角 4/6/2/2（规格）、对 D 线性、
 //            对 e(R) 仿射（e 的中点对应中点）、输入夹到 [0,1]
 //    case3b  响应曲线 e(R)：e(0)=0、e(1)=1、单调递增、R∈(0,1) 时 e(R)>R、
 //            与 kBeatRPow 重算的公式一致、输入夹到 [0,1]
@@ -284,7 +284,7 @@ std::vector<double> FixtureSequence(double R, double D, int frames) {
 //    位置都会露出来），而不是浮点噪声。
 //  ★ R 那一项被 (1-D) 缩放，所以 D=1 时 R 的两项都被乘掉：(R=1,D=1) 与 (R=0,D=1) 的
 //    **周期**同值（30 s）；幅度则不然 —— 幅度的 D 项配的是 A_min，(1,1) 与 (0,1) 都是 3 px
-//    而 (1,0) 才是 5 px。
+//    而 (1,0) 才是 kBeatAMax。
 //  ★ 幅度与周期的配对是**反的**（A_max 配 R、T_min 配 R）：剧烈 = 又快又猛，枯竭 = 又慢又弱。
 double AmpByFormula(double R, double D) {
     const double e = dshb::BeatResponseCurve(R);
@@ -455,7 +455,7 @@ void RunEnvelope(Harness* h, bool verbose) {
                     residualPx > 0.0 && residualPx < 1e-3;
 
     h->Req("case1",
-           "一拍就是一个包络：恰好 1 个局部极大、0 个局部极小；峰值 1.0（τ=μ 处，A_max 下 5 px）；"
+           "一拍就是一个包络：恰好 1 个局部极大、0 个局部极小；峰值 1.0（τ=μ 处，A_max 下 " + F(dshb::kBeatAMax, 1) + " px）；"
            "τ 在 [0, kBeatLen] 之外恰好 0",
            "在 [0, kBeatLen] 内按 " + F(kEnvelopeHz, 0) + " Hz 采 " + I(n + 1) +
                " 点：局部极大 " + I(maxima) + " 个、局部极小 " + I(minima) + " 个；网格最大值 " +
@@ -544,7 +544,7 @@ JumpSweep SweepJump(double R, double D, int phases, int frames) {
 
 void RunJumpSweeps(Harness* h) {
     // 三个 (R,D) 档：常态、两端各一半、最剧烈。A 从**模块**取（不写死），
-    // 因为新律里 A(1,0)=5 px = kBeatAMax（最剧烈那一档的幅度最大 —— case3 的四个角钉的事）。
+    // 因为新律里 A(1,0) = kBeatAMax（最剧烈那一档的幅度最大 —— case3 的四个角钉的事）。
     struct Case {
         double R;
         double D;
@@ -652,7 +652,7 @@ void RunAmplitudeLaw(Harness* h) {
     }
 
     // 四个角：**所有者 2026-09-18 第二次修订给的规格值**（按实现里的式子实算）：
-    //      A(0,0) = 3    A(1,0) = 5    A(0,1) = 1    A(1,1) = 1
+    //      A(0,0) = 4    A(1,0) = 6    A(0,1) = 2    A(1,1) = 2
 //    （(1,1) 与 (0,1) 同值：D=1 时 (1-D)=0，R 那一项整个消失，剩下的就是 A_min）
     // ★ 这四行是本文件里**仅有的两处**规格字面量之一（另一处是 case4 的四角表）：
     //   它钉的是**规格**，不是复算波形。其余期望值都从 src/tuning.h 的常量推。
@@ -660,7 +660,7 @@ void RunAmplitudeLaw(Harness* h) {
     //   所以 (1,1) 与 (0,1) 同值。
     const double specR[4] = {0.0, 1.0, 0.0, 1.0};
     const double specD[4] = {0.0, 0.0, 1.0, 1.0};
-    const double specWant[4] = {3.0, 5.0, 1.0, 1.0};
+    const double specWant[4] = {4.0, 6.0, 2.0, 2.0};
     double cornerErr = 0.0;
     std::string corners;
     for (int i = 0; i < 4; ++i) {
@@ -722,10 +722,10 @@ void RunAmplitudeLaw(Harness* h) {
                     clampLow == clampRefLow;
     h->Req("case3",
            "幅度律 A(R,D)=A_base+(A_min-A_base)·e(R)·(1-D)+(A_max-A_base)·D：49 点网格对公式、"
-           "四个角 3/5/1/1（规格）、对 D 线性、对 e(R) 仿射（e 的中点=中点）、输入夹到 [0,1]",
+           "四个角 4/6/2/2（规格）、对 D 线性、对 e(R) 仿射（e 的中点=中点）、输入夹到 [0,1]",
            "网格 R,D 各取 {0, 0.1, 0.25, 0.5, 0.75, 0.9, 1} 共 49 点：最大偏差 " + F(worst, 15) +
                " px（在 R=" + F(worstAtR, 2) + ", D=" + F(worstAtD, 2) + "）；四个角" + corners +
-               "（规格 3/5/1/1，最大偏差 " + F(cornerErr, 15) + "）；对 D 线性的中点误差 " +
+               "（规格 4/6/2/2，最大偏差 " + F(cornerErr, 15) + "）；对 D 线性的中点误差 " +
                F(worstMidD, 15) + " px；对 e(R) 仿射的最大偏差 " + F(worstE, 15) + " px（在 R=" +
                F(worstEAtR, 4) + ", D=" + F(worstEAtD, 2) + "），其中 e=0.5 那一点" +
                "（R=" + F(ResponseHalfR(), 6) + "）与两端平均的差 " + F(worstMidE, 15) +

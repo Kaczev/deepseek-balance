@@ -208,9 +208,8 @@ inline constexpr float kBorderWidthDip = 2.0f;
 
 // ---- 氛围曲线（规格 §3 的显示层）----
 // 颜色仍是边缘文字那个中性色，透明度仍是氛围档（规格 §3 没让改，保持原样）。
-inline constexpr float kCurveColorR = 0xaf / 255.0f;
-inline constexpr float kCurveColorG = 0xb2 / 255.0f;
-inline constexpr float kCurveColorB = 0xb7 / 255.0f;
+// 曲线的透明度与线宽（**颜色**不在这里：逐点颜色由每个存储点自带的 "#rrggbb" 给出，
+// 见 widget_display.cpp 的 BalanceColorAt 与 renderer.cpp 的 PaintAmbientCurve）。
 inline constexpr float kCurveAlpha = 0.35f;
 inline constexpr float kCurveWidthDip = 8.0f;
 // 曲线的上下界（实体区内坐标，0 = 面板顶）。曲线在这两条线之间铺满。
@@ -318,31 +317,49 @@ inline constexpr bool kGlowCornerRot180 = false;
 
 inline constexpr float kGlowInLipDip = 30.0f;      // 衰减距离（DIP）
 inline constexpr float kGlowInLipAlpha = 0.2f;  // 轮廓内沿处的 alpha（满强度）
-// 底部透光：从面板底边往上的一条竖向渐变（下亮上暗），17 DIP 内衰减到 0。
+// 底部透光：从面板底边往上的一条竖向渐变（下亮上暗），30 DIP 内衰减到 0。
 inline constexpr float kGlowInVertDip = 80.0f;
 inline constexpr float kGlowInVertAlpha = 0.3f;
 // 整板底噪：面板内处处一层极淡的 alpha，作用是"整体被染了一点"，不提供亮度。
 inline constexpr float kGlowInFloorAlpha = 0.1f;  // 整板底噪：这是"被照亮的表面"而不是"一条边"的关键
+// ★ 这三个 alpha 加起来就是**峰值覆盖率 = 0.20 + 0.30 + 0.10 = 0.60**（在底部两角，内唇与
+//   竖向透光重叠处）。5.5 的 k 不夹上界就是靠这个余量：k 到约 1.67 才会碰到彩色层通道的
+//   上限。改动这三个数（或 k0）时都要重算它。
 
 // ---- 5.5 内蒙光的强度倍率 k(R,D) —— 单独暴露，改它不用动剖面 ----
-//   k(R,D) = (kGlowInK0 + kGlowInK1 * R) * (1 - kGlowInD * D)
-//   R 越大越亮（最多 +67%），D 越大越暗（最多 -60%）。
-// ★ 这是所有者唯一需要动的"亮度"旋钮：剖面（5.4）一个数都不用改。
-//   它乘在**整条剖面**上，所以形状不随状态变化（形状变了 = 换了一种状态语言）。
-inline constexpr float kGlowInK0 = 1.00f;   // R = 0 时的基准强度（所有者 2026-09-17：先加大看看）
-inline constexpr float kGlowInK1 = 0.00f;   // R = 1 时额外加多少
-inline constexpr float kGlowInD = 0.00f;    // D = 1 时暗掉的比例
-// 读不到余额（按 D = 1 处理）时观感取"甲"：冷白光**仍在**，不是"褪尽"
-// （一块死板子本身就是"出事了"的信号，v0.2 设计 §7.1 禁止）。
-// 想要"连光一起褪尽"就把 kGlowInD 改成 0.88（D=1 时 k 从 0.36 降到 0.088），
-// 剖面与几何一个数都不用动。
-// D = 1 时 C 是饱和度为 0 的近白；纯中性灰在近黑底上容易读成"玻璃上的灰"，
-// 所以朝基准蓝混一点点，让它读成"冷光"。
-inline constexpr float kGlowInD1Warm = 0.00f;
+//   k(R,D) = max{ 0, (k0 + k1·R)·(1 - kD·D) }
+//   ★ 只夹**下界**，上界不夹（所有者 2026-09-18）。原来写成 clamp(…, 0, 1) 是错的：
+//     k0 = 1.00 时 (k0 + k1·R) 那一项永远被上界吃掉，"剧烈时更亮"在数值上根本表达不出来。
+//   ★ 不夹上界凭什么安全：整条剖面的**峰值覆盖率只有 0.60**（内唇 0.20 + 底部透光 0.30 +
+//     底噪 0.10，见 5.4），所以 k 要到约 1.67 才会碰到彩色层通道的上限。当前 k0/k1 下
+//     k 全域最大是 k(1,0) = 1.10，余量很大。**若把 k0 抬到 1.3 以上请回来重算这个余量**，
+//     否则 k > 1.67 之后那一层会被逐通道削平 —— 表现是颜色变了，不是"更亮"。
+//   ★ 注意它乘在**整条剖面**上，形状不随状态变化（形状变了 = 换了一种状态语言）。
+//
+//   当前值（所有者 2026-09-18 改过 k1 / kD / W，下面这些数就是改完之后的）：
+//     k = 1.0000  (R=0, D=0)   常态
+//     k = 1.0000  (R=1, D=0)   剧烈
+//     k = 0.9500  (R=0, D=1)   枯竭     <- 全域最小
+//     k = 1.0000  (R=1, D=1)   同时发生  <- R 的加成恰好补回 D 的减损
+//   也就是说全幅只有 5%，而且 R 那 +10% 只在 D > 0.73 之后才看得出来（D 小的时候
+//   两者相乘顶在 1.0 上）。想要"剧烈时明显更亮"得把 k0 降下来腾出余量。
+inline constexpr float kGlowInK0 = 1.00f;   // R = 0 时的基准强度
+inline constexpr float kGlowInK1 = 0.10f;   // R = 1 时额外加多少
+inline constexpr float kGlowInD = 0.05f;    // D = 1 时暗掉的比例
+// D = 1 时 C 是饱和度为 0 的近白（#f6f6f6）；纯中性灰在近黑底上容易读成"玻璃上的灰"，
+// 所以朝基准蓝 #6c89f6 混这么一点，让它读成"冷光"。
+//   W = 0.00 时这段分支**不执行**；当前 0.12 → C(D=1) = **#e5e9f6**。
+//   ★ 它不会把光变亮：明度是 max 分量，混色后 max(229, 233, 246) = 246 与 #f6f6f6 相同。
+//   ★ 读不到余额（按 D = 1 处理）时观感取"甲"：冷白光**仍在**，不是"褪尽"
+//     （一块死板子本身就是"出事了"的信号，v0.2 设计 §7.1 禁止）。
+//     想改成"连光一起褪尽"就把 kGlowInD 调大（例如 0.88），剖面与几何一个数都不用动。
+inline constexpr float kGlowInD1Warm = 0.12f;
 
 // ---- 5.6 剧烈程度 R 的恢复速度（所有者 2026 定的模型）----
 //  R(t) = kAmbienceDecayA ^ t        t 的单位是**分钟**
-//  每帧 t += dt；刷新时若 R_new > R(t)，则令 t = ln(R_new) / ln(a)。
+//  每帧 t += dt；每次数据刷新算出新的 R（= R_new，就是曲线端点要用的那个量），
+//  若它 **高于**当前的 R(t)，则令 t = ln(R_new) / ln(a) —— 也就是"跳到新高度、再从那里
+//  自己往下落"；若 R_new **低于** R(t)，则什么都不做（它被当前的 R(t) 盖过去了）。
 //  于是 R 的响应永远是"跳上去、然后自己慢慢落回来"，不需要任何逐通道缓动：
 //  颜色本身就是 R(t)、D 的纯函数。
 //
@@ -359,8 +376,8 @@ inline constexpr double kAmbienceDtMaxSeconds = 0.05;
 
 // ---- 5.7 蒙光强度的缓动 ----
 //  ★ 只有**强度**还在缓动，颜色不缓动（颜色的平滑由 5.6 的 R(t) 负责）。
-//  强度用连续解 exp(-dt/τ)，与帧率无关；dt 用上面那个上限。τ = 1.5 s 是设计里
-//  "光晕透明度 1.5 s"那个数。
+//  强度用连续解 exp(-dt/τ)，与帧率无关；dt 用上面那个上限。
+//  τ = 1.5 s 是当初设计里"光晕透明度 1.5 s"那个数，没有别的来源。
 inline constexpr float kGlowInTauSeconds = 1.5f;
 
 // ---------------------------------------------------------------------------

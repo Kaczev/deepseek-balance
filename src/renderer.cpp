@@ -434,11 +434,18 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
     // 要画的点列（归一化）。渲染层只管连线，不知道余额从哪来——按规格 §3，点已经
     // 是显示层算好的最终位置（横向滚动、纵向缓动都算完了），这里一个都不再改。
     std::vector<std::pair<float, float>> pts;
+    // 每个**控制点**的颜色（与 f.curve 一一对应）：曲线段的两端颜色就是它。
+    //   hasColor == false 的点（老文件里的点、左侧补位点）用**当前 C** —— 就是这一帧
+    //   环境色那一个（f.ambientColor），不是另发明一个颜色。这样"没有颜色的点"在一帧里
+    //   是自洽的，也不会在曲线上凭空造出一段跳变。
+    std::vector<D2D1_COLOR_F> ctrlColors;
+    bool flatLine = false;
 
     if (!f.curveHasData || f.curve.size() < 2) {
-        // 没有数据 = 平的（所有者规则），画在带子中线，用**当前 C**。
+        // 没有数据 = 平的（所有者规则），画在带子中线，整条用当前 C。
         pts.push_back({0.0f, 0.5f});
         pts.push_back({1.0f, 0.5f});
+        flatLine = true;
     } else {
         // 单调三次插值（curve.h）：我们只在采样时刻知道余额，区间内的形状是插出来的；
         // 单调插值保证不过冲（普通样条会画出从未出现过的余额）。
@@ -460,23 +467,57 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
     }
     if (pts.size() < 2) return;
 
-    // 工厂与几何对象各只取一次（每帧一条曲线，不建多余对象）。
+    // 每个控制点的颜色（取不到就用当前 C）。x 可能非单调（滚动中），所以按"x <= 参考值"
+    // 取最后一个，而不是二分查找。
+    //   ★ `f.curve` 可能**是空的**而仍然画线：`curveHasData == false` 时上面走的是
+    //     "平线"分支（2 个点），此时一个控制点都没有。所以"取颜色"必须能退化到
+    //     那个兜底色，而不是假定 ctrlColors 非空 —— 之前这里直接读 ctrlColors[0]
+    //     就是一次越界读（实测：0xC0000005 崩在导帧里，是 seg i=0/0 pts=2 ctrl=0）。
+    const D2D1_COLOR_F fallback =
+        StraightRgba(f.ambientColor.r, f.ambientColor.g, f.ambientColor.b, kCurveAlpha);
+    auto ColorOfCtrl = [&](std::size_t c) -> D2D1_COLOR_F {
+        return c < ctrlColors.size() ? ctrlColors[c] : fallback;
+    };
+    {
+        ctrlColors.assign(f.curve.size(), fallback);
+        for (std::size_t i = 0; i < f.curve.size(); ++i) {
+            const CurvePoint& p = f.curve[i];
+            if (p.hasColor) ctrlColors[i] = StraightRgba(p.cr, p.cg, p.cb, kCurveAlpha);
+        }
+    }
+    // 每个采样点用哪个控制点的颜色：**从它往左数最后一个控制点**（所有者 2026-09-18 定的口径）。
+    //   ★ 为什么是左端：一个点存的是"**进入它**那一步"的陡度（写下它的时候那一步已知），
+    //     而"离开它"那一步要等下一个点到达才知道。于是段 P_N→P_(N+1) 用 **P_N** 的颜色，
+    //     含义是"我刚经历过的那一步有多陡，接下来这一段就按它上色"。
+    //   ★ 若反过来取右端（P_(N+1)），那段颜色就要用"离开 P_N 那一段"的陡度 —— 那一步
+    //     在 P_N 被写下来时还不存在，只能事后回写，等于让颜色去追一个未来的量。
+    //   ★ 后果：最新那一段（最后一个点往右）还没有颜色（它左边那个点已是最后一个）。
+    //     这与主循环滞后一拍是同一件事的两面：屏幕上的氛围也讲滞后那一步。
+    //   ★ 采样点恰好落在某个控制点上时取的是**它自己**（用 <= 而不是 <）：否则那个位置会
+    //     提前一格换色，整条带子平移约半格。
+    std::vector<std::size_t> srcIndex;
+    srcIndex.reserve(pts.size());
+    for (std::size_t i = 0; i < pts.size(); ++i) {
+        std::size_t pick = 0;
+        if (!flatLine && !f.curve.empty()) {
+            for (std::size_t c = 0; c < f.curve.size(); ++c) {
+                if (static_cast<double>(f.curve[c].x) <= static_cast<double>(pts[i].first)) {
+                    pick = c;
+                }
+            }
+        }
+        srcIndex.push_back(pick);
+    }
+
+    // 工厂与几何对象：工厂只取一次；几何**每段建一个**（见下面为什么）。
+    //   ★ 颜色是"每段一个**纯色**"：一段 P_N→P_(N+1) 涂 P_N 的颜色（= 它经历过的那一步，
+    //     见上面 srcIndex 的口径）。D2D 没有"两停靠点一样的渐变刷"这种更省的东西 ——
+    //     用同一色写两个停靠点就是纯色，读的人也一眼看得出这里的意图是平涂。
+    //   ★ 一支渐变刷就够：渐变轴（start/end）是可改的（SetStartPoint/SetEndPoint），
+    //     所以逐段只改轴与两端的颜色，不逐段建刷子。
     ID2D1Factory* fac = nullptr;
     rt->GetFactory(&fac);
     if (!fac) return;
-    ID2D1PathGeometry* geo = nullptr;
-    if (FAILED(fac->CreatePathGeometry(&geo)) || !geo) {
-        fac->Release();
-        return;
-    }
-    ID2D1SolidColorBrush* cb = nullptr;
-    if (FAILED(rt->CreateSolidColorBrush(
-            StraightRgba(kCurveColorR, kCurveColorG, kCurveColorB, kCurveAlpha), &cb)) ||
-        !cb) {
-        geo->Release();
-        fac->Release();
-        return;
-    }
     // 诊断（临时，只在 DSHB_CURVE_DEBUG 时写一次文件；**不在绘制路径里做 I/O**——
     // 这里只是把一段文字塞进内存，写文件由 main 在绘制之后调用 DumpCurveDebug 完成）。
     {
@@ -500,70 +541,86 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
                           static_cast<double>(py(pts.back().second)));
             g_curveDebug = buf;
             for (std::size_t k = 0; k < f.curve.size() && k < 13; ++k) {
-                char line[128];
-                std::snprintf(line, sizeof(line), "\n  ctrl[%llu] x=%.4f y=%.4f hasColor=%d",
+                char line[160];
+                std::snprintf(line, sizeof(line),
+                              "\n  ctrl[%llu] x=%.4f y=%.4f hasColor=%d rgb=(%.3f,%.3f,%.3f)",
                               static_cast<unsigned long long>(k),
                               static_cast<double>(f.curve[k].x),
                               static_cast<double>(f.curve[k].y),
-                              f.curve[k].hasColor ? 1 : 0);
+                              f.curve[k].hasColor ? 1 : 0,
+                              static_cast<double>(f.curve[k].cr),
+                              static_cast<double>(f.curve[k].cg),
+                              static_cast<double>(f.curve[k].cb));
                 g_curveDebug += line;
             }
         }
     }
 
-    // ★ 一次 Open / 一次 Close：**这是唯一能用的写法**。
-    //   回归的根因就是这里被写成"每段重开一次同一个几何"：`ID2D1PathGeometry` 不允许多次
-    //   Open/Close（第二次 Open 返回 D2DERR_WRONG_STATE 0x88990001），于是循环在第一次
-    //   之后就 break，全曲线只有**最左边那一段**被画出来 —— 实测 x[78..82]、20 个像素，
-    //   而它本该横跨实体区 x=80..395。
-    //   ★ 逐点颜色（"E 蒙光.md" §3.1）与这个限制冲突：一个几何只能被一种画笔画一次。
-    //     目前的做法是退回"单色整条"，**逐点颜色重新变成待办**（不能再用重开几何那条路，
-    //     见 .dsh\scratch\amb\report 里的说明）。宁可要一条正确的单色曲线，
-    //     不要一条只有左端 20 个像素的彩色曲线。
-    ID2D1GeometrySink* sink = nullptr;
-    if (FAILED(geo->Open(&sink)) || !sink) {
-        cb->Release();
-        geo->Release();
-        fac->Release();
-        return;
+    // ★ 逐段画：**每段一条自己的两点几何 + 一支自己的渐变刷**，端点是相邻两个采样点。
+    //   为什么不是"一个几何一次 Open/Close"：`ID2D1PathGeometry` 不允许重复 Open ——
+    //   重复调用会在第二次返回 D2DERR_WRONG_STATE(0x88990001)，于是循环当场 break、
+    //   整条曲线只画出最左边那一段（实测：x[78..82] 20 个像素，而它本该横跨 x=80..395）。
+    //   这是本项目踩过的真实回归，注释留着是为了下一个人别再试那条路。
+    //   ★ 每段自己一支刷子听起来贵，但渐变刷一旦建好，它的停靠点是**烘进它自己**的，
+    //     而 D2D 1.0 没有"改已有刷子的停靠点"这条路（`SetGradientStops` 两个接口上都没有）。
+    //     所以唯一确定可行的写法就是逐段建：一次 `CreateGradientStopCollection(2)` +
+    //     一次 `CreateLinearGradientBrush`。代价量过（见证据里的一次导出）。
+    //   ★ 端点的颜色取的是**控制点**的颜色，不是采样点被 x 夹出来的那一个 ——
+    //     所以段与段的接头处颜色严格连续（前段终点 = 后段起点）。
+    for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+        ID2D1PathGeometry* seg = nullptr;
+        if (FAILED(fac->CreatePathGeometry(&seg)) || !seg) break;
+        ID2D1GeometrySink* k = nullptr;
+        if (FAILED(seg->Open(&k)) || !k) {
+            seg->Release();
+            break;
+        }
+        k->BeginFigure(D2D1::Point2F(px(pts[i].first), py(pts[i].second)),
+                       D2D1_FIGURE_BEGIN_HOLLOW);
+        k->AddLine(D2D1::Point2F(px(pts[i + 1].first), py(pts[i + 1].second)));
+        k->EndFigure(D2D1_FIGURE_END_OPEN);
+        k->Close();
+        k->Release();
+
+        ID2D1GradientStopCollection* sc = nullptr;
+        // 纯色：两个停靠点同色（一段只属于它右端那个控制点）。
+        const D2D1_COLOR_F segColor = ColorOfCtrl(srcIndex[i]);
+        const D2D1_GRADIENT_STOP gs[2] = {{0.0f, segColor}, {1.0f, segColor}};
+        ID2D1LinearGradientBrush* gb = nullptr;
+        const D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES props = {
+            D2D1::Point2F(px(pts[i].first), py(pts[i].second)),
+            D2D1::Point2F(px(pts[i + 1].first), py(pts[i + 1].second))};
+        if (SUCCEEDED(rt->CreateGradientStopCollection(gs, 2, &sc)) && sc &&
+            SUCCEEDED(rt->CreateLinearGradientBrush(props, sc, &gb)) && gb) {
+            rt->DrawGeometry(seg, gb, kCurveWidthDip * s);
+        }
+        if (gb) gb->Release();
+        if (sc) sc->Release();
+        seg->Release();
     }
-    sink->BeginFigure(D2D1::Point2F(px(pts[0].first), py(pts[0].second)),
-                      D2D1_FIGURE_BEGIN_HOLLOW);
-    for (std::size_t i = 1; i < pts.size(); ++i) {
-        sink->AddLine(D2D1::Point2F(px(pts[i].first), py(pts[i].second)));
-    }
-    sink->EndFigure(D2D1_FIGURE_END_OPEN);
-    sink->Close();
-    sink->Release();
-    cb->SetColor(StraightRgba(kCurveColorR, kCurveColorG, kCurveColorB, kCurveAlpha));
-    rt->DrawGeometry(geo, cb, kCurveWidthDip * s);
 
     if (!pts.empty()) {
-        // 回归排查（曲线塌到左边缘）留下的唯一痕迹：把这条几何的**实测范围**留在
-        // 内存里，只写一次。它当初就是这么被找出来的（`geo->GetBounds` 报 inf，
-        // 因为几何是空的 —— 每段重开一次 Open/Close 是错的）。
-        // 默认空字符串；只有 DSHB_CURVE_DEBUG 时才有内容，由 main 在绘制之后落盘。
+        // 回归排查（曲线塌到左边缘）留下的痕迹：把这条曲线的**实测范围**留在内存里，
+        // 只写一次。它当初就是这么被找出来的（几何是空的 —— 每段重开一次 Open/Close 是错的）。
+        // ★ 逐段画之后 `geo` 不再存在，所以这里只报点列范围与段数；几何范围那条诊断
+        //   已经在上面第一处（用 px()/py() 直接算）覆盖了同一个事实。
         static bool dumped = false;
         if (!dumped && GetEnvironmentVariableA("DSHB_CURVE_DEBUG", nullptr, 0) > 0) {
             dumped = true;
-            D2D1_RECT_F bounds = D2D1::RectF(0, 0, 0, 0);
-            geo->GetBounds(nullptr, &bounds);
             char buf[256];
             std::snprintf(buf, sizeof(buf),
-                          "control=%llu pts=%llu xRange=[%.1f..%.1f] "
-                          "geoBounds=[%.1f..%.1f]x[%.1f..%.1f]",
+                          "control=%llu pts=%llu segments=%llu xRange=[%.1f..%.1f] "
+                          "yRange=[%.1f..%.1f]",
                           static_cast<unsigned long long>(f.curve.size()),
                           static_cast<unsigned long long>(pts.size()),
+                          static_cast<unsigned long long>(pts.size() - 1),
                           static_cast<double>(px(pts.front().first)),
                           static_cast<double>(px(pts.back().first)),
-                          static_cast<double>(bounds.left), static_cast<double>(bounds.right),
-                          static_cast<double>(bounds.top), static_cast<double>(bounds.bottom));
+                          static_cast<double>(py(0.0f)), static_cast<double>(py(1.0f)));
             g_curveDebug = buf;
         }
     }
 
-    cb->Release();
-    geo->Release();
     fac->Release();
 }
 
@@ -1184,9 +1241,11 @@ inline ID2D1Bitmap* GlowCache::Pick(ID2D1RenderTarget* rt, const CanvasSize& can
     if (!rt) return nullptr;
     EnsureCoverage(canvas);
     Forget(isExport);
-    const float k = (f.ambientIntensity < 0.0f)
-                        ? 0.0f
-                        : ((f.ambientIntensity > 1.0f) ? 1.0f : f.ambientIntensity);
+    // ★ 只夹下界：k 的上界**不夹**（所有者 2026-09-18 的公式是 max{0, ...}）。
+    //   这里原来还有一层 `> 1.0f -> 1.0f`，与显示层那个夹子是同一条错误的两份抄写 ——
+    //   两处都夹的时候，只放开一处等于没放开（k₀ = 1.00 时 R 那一项加不上去）。
+    //   防溢出不靠夹 k，靠的是"剖面峰值覆盖率 0.60"这个余量（见 tuning.h 5.4/5.5）。
+    const float k = (f.ambientIntensity < 0.0f) ? 0.0f : f.ambientIntensity;
     if (k <= 0.0f) return nullptr;   // 这一帧不画蒙光
     // 量化到 4/255：颜色稳下来之后就不再重烘。
     // ★ 为什么不是 1/255：量出来的（.dsh\scratch\amb\glowbake.cpp，逐帧重放一次

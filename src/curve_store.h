@@ -262,6 +262,11 @@ public:
     // Oldest -> newest (the newest point is the last element).
     std::vector<CurveStorePoint> Points() const;
 
+    // Overwrite the colour of the point BEFORE the newest one (value, time and entries
+    // untouched). Used to stamp "the step whose END is the newest point" onto the point it
+    // starts from, which is only known once that next point arrives. False when size < 2.
+    bool SetColorOfPrevNewest(const std::string& colorHex);
+
     // The newest n points, oldest -> newest; fewer when the store holds fewer.
     std::vector<CurveStorePoint> Newest(std::size_t n) const;
 
