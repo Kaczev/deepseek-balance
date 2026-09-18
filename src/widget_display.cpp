@@ -224,6 +224,11 @@ bool g_curveScrolling = false;
 // --curve-frame=k：把计时器冻结在 k/60 秒（导帧口子，只影响导出路径的一帧）。
 bool g_curveFrozen = false;
 
+// --beat-trace：每一拍触发时往 stderr 打一行（触发时刻 / 这一拍的周期与幅度）。
+//  ★ 存在的理由：计时器是**有状态**的，而导帧只看得到最后一帧的位移。要判断"这一帧的
+//    位移是第几拍、那一拍是什么时候触发的"，必须有触发的留痕。默认关，生产路径零影响。
+bool g_beatTrace = false;
+
 // L 用的"旧极值"（规格 §3 第 6 条）：追加发生**之前**屏幕上那 11 个点的极值。
 // ★ 它其实也能从存储推出来（追加后环里最老的那些点就是刚才在看的点），但规格明确
 //   要求"记住上一次的极值"；记住之后，滚动当中再来一次追加也不会把 L 算错。
@@ -931,15 +936,29 @@ double DisplayedAmount::Update(double dtSeconds) {
     return shown;
 }
 
+// 氛围：R 的衰减模型、D 与颜色
 // ---------------------------------------------------------------------------
-// 氛围：R、D 与颜色（"E 蒙光.md" §3、"E 施工单.md" 甲.2/3/5）
-// ---------------------------------------------------------------------------
-//  每帧重算，不缓存、不递推。三个输入：曲线存储里当前显示币种的最近两步、
-//  当前显示的余额、以及"数字是不是读不到"。
+//                 R(t) = a^t          a = kAmbienceDecayA ∈ (0,1)，t 的单位是**分钟**
+//                 每帧   t += dt       （冻结时不推进，于是 R 停住）
+//   数据刷新时     R_new = clamp( min{ max(s, 2B), 0 } / (2B), 0, 1 )
+//                  若 R_new > R(t)  ->  t = ln(R_new) / ln(a)
+//   画到屏幕上     C = DesaturateTowards( AmbienceBase(R_display), D )     ← 没有缓动
+//                  D = clamp( (G − 余额) / G, 0, 1 )                        ← 瞬时量
 //
-//  ★ 为什么"最近一步"取自曲线存储而不是另记一份：存储里每个点都带**自己的**
-//    时间戳（curve_store §2.3b），"这一步有多陡"就是拿最后两个可用点算的。
-//    另记一份增量状态就会多出一个可以忘记刷新的地方。
+//  三个后果，都是这个模型故意的：
+//   1. R 只会被**抬高**：数据说"这次不那么陡"时，R 交给时间自己凉，不许被硬拉下去。
+//      （R 低过当前值时连 t 都不动一下 —— 见下面 currentRatio 那一行的条件。）
+//   2. 颜色**不需要也不许**再有缓动：平滑全部发生在 R 一侧，颜色是 R 与 D 的纯函数。
+//      这同时消掉了旧实现里"从上一帧已降饱和的颜色再降一次"那条自我累积的路径。
+//   3. 一次冲高之后，屏幕是连续地退回平静（t 是连续量），但 D 会在余额刷新那一瞬间跳
+//      —— 余额就是余额，它没有"刚刚"这一说。
+//
+//  ★ 为什么用帧 dt 累加、而不是读墙钟：dt 由主循环给出并被 kAmbienceDtMaxSeconds 夹住，
+//    所以休眠唤醒后的第一帧只推进 50 ms，不会让 R 一帧之内凉透（与速率弹簧、心跳同一
+//    条纪律）。代价是"久挂之后 R 的衰减会比墙上时间慢"，那是刻意的：显示量的连续性
+//    比它与墙钟的严格一致更重要。
+//
+//  ★ 只有"抬升"会改写 t（R_new > R(t) 才抬），所以 t 是单调不减的，不存在负时间。
 double DisplayedAmount::LastStepPerMinute() const {
     const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
     if (points.size() < 2) return 0.0;
@@ -963,90 +982,67 @@ double DisplayedAmount::LastStepPerMinute() const {
 }
 
 void DisplayedAmount::AdvanceAmbience(double dtSeconds) {
-    // ---- 0) 暂停 = 冻结（"E 蒙光.md" §9.6 的连续性要求、施工单 甲.5）----
-    //  ★ 冻结的含义是"**不再推进**"，不是"不画"：颜色与光强停在当前值上，一步都不走。
-    //    所以第一帧（还没有起点时）仍然要**落位**到当前状态 —— 否则暂停期间启动
-    //    会画出一个没有蒙光的面板（实测：彩色层颜色为 (0,0,0)，32% 的黑盖在
-    //    #1b1b1c 上，整个光晕等于不存在）。这一条是量出来的，不是想出来的。
-    if (AmbienceFrozenFlag() && ambienceSeeded_) return;
+    // ---- 0) 暂停 = 冻结 ----
+    //  ★ 冻结的含义是"**不再推进**"，不是"不画"：R 的时间不走、光强也不走，于是两者
+    //    都停在当前值上，颜色按当前值照常画。所以第一帧仍然要**落位**（`glowSeeded_`
+    //    为假时下面第 6 步会落位）—— 否则暂停期间启动会画出一个没有蒙光的面板
+    //    （实测：彩色层颜色为 (0,0,0)，32% 的黑盖在 #1b1b1c 上，整个光晕等于不存在）。
+    const bool frozen = AmbienceFrozenFlag();
+    if (frozen && glowSeeded_) return;
 
-    // ---- 1) 两个纯函数的输出 ----
-    ambienceRatio_ = SeverityRatio(LastStepPerMinute());
+    // ---- 1) 数据这一次给出的高度：R_new = clamp(min{max(s, 2B), 0} / 2B, 0, 1) ----
+    //  ★ 这里只算"高度"，不把它直接当成 R：R 由时间决定（见文件上面那一段模型说明）。
+    ambienceRatioTarget_ = SeverityRatio(LastStepPerMinute());
+
+    // ---- 2) R(t) = a^t：先让时间走这一步，再让刷新去抬高它 ----
+    const double dt = (dtSeconds < 0.0) ? 0.0
+                     : ((dtSeconds > kAmbienceDtMaxSeconds) ? kAmbienceDtMaxSeconds : dtSeconds);
+    if (!frozen) ambienceSeconds_ += dt / 60.0;   // t 的单位是分钟
+    //  ★ 抬高规则（第一帧、或长时间没有刷新之后）：只要当前高度**低于**数据给的高度，
+    //    就把时间退回去，使 R(t) 恰好等于 R_new。R_new 为 0 时"退回"没有意义（R 恒为 0），
+    //    所以只在 R_new > 0 时才动 t；于是"数据说这次不那么陡"永远不会把 R 拉下去。
+    const double currentRatio = std::pow(kAmbienceDecayA, ambienceSeconds_);
+    if (ambienceRatioTarget_ > 0.0 && ambienceRatioTarget_ > currentRatio) {
+        ambienceSeconds_ = std::log(ambienceRatioTarget_) / std::log(kAmbienceDecayA);
+    }
+    ambienceRatio_ = std::pow(kAmbienceDecayA, ambienceSeconds_);
+
+    // ---- 3) D：余额的纯函数，**不加时间平滑** ----
+    //  ★ 用**本帧屏幕上那个数字**（value_ 由本帧的 UpdateValue/AdvancePlaces 刚推完）：
+    //    D 说的是"现在还看得见的那个数有多低"。目标值只在清零预估那一行用。
     const double shownYuan = (value_ < 0.0) ? 0.0 : value_;
     ambienceDepth_ = BalanceDepth(shownYuan);
 
-    // ---- 2) 状态规则（"E 蒙光.md" §3.3、施工单 甲.5）----
+    // ---- 4) 状态规则 ----
     //  读不到余额（数字显示 --.--）：R 与 D 都喂极端值，而不是"保留上一帧"。
     //  保留上一帧会让"网络断了"冻在血红色上 —— 那是对用户撒谎（§7.1）。
     //  ★ 读不到时 D = 1 且观感取**甲**：C 退饱和后的那道冷白光**仍在**。
     //    取"乙"（连光一起褪尽）会让面板变成一块没有任何光的死板子，
     //    而"死板子"本身就是"出事了"的信号 —— 正是 §7.1 禁止的那件事。
-    //    "甲"由 DesaturateTowards 在 depth >= 1 时按 kGlowInD1Warm 保温实现。
+    //    "甲"由 DesaturateTowards 在 depth >= 1 时按 kGlowInD1Warm 保温实现；该常量现在
+    //    等于 0，于是 D = 1 时得到的是纯中性灰 —— 这是代码现状，不是笔误。
     ambientUnreadable_ = !hasValue_;
-    ratioShown_ = ambientUnreadable_ ? 0.0 : ambienceRatio_;
-    depthShown_ = ambientUnreadable_ ? 1.0 : ambienceDepth_;
-    if (ambienceGiven_) {            // 程序内夹具（DisplayedAmount::SetAmbienceGiven）
-        ratioShown_ = ambienceGivenRatio_;
-        depthShown_ = ambienceGivenDepth_;
-    // 命令行夹具（--ambience=R,D）：跳过上面两条状态规则，只影响导出/验收。
-    } else if (AmbienceOverride().given) {
-        ratioShown_ = AmbienceOverride().ratio;
-        depthShown_ = AmbienceOverride().depth;
-    }
+    ApplyShownState();
 
-    // ---- 3) 目标颜色：**永远从本帧未降饱和的 C_0 算** ----
-    const AmbienceColor target = AmbienceTargetColor(ratioShown_, depthShown_);
-
-    // ---- 4) 逐通道缓动（与数字滚动同一套"帧号 k 的纯函数"手感）----
-    //  残差 dC = 老目标 − 新目标；每帧乘一次 rate^c。显示值 = 目标 + 残差：
-    //  于是它是 k 的纯函数，导帧逐帧可复现，且**不会**因为"从上一帧的颜色再算
-    //  一次饱和度"而自我累积（那种写法会让整条曲线在几秒内褪成灰）。
-    const bool retarget = !ambienceSeeded_ ||
-                          (target.r != ambienceTarget_.r || target.g != ambienceTarget_.g ||
-                           target.b != ambienceTarget_.b);
-    if (retarget) {
-        ambDcR_ = ambienceColor_.r - target.r;   // 逐通道，故意**不叫 D**
-        ambDcG_ = ambienceColor_.g - target.g;
-        ambDcB_ = ambienceColor_.b - target.b;
-        if (!ambienceSeeded_) {
-            ambDcR_ = ambDcG_ = ambDcB_ = 0.0f;  // 第一次：直接落位，不做入场动画
-            ambienceFrames_ = 0;
-        }
-        ambienceTarget_ = target;
-    }
-
-    const double dt = (dtSeconds < 0.0) ? 0.0
-                     : ((dtSeconds > kAmbienceMaxDtSeconds) ? kAmbienceMaxDtSeconds : dtSeconds);
-    // 逐通道残差每帧自乘 rate^c（k = 已经走了多少帧）。
-    const float decay = std::pow(kAmbienceColorRate, kAmbienceColorC);
-    if (ambienceSeeded_ && !AmbienceFrozenFlag()) {
-        ambDcR_ *= decay;
-        ambDcG_ *= decay;
-        ambDcB_ *= decay;
-        if (std::fabs(ambDcR_) < kAmbienceColorSnap) ambDcR_ = 0.0f;
-        if (std::fabs(ambDcG_) < kAmbienceColorSnap) ambDcG_ = 0.0f;
-        if (std::fabs(ambDcB_) < kAmbienceColorSnap) ambDcB_ = 0.0f;
-    }
-    ambienceColor_.r = ambienceTarget_.r + ambDcR_;
-    ambienceColor_.g = ambienceTarget_.g + ambDcG_;
-    ambienceColor_.b = ambienceTarget_.b + ambDcB_;
-    // 夹回合法范围：残差一定是朝老值的方向，越界只可能来自浮点噪声。
+    // ---- 5) 颜色：公式的直接输出，**没有缓动** ----
+    //  平滑全部发生在 R 那一侧（R(t) 自己衰减），所以这里不需要、也不许再叠一层动画。
+    //  ★ D 仍是瞬时量：余额一刷新，颜色里 D 那一半当场到位；R 那一半照样自己凉下来。
+    ambienceColor_ = AmbienceTargetColor(ratioShown_, depthShown_);
+    // 夹回合法范围：公式的定义域已经保证在 0..1，越界只可能来自浮点噪声。
     auto clamp01 = [](float x) { return (x < 0.0f) ? 0.0f : ((x > 1.0f) ? 1.0f : x); };
     ambienceColor_.r = clamp01(ambienceColor_.r);
     ambienceColor_.g = clamp01(ambienceColor_.g);
     ambienceColor_.b = clamp01(ambienceColor_.b);
-    ambienceSeeded_ = true;
-    ++ambienceFrames_;
 
-    // ---- 心跳位移（E 段）：放在这里是因为它要读上面刚算好的 ratioShown_/depthShown_。
+    // ---- 心跳位移：放在这里是因为它要读上面刚算好的 ratioShown_/depthShown_ ----
     //  ★ 与氛围一样在冻结时"停住"，但含义略有不同：氛围是停在当前值，心跳是**时间不走**，
     //    于是位移作为一个纯函数自然保持不变（不需要额外的"记住上一帧"状态）。
     AdvanceBeat(dtSeconds);
 
-    // ---- 5) 蒙光强度倍率 k(R,D)：与颜色分开缓动（连续解，与帧率无关）----
+    // ---- 6) 蒙光强度倍率 k(R,D)：与颜色分开缓动（连续解，与帧率无关）----
     const float kTarget = static_cast<float>((kGlowInK0 + kGlowInK1 * ratioShown_) *
                                              (1.0 - kGlowInD * depthShown_));
-    if (!glowSeeded_ || AmbienceFrozenFlag()) {
+    if (!glowSeeded_ || frozen) {
         glowIntensity_ = kTarget;      // 起点落位；冻结时停在当前目标上不再缓动
         glowSeeded_ = true;
     } else if (dt > 0.0) {
@@ -1171,41 +1167,85 @@ void PrimeHistoryForDemo(int points) {
     }
 }
 
-// --curve-frame=k：把滚动计时器冻结在 k/60 秒（导帧口子）。
-// 心跳位移：把仿真时间直接放到 k/60 秒（导出夹具）。
-//  ★ 必须先 seed 再求值：没有历史条目时模块按常态最慢那一档走，位移是一条约 0 的曲线。
+// 本帧该显示的 (R, D)：状态规则 + 两个夹具的覆盖，**只在这里**决定。
+//  ★ 为什么单独抽出来：心跳的导帧夹具（--beat-frame）要把中间每一帧重放一遍，而它重放时
+//    必须用**同一套** R/D 规则。上一版这里散在两处，夹具重放时读到的是夹具生效之前的
+//    R/D（R=0），于是"夹具设 R=1、T=0.5 s"被常态的 15 s 钉住——实测踩过。
+//    一个概念只有一个来源。
+void DisplayedAmount::ApplyShownState() {
+    ratioShown_ = ambientUnreadable_ ? 0.0 : ambienceRatio_;
+    depthShown_ = ambientUnreadable_ ? 1.0 : ambienceDepth_;
+    if (ambienceGiven_) {            // 程序内夹具（DisplayedAmount::SetAmbienceGiven）
+        ratioShown_ = ambienceGivenRatio_;
+        depthShown_ = ambienceGivenDepth_;
+    // 命令行夹具（--ambience=R,D）：跳过上面两条状态规则，只影响导出/验收。
+    } else if (AmbienceOverride().given) {
+        ratioShown_ = AmbienceOverride().ratio;
+        depthShown_ = AmbienceOverride().depth;
+    }
+}
+
+// --beat-frame=k：把心跳的仿真时刻放到 k/60 秒，并按计时器重新走一遍（导出夹具）。
+//  ★ 为什么是"重新走一遍"而不是"直接摆到那一帧"：位移不只取决于时刻，还取决于**这一拍
+//    是什么时候触发的**，而那由"每 T 秒触发一次"决定。照同一条规则把触发次数数出来，
+//    导出的才是真的"第 k 帧"。
+//  ★ 它只重置状态，然后**逐帧走一遍**（不自己算位移）：位移与触发都由 `AdvanceBeat`
+//    一个入口负责（生产路径同一个入口）。若这里另写一遍触发/求值，就有两个地方各算
+//    同一个东西——本项目的"一个概念两个来源"已经犯过三次。
+//  ★ 为什么不能只把 `beatSimSeconds_` 一摆就走：计时器是**有状态**的，"现在这一拍是哪
+//    一刻触发的"取决于中间每一帧。直接摆过去会让 90 帧只跳一次（实测：夹具写 T=0.5 s，
+//    屏幕上却像 15 s 的节拍），导出出来的不是"第 k 帧"。
+//  ★ 第一拍必须由第 0 帧那次 `AdvanceBeat` 触发（所以这里清 `beatSeeded_`）：窗口刚建好
+//    时 `--ambience=R,D` 还没生效，那时候采样的周期是**常态的 15 s**；夹具设了 R=1
+//    （T=0.5 s）而第一拍被 15 s 钉住，整套夹具就白设了（实测踩过）。
 void DisplayedAmount::SetBeatSimFrame(int frame) {
-    beatSimSeconds_ = (frame > 0) ? (static_cast<double>(frame) / kBeatFrameHz) : 0.0;
-    // ★ 夹具只负责"把仿真时刻放到 k/60"，**不在这里 seed**：此刻 ratioShown_/depthShown_ 还没
-    //   算出来（--ambience 夹具的覆盖值要等 AdvanceAmbience 把它落到那两个量上，而那在 Update 里）。
-    //   seed 一律交给 AdvanceBeat，用**当帧**的 R/D，且把变化时刻记在 t=0 —— 若记在"这一帧"，
-    //   任何一帧的经过时间都恰好是 0，永远还没到 onset，位移恒为 0（看起来像没接线）。
-    //   这里曾经读过 DisplayedAmount 里两个同名但没用到的成员，读到的永远是 0，
-    //   于是 seed 成 R=0、心跳最慢 —— 本项目"一个概念两个来源"的老毛病，这次是第三次。
-    beatHistory_.clear();
+    ApplyShownState();               // 先按同一套规则定下这一段的 (R, D)
+    beatSimSeconds_ = 0.0;
+    beatBucket_ = BeatBucket{};
+    beatCount_ = 0;
     beatSeeded_ = false;
-    beatOffsetDip_ = BeatOffsetPx(beatSimSeconds_, beatHistory_, 1.0);
+    const int frames = (frame > 0) ? frame : 0;
+    for (int i = 0; i <= frames; ++i) {
+        // ★ 每步用 `beatSimSeconds_ += dt` 累加，而不是把 `i/60` 直接赋给它：浮点累加的
+        //   次序必须与生产路径**逐位相同**，否则卡在整数边界的那一帧会数出不同的拍数
+        //   （实测：`i/60` 与 `+= 1/60` 在同一位置差整整一拍）。
+        AdvanceBeat((i == 0) ? 0.0 : 1.0 / kBeatFrameHz);
+    }
 }
 
 // 每帧推进心跳位移。
-//  ★ 冻结（暂停）时**不推进时间**：位移是 (时间, 历史) 的纯函数，时间不走位移就不变，
+//  ★ 冻结（暂停）时**不推进时间**：位移是 (时间, 这一拍) 的纯函数，时间不走位移就不变，
 //    这比"每帧记住一个值再锁住"更难写错。
-//  ★ R/D 变化才追加历史条目：F1/F2 由 R 决定，追加一条就是"心跳从这一刻起换了频率"。
+//  ★ 触发条件就是你给的计时：t = now − 上次触发，t >= T 就跳一次。**T 与 A 在触发那一刻
+//    采样、整拍不变**：R 现在每帧都在衰减（R(t) = kAmbienceDecayA^t），若每帧重算 T，
+//    那么"已经等了多久"和"要等多久"会同时变，参照系自己会动。
+//  ★ 第一拍锚在**第一次调用的时候**（而不是"仿真时刻 0"）：调用它的那一刻 R/D 才是
+//    有意义的——`--ambience=R,D` 这类夹具在窗口建好之后才生效，若第一拍锚在 0、用夹具
+//    生效前的 R/D（R=0 ⇒ 周期 15 s）采样，夹具就算白设了（这个坑真的踩过一次：夹具写
+//    T=0.5 s，屏幕上却是 15 s 的节拍）。
 void DisplayedAmount::AdvanceBeat(double dtSeconds) {
     if (!AmbienceFrozenFlag()) beatSimSeconds_ += dtSeconds;
-    const bool changed = (beatLastRatio_ != ratioShown_) || (beatLastDepth_ != depthShown_);
     if (!beatSeeded_) {
-        beatHistory_.push_back(MakeBeatChange(0.0, ratioShown_, depthShown_));   // 变化发生在 t=0（首帧）
         beatSeeded_ = true;
-        beatLastRatio_ = ratioShown_;
-        beatLastDepth_ = depthShown_;
-    } else if (changed && dtSeconds > 0.0) {   // dt=0 不是"又变化了一次"（夹具每帧是独立进程）
-        AppendBeatChange(&beatHistory_, MakeBeatChange(beatSimSeconds_, ratioShown_, depthShown_),
-                         kBeatHistoryKeep);
-        beatLastRatio_ = ratioShown_;
-        beatLastDepth_ = depthShown_;
+        TriggerBeatAt(beatSimSeconds_);
+        ++beatCount_;
+    } else if (beatSimSeconds_ - beatBucket_.triggerSeconds >= beatBucket_.periodSeconds) {
+        TriggerBeatAt(beatSimSeconds_);
+        ++beatCount_;
     }
-    beatOffsetDip_ = BeatOffsetPx(beatSimSeconds_, beatHistory_, 1.0);
+    beatOffsetDip_ = BeatOffsetFromBucket(beatSimSeconds_, beatBucket_);
+}
+
+// 触发一拍：采样这一拍的周期与幅度，并把触发时刻记为 at。
+void DisplayedAmount::TriggerBeatAt(double atSeconds) {
+    beatBucket_.triggerSeconds = atSeconds;
+    beatBucket_.periodSeconds = BeatPeriodSeconds(ratioShown_, depthShown_);
+    beatBucket_.amplitudePx = BeatAmplitudePx(ratioShown_, depthShown_);
+    if (g_beatTrace) {
+        std::fprintf(stderr, "[trace] trigger t=%.6f period=%.6f amp=%.6f R=%.6f D=%.6f\n",
+                     atSeconds, beatBucket_.periodSeconds, beatBucket_.amplitudePx, ratioShown_,
+                     depthShown_);
+    }
 }
 
 void SetCurveScrollFrame(int frame) {
@@ -1327,9 +1367,6 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     //   唯一路径（滚动结束不再切到另一条静止路径，那正是"结束时跳一行"的来源）。
     //   所以未滚动时也必须给值，否则轮子按 0 算、画面上会变成 00.00。
     //   轮子自然停在整行上，与静止状态逐像素一致。
-    if (haveNumber) {
-    } else {
-    }
     return f;
 }
 
@@ -1377,6 +1414,8 @@ bool TextEnabled() { return TextLayerEnabled(); }
 
 void SetAmbienceFrozen(bool on) { AmbienceFrozenFlag() = on; }
 bool AmbienceFrozen() { return AmbienceFrozenFlag(); }
+
+void SetBeatTrace(bool on) { g_beatTrace = on; }
 
 // --ambience-glide=N：跑 N 帧真实的氛围推进。见头文件里的理由（量重烘代价）。
 // ★ 轨迹：前 25% 帧 R 从 0 爬到 1（余额刚掉一截），余下 75% 帧 R 从 1 落回 0

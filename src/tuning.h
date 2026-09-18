@@ -204,7 +204,7 @@ inline constexpr float kEdgeTextColorB = 0xb7 / 255.0f;
 inline constexpr float kBorderColorR = 0xaf / 255.0f;
 inline constexpr float kBorderColorG = 0xb2 / 255.0f;
 inline constexpr float kBorderColorB = 0xb7 / 255.0f;
-inline constexpr float kBorderWidthDip = 4.0f;
+inline constexpr float kBorderWidthDip = 2.0f;
 
 // ---- 氛围曲线（规格 §3 的显示层）----
 // 颜色仍是边缘文字那个中性色，透明度仍是氛围档（规格 §3 没让改，保持原样）。
@@ -340,19 +340,27 @@ inline constexpr float kGlowInD = 0.00f;    // D = 1 时暗掉的比例
 // 所以朝基准蓝混一点点，让它读成"冷光"。
 inline constexpr float kGlowInD1Warm = 0.00f;
 
-// ---- 5.6 颜色与强度的缓动 ----
-// 颜色逐通道缓动：外观旋钮，与数字滚动共用同一套"帧号 k 的纯函数"手感。
-// ★ rate 是**每帧**系数（窗口垂直同步，约 60 帧/秒），与 kRollRate 同风格。
-//   c > 1 起步更快（颜色比数字更早看得出来）。
-inline constexpr float kAmbienceColorRate = 0.975f;
-inline constexpr float kAmbienceColorC = 10.0f;
-// 某个通道的残差小于它就吸附到目标（免得末位永远差一点点）。单位 0..1。
-inline constexpr float kAmbienceColorSnap = 0.002f;
-// 蒙光强度的缓动时间常数（秒）。与设计 §9.6「光晕透明度 1.5 s」同一个数。
-// ★ 强度与颜色分开：颜色逐帧自乘（纯帧号函数），强度用连续解 exp(-dt/τ)。
+// ---- 5.6 剧烈程度 R 的恢复速度（所有者 2026 定的模型）----
+//  R(t) = kAmbienceDecayA ^ t        t 的单位是**分钟**
+//  每帧 t += dt；刷新时若 R_new > R(t)，则令 t = ln(R_new) / ln(a)。
+//  于是 R 的响应永远是"跳上去、然后自己慢慢落回来"，不需要任何逐通道缓动：
+//  颜色本身就是 R(t)、D 的纯函数。
+//
+//  ★ 这是**唯一**描述"剧烈之后多久平静下来"的数。取 a = 0.5 就是"半衰期恰好 1 分钟"：
+//      R 半衰期   = ln 2 / (-ln a) = 1.0 分钟
+//      R 时间常数 = 1 / (-ln a)    = 1.4427 分钟（R 落到 1/e）
+//      一帧（1/60 s）的衰减系数 = exp(ln a / 3600) = 0.9998075
+//    想要"平静得更快"就取 0.1（半衰期 18.1 秒），想要"余韵更长"就取 0.8（半衰期 3.1 分钟）。
+//  必须严格落在 (0,1)：a >= 1 时 R 不衰减（颜色永远停在血色），a <= 0 无意义。
+inline constexpr double kAmbienceDecayA = 0.5;
+// 每帧推进的 dt 上限（秒）。与 kRateSpringMaxDtSeconds 同一个值、同一个理由：
+// 休眠唤醒后第一帧 dt 巨大，动画会一步跳到位。R 的衰减与蒙光强度的缓动共用它。
+inline constexpr double kAmbienceDtMaxSeconds = 0.05;
+
+// ---- 5.7 蒙光强度的缓动 ----
+//  ★ 只有**强度**还在缓动，颜色不缓动（颜色的平滑由 5.6 的 R(t) 负责）。
+//  强度用连续解 exp(-dt/τ)，与帧率无关；dt 用上面那个上限。τ = 1.5 s 是设计里
+//  "光晕透明度 1.5 s"那个数。
 inline constexpr float kGlowInTauSeconds = 1.5f;
-// 缓动每步的 dt 上限（秒）。与 kRateSpringMaxDtSeconds 同一个值、同一个理由：
-// 休眠唤醒后第一帧 dt 巨大，动画会一步跳到位。
-inline constexpr double kAmbienceMaxDtSeconds = 0.05;
 
 }  // namespace dshb

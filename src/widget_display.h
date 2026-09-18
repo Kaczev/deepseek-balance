@@ -70,15 +70,16 @@ double BalanceDepth(double balanceYuan);
 // 这是"未降饱和"的那个颜色。**任何一帧的最终颜色都必须从它算起。**
 AmbienceColor AmbienceBase(double ratio);
 
-// 第二步 + 第三步：把 C_0 的**饱和度**乘 (1 - depth)，R=G=B 不变（色相与明度不动）。
-// ★★ 这是本模块最容易做错的一处：饱和度必须**永远从本帧未降饱和的 C_0** 算。
-//     若从上一帧已经降过饱和的颜色再降一次，D 会在每帧自我累积，
-//     几秒内整条曲线褪成灰色（施工单特别点名）。
-//  depth >= 1 时得到的是 (v,v,v)，v = C_0 的明度；此时按 kGlowInD1Warm
+// 第二步（也是最后一步）：把 C_0 的**饱和度**乘 (1 - depth)，R=G=B 不变（色相与明度不动）。
+// ★★ 饱和度必须**永远从本帧未降饱和的 C_0** 算：若从上一帧已经降过饱和的颜色再降一次，
+//     D 会在每帧自我累积，几秒内整条曲线褪成灰色。
+// depth >= 1 时得到的是 (v,v,v)，v = C_0 的明度；此时按 kGlowInD1Warm
 //  朝基准蓝混一点点，免得纯中性灰在近黑底上读成"玻璃上的灰"（"E 蒙光.md" §5）。
 AmbienceColor DesaturateTowards(const AmbienceColor& base, double depth);
 
-// 两步合起来：目标颜色 = DesaturateTowards(AmbienceBase(ratio), depth)。
+// 合成：C = DesaturateTowards(AmbienceBase(ratio), depth)。
+// ★ 这就是**最终要画的颜色本身**：调用方直接把它交给渲染层，之后不再有缓动。
+//   平滑发生在 ratio 一侧 —— R(t) = kAmbienceDecayA^t 是连续衰减的（见 tuning.h 5.6）。
 AmbienceColor AmbienceTargetColor(double ratio, double depth);
 
 // 颜色管线的一句自检（不需要窗口、不需要渲染）：把 (ratio, depth) 算成颜色，
@@ -170,29 +171,28 @@ public:
     double rateDisplay() const { return rateDisplay_; }
 
     // ---- 氛围（"E 蒙光.md" §3）：R / D / 最终颜色 ----
-    // ★ R 与 D 是**纯函数**（SeverityRatio / BalanceDepth）的逐帧求值结果：
-    //   输入是曲线存储里"当前显示币种"的最近两个点、以及当前显示的余额。
-    //   它们每帧重算，不缓存、不递推 —— 于是不存在"脏了忘了刷"的状态。
-    double ambienceRatio() const { return ambienceRatio_; }
+    // ★ R 不是纯函数：它是**时间**的纯函数 R(t) = kAmbienceDecayA^t（t 以分钟计，
+    //   每帧 t += dt）。D 才是纯函数（BalanceDepth，余额的纯函数）。
+    //   数据里算出来的那个值（= 刷新时 R 应当跳到的高度）由 ambienceRatioTarget() 给。
+    // 本帧刷新的目标高度：clamp(min{max(s, 2B), 0} / 2B, 0, 1)，s = 最近一步的元/分钟。
+    double ambienceRatioTarget() const { return ambienceRatioTarget_; }
     double ambienceDepth() const { return ambienceDepth_; }
     // 本帧**应当显示**的低余额程度（含"读不到余额按 D=1"这条状态规则）。
     double ambienceDepthShown() const { return depthShown_; }
-    // 本帧**应当显示**的 R（读不到余额时为 0，"E 蒙光.md" §3.3）。
+    // 本帧**实际显示**的 R = R(t)。t 只由帧 dt 推进、由刷新抬升（见 .cpp 的模型说明）。
     double ambienceRatioShown() const { return ratioShown_; }
-    // 逐通道缓动之后、真正画上去的颜色（0..1 直通分量）。
+    // 本帧真正画上去的颜色（0..1 直通分量）。★ 它**就是**公式的直接输出，没有缓动。
     const AmbienceColor& ambienceColor() const { return ambienceColor_; }
-    // 本帧的颜色目标（未缓动）。导出/探针要对账时用它。
-    const AmbienceColor& ambienceTargetColor() const { return ambienceTarget_; }
     // 蒙光强度倍率 k(R,D)，范围 (0, 1.0]。
     float ambienceIntensity() const { return glowIntensity_; }
-    // 本帧心跳位移（DIP，> 0 = 往下）。纯函数 BeatOffsetPx 的输出，本层不做任何平滑。
+    // 本帧心跳位移（DIP，> 0 = 往下）。BeatOffsetFromBucket 的输出，本层不做任何平滑。
     double beatOffsetDip() const { return beatOffsetDip_; }
     // 心跳的仿真时刻（秒）。暂停冻结时**不推进**，于是位移自然停住。
     double beatSimSeconds() const { return beatSimSeconds_; }
-    // 已经记下几次"余额变化"（诊断用：正常只会用到最后一条）。
-    std::size_t beatChangeCount() const { return beatHistory_.size(); }
-    // 导出夹具：把心跳的仿真时刻直接放到 k/60 秒，于是"第 k 帧的位移"可单独导出。
-    //  与 SetCurveScrollFrame 同一套惯例（帧状态是 k 的纯函数，不必连跑 k 帧）。
+    // 已经触发过几拍（诊断用）。第一帧就触发第一拍，所以正常从 1 起。
+    std::size_t beatCount() const { return beatCount_; }
+    // 导出夹具：把心跳的仿真时刻放到 k/60 秒，并按计时器重新走一遍（于是"第 k 帧的位移"
+    // 可单独导出，与真跑 k 帧等价）。与 SetCurveScrollFrame 同一套惯例。
     void SetBeatSimFrame(int frame);
     // 余额读不到（= 按 D=1 且取"甲"）—— 供诊断与验收断言用。
     bool ambienceUnreadable() const { return ambientUnreadable_; }
@@ -290,7 +290,7 @@ private:
     // 速率：每帧从曲线存储重算一次，再按帧的 dt 走一步弹簧（见头文件上面那一段）。
     void AdvanceRate(double dtSeconds);
 
-    // 氛围：每帧重算 (R, D) 与目标颜色，再逐通道缓动一步（见下面的 ★ 段）。
+    // 氛围：推进 R 的衰减时间、按状态规则决定 (R, D)、算出颜色与强度（见 .cpp 的模型说明）。
     void AdvanceAmbience(double dtSeconds);
 
     // 曲线存储里"当前显示币种"的最近一步（元/分钟）。没有可用的两步时返回 0。
@@ -302,35 +302,40 @@ private:
     double ambienceGivenDepth_ = 0.0;
 
     // --- 氛围的逐帧状态 ---
-    // ambienceRatio_ / ambienceDepth_ 是"从数据算出来的"（纯函数输出，只读）；
+    // ambienceRatioTarget_ 是"数据这一次给出的高度"（纯函数输出，只读）；
+    // ambienceRatio_ 是本帧实际的 R = R(t)（由 ambienceSeconds_ 导出）。
     // ratioShown_ / depthShown_ 是"按状态规则该显示的"（读不到 -> R=0, D=1）。
-    double ambienceRatio_ = 0.0;
+    double ambienceRatioTarget_ = 0.0;
     double ambienceDepth_ = 0.0;
+    double ambienceRatio_ = 0.0;
     double ratioShown_ = 0.0;
     double depthShown_ = 0.0;
     bool ambientUnreadable_ = false;
-    AmbienceColor ambienceTarget_{};    // 本帧目标（未缓动）
-    AmbienceColor ambienceColor_{};     // 本帧实际画上去的
-    bool ambienceSeeded_ = false;       // 有没有起点（没有时第一次直接落位到目标）
+    AmbienceColor ambienceColor_{};     // 本帧的颜色 = 公式的直接输出
     float glowIntensity_ = kGlowInK0;   // k(R,D)
-    bool glowSeeded_ = false;           // 强度有没有起点（同上）
-    // 每个通道一条"每帧自乘的残差"：与自己上一帧的值相乘 = rate^k。
-    // ★ 与数字滚动同一套手感（kRollRate / kRollCurveC），但它只属于颜色。
-    float ambDcR_ = 0.0f;               // 逐通道颜色残差（**故意不叫 D**：
-    float ambDcG_ = 0.0f;               // 全局的 D 是死态程度，两者绝不能混）
-    float ambDcB_ = 0.0f;
-    int ambienceFrames_ = 0;            // k：颜色缓动的帧号（幂的指数）
+    bool glowSeeded_ = false;           // 强度有没有起点（没有时第一次直接落位）
+    // R 的衰减时间（分钟）：R(t) = kAmbienceDecayA ^ ambienceSeconds_。
+    // ★ 唯一的递推状态就是它，而且只加不减（刷新时是**抬高** t 让 R 跳上去）。
+    //   它在"颜色链路"上扮演的角色，等于 kRollRate 那条自乘残差在数字滚动里的角色。
+    double ambienceSeconds_ = 0.0;
 
-    // --- 心跳的逐帧状态（模块本身无状态，状态全在这里）---
-    //  simSeconds：单调仿真时间（暂停时不推进）；history：每次余额变化追加一条。
-    std::vector<BeatChange> beatHistory_;
+    // --- 心跳（模块本身无状态，状态全在这里）---
+    //  模型（2026-09-18）：**一个计时器 + 一拍包络**。没有历史、没有相位、没有缓动。
+    //   beatBucket_ 存的就是"这一拍的触发时刻 / 周期 / 幅度"这三个数；
+    //   周期与幅度都在**触发那一刻**由当时的 (R, D) 采样，整拍不变。
+    //   beatSeeded_ 只表示"第一拍已经触发过"，于是第一帧就跳一次（而不是等一个周期）。
+    BeatBucket beatBucket_{};
+    bool beatSeeded_ = false;
     double beatSimSeconds_ = 0.0;
     double beatOffsetDip_ = 0.0;
-    bool beatSeeded_ = false;
-    double beatLastRatio_ = 0.0;    // 上次追加时的 R/D，用来判断"又变化了一次"
-    double beatLastDepth_ = 0.0;
-    // 每帧推进心跳：推进仿真时间（冻结时不动）、必要时追加一条变化、再求位移。
+    std::size_t beatCount_ = 0;
+    // 每帧推进心跳：推进仿真时间（冻结时不动）、必要时触发下一拍、再求这一拍的位移。
     void AdvanceBeat(double dtSeconds);
+    // 触发一拍（把触发时刻记为 at，并按当时的 R/D 采样这一拍的周期与幅度）。
+    // ★ 只写状态、不算位移：位移一律由 AdvanceBeat 在每帧末尾算一次（单一来源）。
+    void TriggerBeatAt(double atSeconds);
+    // 本帧该显示的 (R, D)：状态规则 + 两个夹具的覆盖，**只在这里**决定（见 .cpp 的说明）。
+    void ApplyShownState();
 
     RateEstimate rateEstimate_;   // 最近一次 EstimateRate 的结果（纯函数输出）
     double rateDisplay_ = 0.0;    // rate_display：被弹簧平滑过的速率，元/分钟
@@ -454,6 +459,10 @@ bool TextEnabled();
 //   恢复后再导一帧不同"。
 void SetAmbienceFrozen(bool on);
 bool AmbienceFrozen();
+
+// --beat-trace：每一拍触发时往 stderr 打一行（触发时刻 / 这一拍的周期与幅度）。
+//   计时器是有状态的，而一帧的位移看不出"这是第几拍"；要留痕就得在触发处打。
+void SetBeatTrace(bool on);
 
 // --ambience-glide=N：跑 N 帧**真实的**氛围推进（每帧 1/60 秒），其间 R 走一条
 //   真实会发生的轨迹：0 -> 1（余额突然掉一截，剧烈程度拉满）-> 再回落到 0。

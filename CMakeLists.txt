@@ -76,13 +76,15 @@ add_executable(rateprobe tools/rateprobe.cpp src/rate_estimator.cpp src/amount.c
 target_compile_definitions(rateprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(rateprobe PRIVATE src)
 
-# beat probe: the heartbeat displacement waveform (src/heartbeat.h/.cpp) -- peak to peak,
-# per-frame jump, phase continuity, rise time, determinism and recovery. The waveform is a
-# pure function of (seconds, history, fade), so this target needs only src/heartbeat.cpp;
-# psapi is the one extra library, for the working-set readout of the probe's own K table.
-# Offline, no store, no network, no widget, and its own main() so the widget's argument
-# parsing stays untouched.
+# beat probe: the heartbeat displacement waveform (src/heartbeat.h/.cpp) -- envelope shape,
+# per-frame jump, the amplitude and period laws, and the timer's trigger behaviour.
+# The waveform and both laws are pure functions of (seconds, that beat), so this target needs
+# only src/heartbeat.cpp: the module now has no static state and no integral table, so neither
+# psapi nor any extra library is needed. Offline, no store, no network, no widget, and its own
+# main() so the widget's argument parsing stays untouched.
+# ★ It cannot cover the production trigger loop (that lives in widget_display.cpp's AdvanceBeat,
+#   which this target does not link): the timer is replicated here as a fixture, and the real
+#   loop is verified from the widget with --beat-frame + the [beat] log line.
 add_executable(beatprobe tools/beatprobe.cpp src/heartbeat.cpp)
 target_compile_definitions(beatprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(beatprobe PRIVATE src)
-target_link_libraries(beatprobe PRIVATE psapi)

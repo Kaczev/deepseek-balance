@@ -192,6 +192,27 @@ double NowWallMs() {
     return static_cast<double>(static_cast<int64_t>(u.QuadPart / 10000ULL) - 11644473600000LL);
 }
 
+// 导帧的**氛围**诊断（与下面那个 [frame] 同一条理由：导帧进程没有控制台，PNG 里的颜色
+// 又要量像素才读得回来，所以把这一帧实际用的 R/D/颜色/强度逐字写进日志）。
+//
+// ★ 为什么这一行必须存在：R 现在是**时间**的量（R(t) = kAmbienceDecayA^t），而"时间走了
+//   多久"只有真的跑过帧循环才知道。没有它，验证就只能靠另写一份同样的公式做模拟 ——
+//   那样量到的是模拟，不是屏幕。这一行打印的是**这个进程真正拿去画的那几个数**。
+namespace {
+
+// 颜色分量 -> "#rrggbb"（与显示层 HexOf 同一口径：v*255 + 0.5 取整）。
+std::wstring AmbienceHex(const dshb::AmbienceColor& c) {
+    auto byte = [](float x) {
+        const float v = (x < 0.0f) ? 0.0f : ((x > 1.0f) ? 1.0f : x);
+        return static_cast<int>(v * 255.0f + 0.5f);
+    };
+    wchar_t buf[16];
+    swprintf_s(buf, L"#%02x%02x%02x", byte(c.r), byte(c.g), byte(c.b));
+    return buf;
+}
+
+}  // namespace
+
 // 浮层用的 ASCII 状态名。**不走运行时编码转换**：调一次 WideCharToMultiByte
 // 看着省事，但在"图省事"的地方出错最难查。这里直接映射，一目了然。
 const char* ConnStateNameUtf8(dshb::ConnState s) {
@@ -526,9 +547,12 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // "滚动中的第 k 帧"可以用 --export-frame=1 直接导出来（不需要连画 k 帧）。
             g_curveFrame = _wtoi(argv[i] + 14);
         } else if (wcsncmp(argv[i], L"--beat-frame=", 13) == 0) {
-            // 导帧夹具：心跳位移是 (仿真时间, 变化历史) 的纯函数，把时间放到 k/60 秒，
-            // "第 k 帧的位移"就能单独导出（不必连跑 k 帧）——与 --curve-frame 同一套惯例。
+            // 导帧夹具：位移是 (仿真时刻, 这一拍) 的纯函数。把仿真时刻放到 k/60 秒、并按
+            // 计时器重新走一遍，"第 k 帧的位移"就能单独导出（不必连跑 k 帧）——与
+            // --curve-frame 同一套惯例。
             g_beatFrame = _wtoi(argv[i] + 13);
+        } else if (wcscmp(argv[i], L"--beat-trace") == 0) {
+            dshb::SetBeatTrace(true);   // 每拍触发往 stderr 打一行（计时器是有状态的）
         } else if (wcsncmp(argv[i], L"--history-demo=", 15) == 0) {
             g_historyDemo = _wtoi(argv[i] + 15);
         } else if (wcscmp(argv[i], L"--curve-selftest") == 0) {
@@ -1152,9 +1176,20 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         if (g_beatFrame >= 0) g_display.SetBeatSimFrame(g_beatFrame);
         g_display.Update(0.0);
         if (g_beatFrame >= 0) {
-            SelfTestLog(L"[beat] frame=%d sim=%.4f dip=%.4f changes=%d",
+            SelfTestLog(L"[beat] frame=%d sim=%.4f dip=%.4f beats=%d",
                         g_beatFrame, g_display.beatSimSeconds(), g_display.beatOffsetDip(),
-                        static_cast<int>(g_display.beatChangeCount()));
+                        static_cast<int>(g_display.beatCount()));
+        }
+        // 氛围：这一帧真正拿去画的 R/D/颜色/强度（见 AmbienceHex 上面的理由）。
+        //   ratio= 是**实际显示**的 R(t)，ratio_new= 是数据这一次给的高度（未衰减的那个）。
+        {
+            const std::wstring hex = AmbienceHex(g_display.ambienceColor());
+            SelfTestLog(L"[ambience] ratio_new=%.6f ratio=%.6f depth=%.6f color=%ls "
+                        L"intensity=%.6f unreadable=%d",
+                        g_display.ambienceRatioTarget(), g_display.ambienceRatioShown(),
+                        g_display.ambienceDepthShown(), hex.c_str(),
+                        static_cast<double>(g_display.ambienceIntensity()),
+                        g_display.ambienceUnreadable() ? 1 : 0);
         }
         // 组装正文（和真实运行时同一条路径），这样导出的图就是屏幕上会看到的图
         {

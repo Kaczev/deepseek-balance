@@ -1,43 +1,68 @@
-// beatprobe -- offline proof for the heartbeat displacement waveform
-//             (src/heartbeat.h/.cpp).
+// ===========================================================================
+//  beatprobe.cpp —— 心跳位移波形的离线证明（src/heartbeat.h/.cpp）
+// ===========================================================================
 //
-//   beatprobe            run every check (the default)
-//   beatprobe --verbose  also print a sampled beat
+//  怎么跑：
+//      beatprobe             跑全部检查（默认，无参数）
+//      beatprobe --verbose   另外打印一段采样波形（一拍之内每 16 个采样点一格）
 //
-// No clock, no file, no shared state: the waveform is a pure function of
-// (simulated seconds, history, fade), so this tool needs nothing but synthetic
-// history. It creates no file at all -- in particular it never touches
-// %LOCALAPPDATA%\deepseek-balance\curve.json.
+//  输出契约（与 rateprobe / storeprobe 同形）：一行一个检查，
+//      PASS: caseN | 标题 | 数字
+//  任何一行 FAIL 都让退出码非 0；全过时最后两行是
+//      N passed, 0 failed
+//      beatprobe: ALL PASS
+//  ★ 每条检查都把**判过的数字**印出来（峰位与极值个数、最坏跳变和它出现在哪个相位、
+//    四个角、斜率和中点的偏差、触发时刻表、间隔区间、残余量……）。
+//    只印 PASS 不印数字的检查，读报告的人只能信、不能读。
 //
-// Output contract (same shape as rateprobe/storeprobe): one line per acceptance
-// item, each line starting with "PASS: " or "FAIL: ". Exit code is 0 only when
-// every line is a PASS.
-// ★ Every check prints the NUMBERS it judged -- peaks, extremum counts, the
-//   worst observed frame jump and the phase it happened at, frequencies, the
-//   rise duration -- so the report can be READ, not merely trusted.
-//   A check that only printed PASS would be worth nothing.
+//  ---------------------------------------------------------------------------
+//  ★ 本探针量得到什么
+//  ---------------------------------------------------------------------------
+//    · src/heartbeat.cpp 的**波形**：包络 Shape(τ)（一拍内恰好一个局部极大、零个局部极小）、
+//      峰值恰好在 τ = μ 处为 1.0、τ ∉ [0, kBeatLen] 时**恰好 0**、kBeatLen 处的末端残留；
+//    · **两条律**：幅度律 A(R,D) 与周期律 T(R,D)（网格对公式、四个角、对 R 与 D 线性、夹取）；
+//    · **计时规则**：把两条律接起来的那条触发判据（在探针里用夹具复刻，见 BeatFixture）。
 //
-// 施工单要求的六项，逐条对应（编号就是下面 case 的编号）：
-//   (0) 自检：一条故意失败的检查必须真的失败
-//   (1) 一拍的峰峰值 + 局部极大/极小的**个数**（必须恰好一个包络）
-//   (2) 单帧最大跳变占幅度的百分比，扫遍起始相位，三种工况 R=0/D=0、
-//       R=0.5/D=0.5、R=1/D=0 —— 必须 <= 35%
-//   (3) 相位连续性：F 变化那一刻与朴素 sin(2*pi*F*t) 的对照
-//   (4) 上升段耗时（毫秒与帧数）
-//   (5) 确定性：同一 (t, history, fade) 反复求值一致
-//   (6) 恢复：经过 T_rec 后频率回到 F_0_min
+//  ---------------------------------------------------------------------------
+//  ★ 本探针量不到什么（别把这份证据读大了）
+//  ---------------------------------------------------------------------------
+//    · 生产层那个每帧真的在跑的计时循环：它在 src/widget_display.cpp 的
+//      AdvanceBeat / SetBeatSimFrame 里，而本目标只链 src/heartbeat.cpp。
+//      这里只是把**同一条规则**复刻成夹具跑一遍（规则一致，代码不是同一份）；
+//      生产循环由主代理用 `--beat-frame` 导帧 + [beat] 日志验证，那是另一条证据。
+//    · 窗口位移、命中测试跟着 Δ 平移、SetWindowRgn 的行程 —— 都不在本文件里。
+//    · (τ−μ) 到底是不是用 fma 算的：fma 与朴素减法的差别在本参数下只有 1e-16 量级，
+//      对形状的影响低于任何可打印的位数（见 case7b 的说明）。探针量得出来的是**门闸**
+//      有没有加 —— 那个能把 τ≈0 处整块砍成 0。
 //
-// 另有四条自己加的守门检查，因为它们是上一轮真正踩过 / 最容易再踩的坑：
-//   (2b) 把脉冲中心放回 t=0 会怎样（100% 跳变的直接证据）
-//   (6b) T_rec = 0 表示"无需恢复"：频率停在 F2，**不是** F_0_min
-//   (7)  静默段恰好 0、且两次搏动之间真的回得到 0（不重叠）
-//   (8)  相位"以拍为单位"确实成立：F 恒定时第 n 次 onset == n / F
-//   (9)  fade 只缩放位移，**不碰相位**
+//  ★ 本探针不读时钟、不写文件、不碰 %LOCALAPPDATA%、不碰 src/ 的任何东西。
+//    （上一版还读 psapi 的工作集，为的是量那张 0.19 MB 的 K 积分表；新模型里模块
+//      连一个 static 都没有、那张表不存在了，工作集读数没有对象可量，所以连同
+//      <psapi.h> 一起删掉 —— CMakeLists 不动，psapi 留着不链也不影响。）
+//
+//  ---------------------------------------------------------------------------
+//  检查清单（编号就是下面 case 的编号）
+//  ---------------------------------------------------------------------------
+//    case0   自检：一条故意失败的检查真的会被格式化成 FAIL 行、真的被计数
+//    case1   包络：1 个极大 / 0 个极小、峰值 1.0（τ=μ 处，A_max 下 5 px）、
+//            区间外恰好 0（−1e-9 与 kBeatLen+1e-9 两点）、kBeatLen 处的残留
+//    case2   单帧最大跳变：1200 起始相位 × 24 帧，占幅度的百分比 ≤ 35%（三种工况）
+//    case3   幅度律：49 点网格对公式、四个角 3/5/1/3、对 R 与 D 线性、夹到 [0,1]
+//    case4   周期律：同上，四个角 15/0.5/30/15.5
+//    case5a  计时：固定 (R,D) 跑 N 秒，触发次数 = 1 + floor(N/T)，节拍时刻印出来
+//    case5b  计时：一帧拉成 3T / 7T 只触发一次，不补拍
+//    case5c  计时：周期中途变化 -> 整拍不变、时刻不回退、不重复触发、τ 不为负
+//    case5d  计时：静默窗口里位移恰好 0；且 T_min > kBeatLen（两拍不叠的前提）
+//    case6   确定性：同一 (now, bucket) 逐位相同、同一初始状态重建逐位相同、
+//            位移与绝对时间原点无关
+//    case7a  守门：两个中心都在 95 ms（把第一个中心放回 0 -> 首帧跳变 73.5% 的对照）
+//    case7b  守门：脉冲不分段、无门闸（朴素门闸写法在 τ→0 返回 0，正确值 0.1645/0.2048）
 #include "heartbeat.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -46,58 +71,45 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#include <psapi.h>
 #endif
 
 namespace {
 
-using dshb::BeatChange;
+using dshb::BeatBucket;
 using dshb::BeatOnset;
 
-constexpr double kHz = 60.0;      // 采样帧率（与 kBeatFrameHz 同源）
-constexpr double kFrame = 1.0 / kHz;
-constexpr double kPi = 3.14159265358979323846;
+// 帧长：从模块的 kBeatFrameHz 推，不要自己写 0.0166…（那是把常量抄一份到探针里）。
+constexpr double kFrame = 1.0 / dshb::kBeatFrameHz;
 
-// 合成历史的时间原点。刻意取一个大数，让探针自身与 t=0 的边界无关。
+// 合成时间原点。位移是 (now − trigger) 的纯函数，换个原点必须给同一个值 —— case6 量这条。
 constexpr double kT0 = 1000.0;
 
-// ===========================================================================
-// Measured memory (NOT an element-count estimate)
-// ===========================================================================
-//  ★ 施工单要求用**实测**而不是按元素个数估算。这里读 GetProcessMemoryInfo 的
-//    WorkingSetSize（物理内存里真实驻留的量）。
-//
-//    编排上有个关键点：K 表是**函数内 static、惰性构造**的，所以进程刚起来时
-//    它还不存在。于是"跑检查之前 / 跑完检查之后"两次读数之差，就是这张表这次
-//    运行真的多占了多少物理内存 —— 不是估算，是实测。
-std::size_t WorkingSetBytes() {
-#ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS pmc{};
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
-        return static_cast<std::size_t>(pmc.WorkingSetSize);
-    }
-#endif
-    return 0;
-}
+// 包络采样率（Hz）。480 Hz 扫 [0, kBeatLen]：165 格、166 个点，最后一点在 343.75 ms，
+// 全部落在区间**内部**；比 60 Hz 的渲染网格密 8 倍，足够把"一个极大"数清楚，
+// 又不必用解析导数（上一版手写解析导数连错两次）。
+constexpr double kEnvelopeHz = 480.0;
 
-std::string HumanBytes(std::size_t b) {
-    char buf[96];
-    std::snprintf(buf, sizeof(buf), "%zu B (%.2f MiB)", b,
-                  static_cast<double>(b) / (1024.0 * 1024.0));
-    return buf;
-}
+double Clamp01(double x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); }
 
 // ===========================================================================
-// A deliberately tiny harness (same contract as rateprobe's)
+// 一个很小的 harness（与 rateprobe 的同一份契约）
 // ===========================================================================
 struct Harness {
     int passed = 0;
     int failed = 0;
     std::vector<std::string> failures;
 
-    bool Req(const char* id, const std::string& what, const std::string& evidence, bool ok) {
+    // 组装一行但不打印。自检要用它验证 FAIL 行**长什么样**，又不能真打印一行 FAIL：
+    // 下游是按"行首是 FAIL"读这份输出的，探针自己印一行会被当成一条真失败。
+    std::string Line(const char* id, const std::string& what, const std::string& evidence,
+                     bool ok) const {
         std::string line = std::string(ok ? "PASS: " : "FAIL: ") + id + " | " + what;
         if (!evidence.empty()) line += " | " + evidence;
+        return line;
+    }
+
+    bool Req(const char* id, const std::string& what, const std::string& evidence, bool ok) {
+        const std::string line = Line(id, what, evidence, ok);
         std::printf("%s\n", line.c_str());
         if (ok) {
             ++passed;
@@ -108,8 +120,7 @@ struct Harness {
         return ok;
     }
 
-    // Same bookkeeping, no output: used by the harness self-check so that proving
-    // "a failing check fails" cannot itself print a FAIL line and sink the exit code.
+    // 同样的记账，不打印：自检用来证明"失败的检查会被计数"而不污染输出。
     bool ReqSilent(bool ok) {
         if (ok) {
             ++passed;
@@ -121,506 +132,981 @@ struct Harness {
     }
 };
 
+// ===========================================================================
+// 数字与文本小工具
+// ===========================================================================
 std::string F(double v, int digits) {
-    char buf[72];
+    char buf[96];
     std::snprintf(buf, sizeof(buf), "%.*f", digits, v);
     return buf;
 }
 
-// ===========================================================================
-// Synthetic history
-// ===========================================================================
-std::vector<BeatChange> OneChange(double R, double D) {
-    std::vector<BeatChange> h;
-    dshb::AppendBeatChange(&h, dshb::MakeBeatChange(kT0, R, D));
-    return h;
+std::string I(long long v) { return std::to_string(v); }
+
+// ★ 必须返回 std::string，不能返回 const char*：它总和字符串字面量/其它 std::string 拼在
+//   一起用，而 `"字面量" + (const char*)` 在 C++ 里是指针相加 —— 编译不过（这一版第一次
+//   构建就栽在这里）。
+std::string YN(bool v) { return v ? "yes" : "no"; }
+
+// 逐位相同（含 NaN、±0）：确定性检查要求的是"逐位"，不是"差得很小"。
+bool BitSame(double a, double b) {
+    std::uint64_t ua = 0;
+    std::uint64_t ub = 0;
+    std::memcpy(&ua, &a, sizeof(ua));
+    std::memcpy(&ub, &b, sizeof(ub));
+    return ua == ub;
 }
 
-// 变化发生在 tChange，之前的历史在更早处（保证 tChange 之前频率已是常态）。
-std::vector<BeatChange> ChangeAt(double tChange, double R, double D) {
-    std::vector<BeatChange> h;
-    dshb::AppendBeatChange(&h, dshb::MakeBeatChange(tChange - 600.0, 0.0, 0.0));
-    dshb::AppendBeatChange(&h, dshb::MakeBeatChange(tChange, R, D));
-    return h;
-}
-
-//  ★ 注意大小写：参数是 D（死态程度），局部必须叫别的名字。
-//    写成 `const double d = D < 0.0 ? ... ` 会**遮蔽参数**、用未初始化的 d 去比较
-//    （MSVC 的 C4700 抓到了这个）。编译器的警告在这里确实救了命，别忽略它。
-double AmpOf(double D) {
-    const double dc = D < 0.0 ? 0.0 : (D > 1.0 ? 1.0 : D);
-    return dshb::kBeatAMax + (dshb::kBeatAMin - dshb::kBeatAMax) * dc;
-}
-
-// 一次变化之后，**下一拍** onset 的绝对时刻。
-// 用 CurrentBeatOnset 反解：φ 单调增，所以"给定一个时刻、它属于哪一拍"是纯函数。
-//
-//  ★ 关键：目标整数是"变化时刻之后**第一次**跨过的那个整数"，不是 1。
-//    探针用 ChangeAt() 造的历史里，变化之前还有一条更早的条目，
-//    所以 φ(tChange) 早就 > 1 了（可能是 10、11...）。第一版写死找 φ >= 1，
-//    于是在这种历史下**立刻就成立**、直接把近似值当成 onset 返回，
-//    后面所有量出来的东西全错（case4 的 onset 值因此印成 0.0000 px）。
-double OnsetAbsolute(double tChange, double R, double D) {
-    const std::vector<BeatChange> h = ChangeAt(tChange, R, D);
-    const double phiAtChange = dshb::BeatPhaseBeats(tChange, h);
-    double guess = 1.0 / dshb::BeatF1(R);
-    for (int i = 0; i < 400; ++i) {
-        if (dshb::BeatPhaseBeats(tChange + guess, h) > std::floor(phiAtChange) + 1.0) break;
-        guess *= 1.1;
+// 时刻表：少于 head+tail+1 个就全列，否则列头 head 个 + 尾 tail 个。
+std::string Times(const std::vector<double>& v, std::size_t head, std::size_t tail) {
+    const std::size_t n = v.size();
+    const std::size_t h = n < head ? n : head;
+    std::string out = "[";
+    for (std::size_t i = 0; i < h; ++i) {
+        if (i != 0) out += ", ";
+        out += F(v[i], 6);
     }
-    const BeatOnset o = dshb::CurrentBeatOnset(tChange + guess, h);
-    if (!o.valid) return tChange;
-    return o.atSeconds;
+    const bool truncated = n > head + tail + 1;
+    const std::size_t t = truncated ? tail : (n - h);
+    if (truncated) {
+        out += ", ..., 共 " + I(static_cast<long long>(n)) + " 个, ..., ";
+    } else if (t != 0) {
+        out += ", ";
+    }
+    for (std::size_t i = n - t; i < n; ++i) {
+        if (i != n - t) out += ", ";
+        out += F(v[i], 6);
+    }
+    out += "]";
+    return out;
 }
 
-//  ★★ OnsetAbsolute 是**二分**出来的，返回值可能落在真实整数穿越的**左侧**
-//    相差约 1e-16 s。在那个点上 floor(φ) 仍是上一拍、BeatOffsetPx 返回 0 ——
-//    于是"onset 处的位移"会被印成 0.0000 px（而不是 1.0241 px），整条上升段也跟着错。
-//    所以**量波形**时统一往后让开 1e-9 s（远大于 1e-16，又远小于任何有意义的时间）。
-//    （跳变扫描不用让：那里本来就要求 τ > 0。）
-double OnsetForSampling(double tChange, double R, double D) {
-    return OnsetAbsolute(tChange, R, D) + 1e-9;
+// ===========================================================================
+// 夹具：把 widget_display.cpp 的计时规则复刻一遍
+// ===========================================================================
+//  每帧的顺序与生产层逐条一致：
+//      1. 推进仿真时钟：now += dt
+//      2. elapsed = now - trigger
+//      3. if (elapsed >= period) { trigger = now;
+//                                   period = BeatPeriodSeconds(R, D);
+//                                   amplitudePx = BeatAmplitudePx(R, D); }
+//      4. y = BeatOffsetFromBucket(now, bucket)
+//  第一拍在 t = 0 触发（TriggerFirstBeatIfNeeded），周期与幅度按**当帧**的 (R, D) 采样。
+//  ★ 一帧最多触发一次：迟到的帧**不补拍**（生产层也没有补齐的代码，这是 case5b 的规则）。
+//  ★ period / amp 在触发那一刻采样、整拍不变：R 每帧都在衰减，若每帧重算 T，
+//    "已经等了多久"和"要等多久"会同时变，参照系自己会动（case5c 量这条）。
+struct Tick {
+    double t = 0.0;        // 这一帧的仿真时刻
+    double tau = 0.0;      // 这一帧的 elapsed
+    double y = 0.0;        // 这一帧的位移（px）
+    double period = 0.0;   // 这一帧生效的周期（bucket 里那个）
+    bool fired = false;    // 这一帧触发了没有
+};
+
+struct BeatFixture {
+    BeatBucket bucket;
+    double now = 0.0;
+    int triggers = 0;
+    double seedPeriod = 0.0;   // 第一拍采样到的周期（后面各拍从 Tick::period 取）
+    std::vector<double> triggerTimes;
+    double minTau = 1e300;     // 全程出现过的最小 elapsed
+
+    void Seed(double R, double D) {
+        bucket = BeatBucket{};
+        bucket.triggerSeconds = 0.0;
+        bucket.periodSeconds = dshb::BeatPeriodSeconds(R, D);
+        bucket.amplitudePx = dshb::BeatAmplitudePx(R, D);
+        now = 0.0;
+        triggers = 1;
+        seedPeriod = bucket.periodSeconds;
+        triggerTimes.assign(1, 0.0);
+        minTau = 1e300;
+    }
+
+    Tick Step(double dt, double R, double D) {
+        now += dt;
+        Tick k;
+        k.t = now;
+        if (now - bucket.triggerSeconds >= bucket.periodSeconds) {
+            bucket.triggerSeconds = now;
+            bucket.periodSeconds = dshb::BeatPeriodSeconds(R, D);
+            bucket.amplitudePx = dshb::BeatAmplitudePx(R, D);
+            ++triggers;
+            triggerTimes.push_back(now);
+            k.fired = true;
+        }
+        k.tau = now - bucket.triggerSeconds;
+        k.period = bucket.periodSeconds;
+        k.y = dshb::BeatOffsetFromBucket(now, bucket);
+        if (k.tau < minTau) minTau = k.tau;
+        return k;
+    }
+};
+
+// 固定 (R,D) 跑 frames 帧，返回逐帧位移。用于"同一初始状态重建"的逐位对照。
+std::vector<double> FixtureSequence(double R, double D, int frames) {
+    BeatFixture fx;
+    fx.Seed(R, D);
+    std::vector<double> out;
+    out.reserve(static_cast<std::size_t>(frames));
+    for (int i = 0; i < frames; ++i) out.push_back(fx.Step(kFrame, R, D).y);
+    return out;
 }
 
-//  包络的**替身**：第一个脉冲的中心可以在任意位置（探针用它做"中心在 0"的对照）。
-//  这不是模块的输出，只是同样的两个高斯的本地重算，用来把"中心放错会怎样"钉住。
-double ShapeHelperProbe(double t, double mu1) {
-    auto pulse = [](double x, double mu, double s) {
+// ===========================================================================
+// 两条律的**手算**对照
+// ===========================================================================
+//  ★ 只写公式，常量仍从 src/heartbeat.h 取 —— 改常量这里会跟着变，探针不会说谎。
+//    运算是同序同量：模块写的是 `base + (x-base)*d + (y-base)*r`，这里逐字照抄。
+double AmpByFormula(double R, double D) {
+    const double r = Clamp01(R);
+    const double d = Clamp01(D);
+    return dshb::kBeatABase + (dshb::kBeatAMin - dshb::kBeatABase) * d +
+           (dshb::kBeatAMax - dshb::kBeatABase) * r;
+}
+
+double PeriodByFormula(double R, double D) {
+    const double r = Clamp01(R);
+    const double d = Clamp01(D);
+    return dshb::kBeatTBase + (dshb::kBeatTMax - dshb::kBeatTBase) * d +
+           (dshb::kBeatTMin - dshb::kBeatTBase) * r;
+}
+
+// ===========================================================================
+// 探针内部的**对照实现**（不是模块的输出，只用来把"写错了会怎样"钉成数字）
+// ===========================================================================
+// 同一个包络，只把第一个脉冲的中心挪到别处：case7a 用它量"中心放在 0"的代价。
+// 这里刻意用朴素减法 —— 它是一条**对照**曲线，不是被测代码。
+double ShapeWithMu1(double tau, double mu1) {
+    auto pulse = [](double x, double mu, double sigma) {
         const double u = x - mu;
-        return std::exp(-0.5 * (u / s) * (u / s));
+        const double z = u / sigma;
+        return std::exp(-0.5 * z * z);
     };
-    return (pulse(t, mu1, dshb::kBeatSigma1) +
-            dshb::kBeatB2 * pulse(t, dshb::kBeatMu2, dshb::kBeatSigma2)) /
+    return (pulse(tau, mu1, dshb::kBeatSigma1) +
+            dshb::kBeatB2 * pulse(tau, dshb::kBeatMu2, dshb::kBeatSigma2)) /
+           dshb::kBeatShapePeak;
+}
+
+// 朴素脉冲：先减再判门闸（"τ < μ 就不用算了，反正 exp 已经很小"）。
+// 这是最自然的写法，也正是错的写法：μ=0.095 时 τ=0 落进门闸里，函数返回 0，
+// 而正确值是 exp(-1.805)=0.164474（第二个脉冲）/ exp(-1.4917)=0.224941（第一个）。
+double NaivePulse(double tau, double mu, double sigma) {
+    if (tau < mu) return 0.0;
+    const double u = tau - mu;
+    const double z = u / sigma;
+    return std::exp(-0.5 * z * z);
+}
+
+double NaiveShapeNorm(double tau) {
+    if (tau < 0.0 || tau > dshb::kBeatLen) return 0.0;
+    return (NaivePulse(tau, dshb::kBeatMu1, dshb::kBeatSigma1) +
+            dshb::kBeatB2 * NaivePulse(tau, dshb::kBeatMu2, dshb::kBeatSigma2)) /
+           dshb::kBeatShapePeak;
+}
+
+// 与模块同一顺序的 fma 重算：用来做逐位对照，证明"模块的值 == 不分段、无门闸的那个值"。
+double FmaPulse(double tau, double mu, double sigma) {
+    const double u = std::fma(tau, 1.0, -mu);
+    const double z = u / sigma;
+    const double e = -0.5 * z * z;
+    return e > -700.0 ? std::exp(e) : 0.0;
+}
+
+double FmaShapeNorm(double tau) {
+    if (tau < 0.0 || tau > dshb::kBeatLen) return 0.0;
+    return (FmaPulse(tau, dshb::kBeatMu1, dshb::kBeatSigma1) +
+            dshb::kBeatB2 * FmaPulse(tau, dshb::kBeatMu2, dshb::kBeatSigma2)) /
            dshb::kBeatShapePeak;
 }
 
 // ===========================================================================
-// Sampling
+// (0) 自检
 // ===========================================================================
-struct Sample {
-    double tau = 0.0;   // 相对 onset
-    double y = 0.0;     // px
-};
-
-// 从 onset 起按 hz 采一拍（history 只用于求 onset）。
-std::vector<Sample> SampleBeat(const std::vector<BeatChange>& h, double onsetAbs,
-                               double span, double hz) {
-    std::vector<Sample> out;
-    const int n = static_cast<int>(std::floor(span * hz + 1e-9));
-    for (int i = 0; i <= n; ++i) {
-        const double tau = i / hz;
-        out.push_back({tau, dshb::BeatOffsetPx(onsetAbs + tau, h, 1.0)});
-    }
-    return out;
-}
-
-struct ExtremumCount {
-    int maxima = 0;
-    int minima = 0;
-    double firstMaxAt = 0.0;
-    double firstMaxY = 0.0;
-};
-
-// 数局部极大 / 极小（严格内点）。
-// ★ 用细网格而不是解析求导：上一轮手写解析导数连错两次，两次都让"峰"消失。
-//   细网格法不可能有那种错，而这里的包络是 C1 的。
-ExtremumCount CountExtrema(const std::vector<Sample>& s) {
-    ExtremumCount e;
-    for (std::size_t i = 1; i + 1 < s.size(); ++i) {
-        if (s[i].y > s[i - 1].y && s[i].y >= s[i + 1].y) {
-            if (e.maxima == 0) {
-                e.firstMaxAt = s[i].tau;
-                e.firstMaxY = s[i].y;
-            }
-            ++e.maxima;
-        } else if (s[i].y < s[i - 1].y && s[i].y <= s[i + 1].y) {
-            ++e.minima;
-        }
-    }
-    return e;
-}
-
-}  // namespace
-
-// ===========================================================================
-// (0) harness self-check
-// ===========================================================================
-namespace {
-void RunHarnessSelfCheck(Harness* h) {
+void RunSelfCheck(Harness* h) {
     Harness throwaway;
-    const bool good = throwaway.Req("selfcheck:probe-true", "harness reports a true check as PASS",
-                                    "expected true", true);
+    const std::string passLine = throwaway.Line("case0:probe-true", "真检查", "预期 PASS", true);
+    const std::string failLine = throwaway.Line("case0:probe-false", "假检查", "预期 FAIL", false);
+    const bool good = throwaway.ReqSilent(true);
     const bool bad = throwaway.ReqSilent(false);
-    const bool ok = good && !bad && throwaway.passed == 1 && throwaway.failed == 1 &&
-                    throwaway.failures.size() == 1;
-    h->Req("case0", "harness self-check: a failing check really fails, and is counted",
-           "true->" + std::string(good ? "PASS" : "FAIL") + ", false->" +
-               std::string(bad ? "PASS" : "FAIL") + ", throwaway counters " +
-               F(throwaway.passed, 0) + " passed / " + F(throwaway.failed, 0) + " failed",
+    // 这条自检在量两件事，都要有数字：
+    //   ① 格式：假检查组装出来的那一行**行首是 "FAIL: "**（真检查是 "PASS: "）；
+    //   ② 记账：丢弃用的 harness 里 passed 加了 1、failed 也加了 1，failures 里多一条。
+    // 两件事合起来就是"它会报 FAIL"；那两行都没有打印，以免污染下游按行首读的证据。
+    const bool formatOk = passLine.rfind("PASS: ", 0) == 0 && failLine.rfind("FAIL: ", 0) == 0;
+    const bool countOk = throwaway.passed == 1 && throwaway.failed == 1 &&
+                         throwaway.failures.size() == 1;
+    const bool ok = good && !bad && formatOk && countOk;
+    h->Req("case0", "自检：一条故意失败的检查真的被格式化成 FAIL 行、真的被计数",
+           "假检查那一行的行首前缀 = \"" + failLine.substr(0, 6) + "\"（真检查 = \"" +
+               passLine.substr(0, 6) + "\"）；丢弃用的 harness 计数 " + I(throwaway.passed) +
+               " passed / " + I(throwaway.failed) + " failed，failures 里 " +
+               I(static_cast<long long>(throwaway.failures.size())) +
+               " 条；这两行都只组装、没有打印（打印会被下游当成一条真失败）",
            ok);
 }
-}  // namespace
 
 // ===========================================================================
-// (1) one envelope: peak-to-peak and the extremum COUNTS
+// (1) 一拍就是**一个**包络
 // ===========================================================================
-namespace {
-void RunOneEnvelope(Harness* h, bool verbose) {
-    const std::vector<BeatChange> h0 = OneChange(0.0, 0.0);
-    const double onset = OnsetForSampling(kT0, 0.0, 0.0);
-    // 只采 [0, kBeatLen]：再往后就是静默段，第 0 个 0 会被当成一个局部极小
-    // （第 1 版就是这么数出 minima=1 的）。一拍之内数才对。
-    const std::vector<Sample> beat = SampleBeat(h0, onset, dshb::kBeatLen, 480.0);
-    const ExtremumCount e = CountExtrema(beat);
+void RunEnvelope(Harness* h, bool verbose) {
+    // 幅度取 A_max（R=1, D=0）：这样"包络峰值 = 1.0"就直接读成 5 px。
+    // 触发时刻取 0，是为了让 τ = now 精确 —— 边界点 kBeatLen±1e-9 与 kBeatLen 都能精确比较。
+    BeatBucket b;
+    b.triggerSeconds = 0.0;
+    b.periodSeconds = dshb::BeatPeriodSeconds(1.0, 0.0);
+    b.amplitudePx = dshb::BeatAmplitudePx(1.0, 0.0);
 
-    double yMax = -1e300;
-    double yMin = 1e300;
-    for (const Sample& p : beat) {
-        if (p.y > yMax) yMax = p.y;
-        if (p.y < yMin) yMin = p.y;
+    const int n = static_cast<int>(std::floor(dshb::kBeatLen * kEnvelopeHz));
+    std::vector<double> tau(static_cast<std::size_t>(n) + 1, 0.0);
+    std::vector<double> y(static_cast<std::size_t>(n) + 1, 0.0);
+    for (int i = 0; i <= n; ++i) {
+        tau[i] = static_cast<double>(i) / kEnvelopeHz;
+        y[i] = dshb::BeatOffsetFromBucket(tau[i], b);
     }
-    const double tail = beat.back().y;
-    // 硬边界：τ 一旦超过 kBeatLen，函数必须返回**恰好 0**（不是"很小的数"）。
-    // 这一条是静默段能被验收的前提，所以单独量，而且要求 == 0.0 而不是"接近 0"。
-    const double justPast = dshb::BeatShapeNorm(dshb::kBeatLen + 1e-9);
-    const double pastPx = dshb::BeatOffsetPx(onset + dshb::kBeatLen + 1e-9, h0, 1.0);
-    const double before = dshb::BeatOffsetPx(onset - 1e-9, h0, 1.0);
 
-    // τ = kBeatLen 本身仍在区间内，所以那里是"包络的末端残留"而不是 0。
-    // 规格给的常数是 2.3e-5（相对峰值），5 px 下约 1.15e-4 px。这里按 1e-3 px 卡，
-    // 并把实测值印出来 —— 卡太紧就成了在量浮点噪声，卡太松就失去意义。
-    const bool ok = (e.maxima == 1) && (e.minima == 0) &&
-                    std::fabs(yMax - dshb::kBeatAMax) < 5e-3 && std::fabs(tail) < 1e-3 &&
-                    justPast == 0.0 && pastPx == 0.0 && before == 0.0;
+    // 局部极大 / 极小只数**严格内点**，且网格只覆盖 [0, kBeatLen] 内部：
+    // 把静默段的 0 也采进来，第一个 0 会被当成一个局部极小（上一版就这么数出 minima=1）。
+    int maxima = 0;
+    int minima = 0;
+    double gridMax = -1e300;
+    double gridMaxAt = 0.0;
+    double gridMin = 1e300;
+    double gridMinAt = 0.0;
+    for (std::size_t i = 0; i < y.size(); ++i) {
+        if (y[i] > gridMax) {
+            gridMax = y[i];
+            gridMaxAt = tau[i];
+        }
+        if (y[i] < gridMin) {
+            gridMin = y[i];
+            gridMinAt = tau[i];
+        }
+    }
+    for (std::size_t i = 1; i + 1 < y.size(); ++i) {
+        if (y[i] > y[i - 1] && y[i] >= y[i + 1]) {
+            ++maxima;
+        } else if (y[i] < y[i - 1] && y[i] <= y[i + 1]) {
+            ++minima;
+        }
+    }
+
+    // 峰值：两个中心相等 -> 连续域峰值恰好在 τ = μ，且恰好是 1.0（-> A_max px）。
+    const double peakNorm = dshb::BeatShapeNorm(dshb::kBeatMu1);
+    const double peakPx = dshb::BeatOffsetFromBucket(dshb::kBeatMu1, b);
+
+    // 硬边界：τ 一旦出了 [0, kBeatLen]，函数必须返回**恰好 0**（不是"很近 0"）。
+    // 这一条是"两次跳动之间回到 0"能被验收的前提，所以要求 == 0.0，不接受"接近"。
+    const double normBefore = dshb::BeatShapeNorm(-1e-9);
+    const double normAfter = dshb::BeatShapeNorm(dshb::kBeatLen + 1e-9);
+    const double pxBefore = dshb::BeatOffsetFromBucket(-1e-9, b);
+    const double pxAfter = dshb::BeatOffsetFromBucket(dshb::kBeatLen + 1e-9, b);
+    const double pxFar = dshb::BeatOffsetFromBucket(kT0, b);   // τ = 1000 s，静默段深处
+    // τ = kBeatLen 本身**仍在区间内**，所以那里是"末端残留"而不是 0：
+    // 常数给的量级是 2.3e-5（相对峰值），A_max 下约 1.15e-4 px。按 1e-3 px 卡，
+    // 并把实测值印出来 —— 卡紧到 1e-9 就成了在量浮点噪声。
+    const double residualNorm = dshb::BeatShapeNorm(dshb::kBeatLen);
+    const double residualPx = dshb::BeatOffsetFromBucket(dshb::kBeatLen, b);
+
+    const bool peakOk = std::fabs(peakNorm - 1.0) < 1e-12 &&
+                        std::fabs(peakPx - dshb::kBeatAMax) < 1e-9;
+    const bool edgeOk = normBefore == 0.0 && normAfter == 0.0 && pxBefore == 0.0 &&
+                        pxAfter == 0.0 && pxFar == 0.0;
+    const bool ok = maxima == 1 && minima == 0 && peakOk && edgeOk &&
+                    gridMax >= dshb::kBeatAMax - 0.01 && residualNorm > 0.0 &&
+                    residualPx > 0.0 && residualPx < 1e-3;
 
     h->Req("case1",
-           "one beat is ONE envelope: exactly 1 local max and 0 local min, peak == A_max, "
-           "and outside [0, kBeatLen] the displacement is EXACTLY 0",
-           "sampled at 480 Hz over exactly [0, kBeatLen]: maxima=" + F(e.maxima, 0) +
-               " minima=" + F(e.minima, 0) + "; the one max is at tau=" +
-               F(e.firstMaxAt * 1000, 3) + " ms with y=" + F(e.firstMaxY, 6) +
-               " px; yMax=" + F(yMax, 6) + " px (A_max=" + F(dshb::kBeatAMax, 3) +
-               "), yMin=" + F(yMin, 6) + " px, peak-to-peak=" + F(yMax - yMin, 6) +
-               " px; end-of-envelope residual at tau=kBeatLen is " + F(tail, 9) +
-               " px (spec's constant: 2.3e-5 of peak = 1.15e-4 px); "
-               "hard cutoff: BeatShapeNorm(kBeatLen+1e-9)=" + F(justPast, 9) +
-               ", BeatOffsetPx(onset+kBeatLen+1e-9)=" + F(pastPx, 9) +
-               ", BeatOffsetPx(onset-1e-9)=" + F(before, 9) + " px",
+           "一拍就是一个包络：恰好 1 个局部极大、0 个局部极小；峰值 1.0（τ=μ 处，A_max 下 5 px）；"
+           "τ 在 [0, kBeatLen] 之外恰好 0",
+           "在 [0, kBeatLen] 内按 " + F(kEnvelopeHz, 0) + " Hz 采 " + I(n + 1) +
+               " 点：局部极大 " + I(maxima) + " 个、局部极小 " + I(minima) + " 个；网格最大值 " +
+               F(gridMax, 9) + " px @ τ=" + F(gridMaxAt * 1000.0, 3) + " ms，最小值 " +
+               F(gridMin, 9) + " px @ τ=" + F(gridMinAt * 1000.0, 3) +
+               " ms（网格末端的残余，不是 0 —— τ=kBeatLen 仍在区间内）；解析峰位 τ=μ=" +
+               F(dshb::kBeatMu1 * 1000.0, 1) +
+               " ms 处 BeatShapeNorm=" + F(peakNorm, 15) + "（峰值 1.0）、位移 " + F(peakPx, 12) +
+               " px（A_max=" + F(dshb::kBeatAMax, 1) + " px）；"
+               "区间外恰好 0：BeatShapeNorm(-1e-9)=" + F(normBefore, 12) + "、BeatShapeNorm(" +
+               F(dshb::kBeatLen, 3) + "+1e-9)=" + F(normAfter, 12) + "、同两点的位移 " +
+               F(pxBefore, 12) + " / " + F(pxAfter, 12) + " px（都是字面 0.0）、τ=1000 s 处 " +
+               F(pxFar, 12) + " px；末端残留：τ=kBeatLen=" + F(dshb::kBeatLen, 3) +
+               " s 处包络 " + F(residualNorm, 12) + "（规格约 2.3e-5）、位移 " + F(residualPx, 12) +
+               " px（A_max 下）",
            ok);
 
     if (verbose) {
-        std::printf("  [case1] one beat (tau ms, px), every 16th of %d samples:\n   ",
-                    static_cast<int>(beat.size()));
-        for (std::size_t i = 0; i < beat.size(); i += 16) {
-            std::printf(" (%.1f,%.4f)", beat[i].tau * 1000.0, beat[i].y);
+        std::printf("  [case1] 一拍的位移（τ ms, px），%d 个采样点里每 16 个印一格:\n   ",
+                    n + 1);
+        for (std::size_t i = 0; i < y.size(); i += 16) {
+            std::printf(" (%.1f,%.4f)", tau[i] * 1000.0, y[i]);
         }
         std::printf("\n");
     }
 }
-}  // namespace
 
 // ===========================================================================
-// (2) worst-case single-frame jump, swept over the onset phase
+// (2) 单帧最大跳变（扫遍起始相位）
 // ===========================================================================
-namespace {
 struct JumpSweep {
-    double worst = 0.0;        // px
-    double worstPhase = 0.0;   // onset 相对帧网格的偏移（帧）
-    double worstTau = 0.0;     // 出现在 onset 之后多久（ms）
-    double amp = 0.0;
-    double atFirstFrame = 0.0; // 第一帧采到的位移（px，最小值随相位变化）
-    double atFirstFrameMax = 0.0;
+    double amp = 0.0;         // 这一档的幅度（px）
+    double worst = 0.0;       // 最坏单帧跳变（px）
+    double worstTau = 0.0;    // 它出现在触发之后多久（ms）
+    double worstPhase = 0.0;  // 触发落在帧格内的位置（0 = 正好落在格上）
+    double gridWorst = 0.0;   // 触发正好落在帧格上（生产里最常见的情形）
+    double gridWorstAt = 0.0; // 上者在触发之后多久（ms）
+    double firstFrame = 0.0;  // ph=0 时"触发那一瞬间"的位移（px）
 };
 
-//  扫遍"onset 相对帧网格的偏移"（唯一的自由度）。
-//
-//  ★ 几何（这一条我写错过两次，所以写详细）：
-//
-//    设 onset 落在帧网格上"格内位置 ph ∈ [0,1)"处（0 = 正好落在格上）。
-//    于是网格采样点相对 onset 的时刻是
-//
-//        tau = (ph + k) / 60 ,  k = 0, 1, 2, ...
-//
-//    —— onset **之后第一个采样点**是 k = 0，即 tau = ph/60 ∈ [0, 1/60)，
-//       而不是"(1-ph)/60"。所以"首帧跳变"就是把 tau 扫过 [0, 1/60)，
-//       取位移的最大值（onset 处位移恰好是 0，跳变 = 首帧值）。
-//
-//    我第一版写成 (1-ph)+c/inCell，方向反了，于是量到的是**第二帧**那个点
-//    （tau ≈ 0.024~0.033 s），把 1.6974 px 量成了 2.5565 px。
-//
-//  这里顺便也量"整拍内部的单帧最大跳变"：把 tau 一路扫到 kBeatLen，
-//  相邻采样点的差取最大。那个数比首帧跳变小（曲线在那里更平），
-//  所以首帧值就是上界 —— 印出来是为了让这一点可验证。
-JumpSweep SweepJump(double R, double D, int phaseSteps = 1200, int inCell = 12) {
+//  几何（这条容易写反，所以写详细）：
+//    帧网格的间距是 1/60 s。触发落在格内位置 ph ∈ [0,1) 处，于是触发之后的
+//    第 k 个采样点相对触发的时刻是
+//        τ = (ph + k)/60 ,  k = 0, 1, 2, ...
+//    —— **触发之后的第一个采样点是 k = 0**，即 τ = ph/60 ∈ [0, 1/60)。
+//    触发那一帧的位移是 0（静默段），所以首帧跳变 = τ 扫过 [0, 1/60) 时位移的最大值。
+//    本参数下它出现在 τ→1/60：33.94% —— 这就是整个扫描的上界。
+JumpSweep SweepJump(double R, double D, int phases, int frames) {
     JumpSweep out;
-    out.amp = AmpOf(D);
-    out.atFirstFrame = 1e300;
+    BeatBucket b;
+    b.triggerSeconds = 0.0;
+    b.periodSeconds = dshb::BeatPeriodSeconds(R, D);
+    b.amplitudePx = dshb::BeatAmplitudePx(R, D);
+    out.amp = b.amplitudePx;
 
-    const std::vector<BeatChange> h = OneChange(R, D);
-    const double onset = OnsetAbsolute(kT0, R, D);
+    // 触发正好落在帧格上（ph = 0）：生产里帧步均匀时就是这个情形。
+    double prev = 0.0;   // 触发之前的一帧：静默段，恰好 0
+    for (int k = 0; k < frames; ++k) {
+        const double t = static_cast<double>(k) * kFrame;
+        const double yy = dshb::BeatOffsetFromBucket(t, b);
+        const double jump = std::fabs(yy - prev);
+        if (jump > out.gridWorst) {
+            out.gridWorst = jump;
+            out.gridWorstAt = t * 1000.0;
+        }
+        prev = yy;
+    }
+    out.firstFrame = dshb::BeatOffsetFromBucket(0.0, b);
 
-    for (int q = 0; q < phaseSteps; ++q) {
-        // ph = onset 在帧格内的位置，扫满 [0,1)
-        const double ph = (q + 0.5) / phaseSteps;
-        // onset 之后第一个采样点：tau = ph/60，再在格内细扫
-        for (int c = 0; c <= inCell; ++c) {
-            const double tau = (ph + c / static_cast<double>(inCell)) * kFrame;
-            if (tau > dshb::kBeatLen) continue;
-            const double y = dshb::BeatOffsetPx(onset + tau, h, 1.0);
-            // 这一格的跳变 = 本帧值 - 上一帧值；上一帧要么是 onset 之前的静默段
-            // （0 px），要么是 tau 小一帧的那个点。
-            double prev = 0.0;
-            if (tau > kFrame) {
-                prev = dshb::BeatOffsetPx(onset + tau - kFrame, h, 1.0);
-            }
-            const double d = std::fabs(y - prev);
-            if (d > out.worst) {
-                out.worst = d;
+    for (int q = 0; q < phases; ++q) {
+        const double ph = (q + 0.5) / phases;
+        prev = 0.0;
+        for (int k = 0; k < frames; ++k) {
+            const double tt = (ph + k) * kFrame;
+            const double yy = dshb::BeatOffsetFromBucket(tt, b);
+            const double jump = std::fabs(yy - prev);
+            if (jump > out.worst) {
+                out.worst = jump;
+                out.worstTau = tt * 1000.0;
                 out.worstPhase = ph;
-                out.worstTau = tau * 1000.0;
             }
-            // 首帧（onset 之后第一个网格点）的值
-            if (c == 0) {
-                if (y < out.atFirstFrame) out.atFirstFrame = y;
-                if (y > out.atFirstFrameMax) out.atFirstFrameMax = y;
-            }
+            prev = yy;
         }
     }
     return out;
 }
-}  // namespace
 
-// ===========================================================================
-// (3) phase continuity vs the naive sin(2*pi*F*t)
-// ===========================================================================
-namespace {
-struct ContinuityCase {
-    double fBefore = 0.0;       // 变化前（常态 F2）
-    double fAfter = 0.0;        // 变化后（F1）
-    double naiveMaxPre = 0.0;   // 朴素写法：变化前 1 秒内的最大帧间跳变
-    double naiveMaxPost = 0.0;  // 朴素写法：变化后 1 秒内的最大帧间跳变
-    double naiveJumpAtChange = 0.0;
-    double beatJumpAtChange = 0.0;
-    double naiveAtChangeBefore = 0.0;
-    double naiveAtChangeAfter = 0.0;
-    double beatAtChangeBefore = 0.0;
-    double beatAtChangeAfter = 0.0;
-};
-
-//  ★ 这条检查在量什么，必须说清楚，否则很容易自欺：
-//
-//  朴素写法 `A*sin(2*pi*F*t)` 把 t 当成**从固定原点起算的绝对时间**。
-//  F 一变，同一个 t 对应的相位 `2*pi*F*t` 就变了 —— 变化的时刻越晚、
-//  漂得越多。所以它在变化那一刻有一个**真实存在**的位移跳变。
-//
-//  本模块的相位是**从 onset 起算的**（相位是积分，变化只影响下一次 onset 的
-//  时刻），所以变化那一刻位移**连续**，而且已经起跳的那一拍照常走完。
-//
-//  这就是"相位累积 vs 直接乘 t"的差别，也是本 case 要印出来的对照。
-ContinuityCase RunContinuity(double R, double D) {
-    ContinuityCase out;
-    const double amp = AmpOf(D);
-    const double tChange = 2.0;
-    out.fBefore = dshb::BeatF2(R);
-    out.fAfter = dshb::BeatF1(R);
-
-    const std::vector<BeatChange> h = ChangeAt(tChange, R, D);
-
-    // 朴素写法：变化前后各自一个固定频率，自变量是"相对原点的绝对时间"
-    auto naive = [&](double u) {
-        const double f = u < tChange ? out.fBefore : out.fAfter;
-        return amp * std::sin(2.0 * kPi * f * u);
+void RunJumpSweeps(Harness* h) {
+    struct Case {
+        const char* name;
+        double R;
+        double D;
     };
-
-    // 变化前 1 秒 / 后 1 秒内分别扫最大帧间跳变。
-    // ★ 前 1 秒滑窗**避开 t=0**（那里 sin 自己也从 0 起步，是另一回事）。
-    for (int i = 0; i < 60; ++i) {
-        const double u = tChange - 1.0 + i * kFrame;
-        const double j = std::fabs(naive(u + kFrame) - naive(u));
-        if (j > out.naiveMaxPre) out.naiveMaxPre = j;
+    const Case cases[3] = {{"R=0/D=0（A=3 px）", 0.0, 0.0},
+                           {"R=0.5/D=0.5（A=3 px）", 0.5, 0.5},
+                           {"R=1/D=0（A=5 px）", 1.0, 0.0}};
+    for (const Case& c : cases) {
+        const JumpSweep s = SweepJump(c.R, c.D, 1200, 24);
+        const double pct = 100.0 * s.worst / s.amp;
+        const double gridPct = 100.0 * s.gridWorst / s.amp;
+        h->Req("case2", std::string("单帧最大跳变 <= 35% 幅度（") + c.name + "）",
+               "扇 1200 个起始相位 × 24 帧 = 28800 次求值：最坏跳变 " + F(s.worst, 6) + " px = " +
+                   F(pct, 2) + "% of A=" + F(s.amp, 3) + " px，出现在触发后 τ=" +
+                   F(s.worstTau, 3) + " ms（触发落在帧格内 " + F(s.worstPhase, 6) +
+                   " 处；落在首帧=" + YN(s.worstTau <= kFrame * 1000.0 + 1e-9) +
+                   "，也就是触发后第一个采样点那一格）；触发正好落在帧格上时最坏 " + F(s.gridWorst, 6) +
+                   " px = " + F(gridPct, 2) + "% @ τ=" + F(s.gridWorstAt, 3) +
+                   " ms；触发那一瞬间（τ=0）的位移 " + F(s.firstFrame, 6) + " px = " +
+                   F(100.0 * s.firstFrame / s.amp, 2) + "%",
+               pct <= 35.0);
     }
-    for (int i = 0; i < 60; ++i) {
-        const double u = tChange + i * kFrame;
-        const double j = std::fabs(naive(u + kFrame) - naive(u));
-        if (j > out.naiveMaxPost) out.naiveMaxPost = j;
-    }
-    // 跨越变化那一刻的那一帧（取最坏的一个子相位）
-    for (int q = 0; q < 200; ++q) {
-        const double u = tChange - (q + 1) / 200.0 * kFrame;
-        const double j = std::fabs(naive(u + kFrame) - naive(u));
-        if (j > out.naiveJumpAtChange) out.naiveJumpAtChange = j;
-    }
-    out.naiveAtChangeBefore = naive(tChange - 1e-9);
-    out.naiveAtChangeAfter = naive(tChange + 1e-9);
-
-    // 本模块：同样扫跨越变化那一刻的那一帧
-    for (int q = 0; q < 200; ++q) {
-        const double u = tChange - (q + 1) / 200.0 * kFrame;
-        const double j = std::fabs(dshb::BeatOffsetPx(u + kFrame, h, 1.0) -
-                                   dshb::BeatOffsetPx(u, h, 1.0));
-        if (j > out.beatJumpAtChange) out.beatJumpAtChange = j;
-    }
-    out.beatAtChangeBefore = dshb::BeatOffsetPx(tChange - 1e-9, h, 1.0);
-    out.beatAtChangeAfter = dshb::BeatOffsetPx(tChange + 1e-9, h, 1.0);
-    return out;
 }
-}  // namespace
 
 // ===========================================================================
-// (4) rise duration
+// (3) 幅度律 A(R,D)
 // ===========================================================================
-namespace {
-struct RiseInfo {
-    double peakAt = 0.0;       // 峰值相对 onset（ms）
-    double fivePercentAt = 0.0;
-    double riseMs = 0.0;
-    double riseFrames = 0.0;
-    double atOnset = 0.0;
-    double peak = 0.0;
-};
+void RunAmplitudeLaw(Harness* h) {
+    const double grid[7] = {0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0};
 
-//  上升段 = 位移从峰值的 5% 升到峰值所需的时间。
-//  ★ 这是"上升段"唯一不含歧义的度量。不要用"距 onset 到峰值" —— 那个量会把
-//    "位移还几乎是 0 的那一段"也算成上升时间。本参数下两者恰好相同
-//    （onset 处已经是峰值的 20.5% > 5%），但定义要按前者写，否则换个参数就错。
-RiseInfo MeasureRise(double R, double D) {
-    RiseInfo out;
-    const std::vector<BeatChange> h = OneChange(R, D);
-    const double onset = OnsetForSampling(kT0, R, D);
-    const int n = 400000;
-    double peak = -1e300;
-    double peakAt = 0.0;
-    for (int i = 0; i <= n; ++i) {
-        const double tau = dshb::kBeatLen * i / n;
-        const double y = dshb::BeatOffsetPx(onset + tau, h, 1.0);
-        if (y > peak) {
-            peak = y;
-            peakAt = tau;
+    double worst = 0.0;
+    double worstAtR = 0.0;
+    double worstAtD = 0.0;
+    for (double r : grid) {
+        for (double d : grid) {
+            const double e = std::fabs(dshb::BeatAmplitudePx(r, d) - AmpByFormula(r, d));
+            if (e > worst) {
+                worst = e;
+                worstAtR = r;
+                worstAtD = d;
+            }
         }
     }
-    double five = peakAt;
-    for (int i = 0; i <= n; ++i) {
-        const double tau = dshb::kBeatLen * i / n;
-        if (dshb::BeatOffsetPx(onset + tau, h, 1.0) >= 0.05 * peak) {
-            five = tau;
+
+    // 四个角，规格给的数：(0,0)=3、(1,0)=5、(0,1)=1、(1,1)=3。
+    // ★ 这几行是本文件里**唯一**写死的波形数值：它钉的是**规格**，不是复算波形。
+    //   其余所有期望值都从 src/heartbeat.h 的常量推；谁改了常量，这一条必须 FAIL。
+    const double specR[4] = {0.0, 1.0, 0.0, 1.0};
+    const double specD[4] = {0.0, 0.0, 1.0, 1.0};
+    const double specWant[4] = {3.0, 5.0, 1.0, 3.0};
+    double cornerErr = 0.0;
+    std::string corners;
+    for (int i = 0; i < 4; ++i) {
+        const double got = dshb::BeatAmplitudePx(specR[i], specD[i]);
+        const double e = std::fabs(got - specWant[i]);
+        if (e > cornerErr) cornerErr = e;
+        corners += " A(" + F(specR[i], 0) + "," + F(specD[i], 0) + ")=" + F(got, 12);
+    }
+
+    // 线性：中点 = 两端平均（对 R 与对 D 各扫一遍）。
+    double worstMidR = 0.0;
+    double worstMidD = 0.0;
+    for (double v : grid) {
+        const double midUp = std::fabs(dshb::BeatAmplitudePx(0.5, v) -
+                                       0.5 * (dshb::BeatAmplitudePx(0.0, v) +
+                                              dshb::BeatAmplitudePx(1.0, v)));
+        if (midUp > worstMidR) worstMidR = midUp;
+        const double midD = std::fabs(dshb::BeatAmplitudePx(v, 0.5) -
+                                      0.5 * (dshb::BeatAmplitudePx(v, 0.0) +
+                                             dshb::BeatAmplitudePx(v, 1.0)));
+        if (midD > worstMidD) worstMidD = midD;
+    }
+
+    // 夹取：模块的头文件写着"R、D 会先夹到 [0,1]"。
+    const double clampHigh = dshb::BeatAmplitudePx(2.0, 3.0);
+    const double clampLow = dshb::BeatAmplitudePx(-1.0, -0.5);
+    const double clampRefHigh = dshb::BeatAmplitudePx(1.0, 1.0);
+    const double clampRefLow = dshb::BeatAmplitudePx(0.0, 0.0);
+
+    // 方向：R 越大越猛（正斜率）、D 越大越枯竭（负斜率）。
+    const double slopeR = dshb::BeatAmplitudePx(1.0, 0.0) - dshb::BeatAmplitudePx(0.0, 0.0);
+    const double slopeD = dshb::BeatAmplitudePx(0.0, 1.0) - dshb::BeatAmplitudePx(0.0, 0.0);
+
+    const bool ok = worst < 1e-12 && cornerErr < 1e-12 && worstMidR < 1e-12 &&
+                    worstMidD < 1e-12 && clampHigh == clampRefHigh && clampLow == clampRefLow &&
+                    slopeR > 0.0 && slopeD < 0.0;
+    h->Req("case3",
+           "幅度律 A(R,D)=A_base+(A_min-A_base)·D+(A_max-A_base)·R：49 点网格对公式、四个角 "
+           "3/5/1/3、对 R 与 D 都线性（中点=两端平均）、输入夹到 [0,1]",
+           "网格 R,D 各取 {0, 0.1, 0.25, 0.5, 0.75, 0.9, 1} 共 49 点：最大偏差 " + F(worst, 15) +
+               " px（在 R=" + F(worstAtR, 2) + ", D=" + F(worstAtD, 2) + "）；四个角" + corners +
+               "（规格 3/5/1/3，最大偏差 " + F(cornerErr, 15) + "）；线性中点误差：对 R " +
+               F(worstMidR, 15) + " px、对 D " + F(worstMidD, 15) + " px；斜率（用模块自己的值算）"
+               "dA/dR=" + F(slopeR, 6) + " px（R 0->1，D=0）、dA/dD=" + F(slopeD, 6) +
+               " px（D 0->1，R=0）；夹取：A(2,3)=" + F(clampHigh, 6) + " == A(1,1)=" +
+               F(clampRefHigh, 6) + "，A(-1,-0.5)=" + F(clampLow, 6) + " == A(0,0)=" +
+               F(clampRefLow, 6) + " px；常量 A_base=" + F(dshb::kBeatABase, 1) + " A_min=" +
+               F(dshb::kBeatAMin, 1) + " A_max=" + F(dshb::kBeatAMax, 1) + " px",
+           ok);
+}
+
+// ===========================================================================
+// (4) 周期律 T(R,D)
+// ===========================================================================
+void RunPeriodLaw(Harness* h) {
+    const double grid[7] = {0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0};
+
+    double worst = 0.0;
+    double worstAtR = 0.0;
+    double worstAtD = 0.0;
+    for (double r : grid) {
+        for (double d : grid) {
+            const double e = std::fabs(dshb::BeatPeriodSeconds(r, d) - PeriodByFormula(r, d));
+            if (e > worst) {
+                worst = e;
+                worstAtR = r;
+                worstAtD = d;
+            }
+        }
+    }
+
+    // 四个角，规格给的数：(0,0)=15、(1,0)=0.5、(0,1)=30、(1,1)=15.5。
+    // 与 case3 同一句话：这是全文件唯一写死的波形数值，钉的是规格。
+    const double specR[4] = {0.0, 1.0, 0.0, 1.0};
+    const double specD[4] = {0.0, 0.0, 1.0, 1.0};
+    const double specWant[4] = {15.0, 0.5, 30.0, 15.5};
+    double cornerErr = 0.0;
+    std::string corners;
+    for (int i = 0; i < 4; ++i) {
+        const double got = dshb::BeatPeriodSeconds(specR[i], specD[i]);
+        const double e = std::fabs(got - specWant[i]);
+        if (e > cornerErr) cornerErr = e;
+        corners += " T(" + F(specR[i], 0) + "," + F(specD[i], 0) + ")=" + F(got, 12);
+    }
+
+    double worstMidR = 0.0;
+    double worstMidD = 0.0;
+    for (double v : grid) {
+        const double midUp = std::fabs(dshb::BeatPeriodSeconds(0.5, v) -
+                                       0.5 * (dshb::BeatPeriodSeconds(0.0, v) +
+                                              dshb::BeatPeriodSeconds(1.0, v)));
+        if (midUp > worstMidR) worstMidR = midUp;
+        const double midD = std::fabs(dshb::BeatPeriodSeconds(v, 0.5) -
+                                      0.5 * (dshb::BeatPeriodSeconds(v, 0.0) +
+                                             dshb::BeatPeriodSeconds(v, 1.0)));
+        if (midD > worstMidD) worstMidD = midD;
+    }
+
+    const double clampHigh = dshb::BeatPeriodSeconds(2.0, 3.0);
+    const double clampLow = dshb::BeatPeriodSeconds(-1.0, -0.5);
+    const double clampRefHigh = dshb::BeatPeriodSeconds(1.0, 1.0);
+    const double clampRefLow = dshb::BeatPeriodSeconds(0.0, 0.0);
+
+    const double slopeR = dshb::BeatPeriodSeconds(1.0, 0.0) - dshb::BeatPeriodSeconds(0.0, 0.0);
+    const double slopeD = dshb::BeatPeriodSeconds(0.0, 1.0) - dshb::BeatPeriodSeconds(0.0, 0.0);
+
+    // 用模块自己的律取最快/最慢，不抄常量。
+    const double fastest = dshb::BeatPeriodSeconds(1.0, 0.0);
+    const double slowest = dshb::BeatPeriodSeconds(0.0, 1.0);
+
+    const bool ok = worst < 1e-9 && cornerErr < 1e-12 && worstMidR < 1e-9 &&
+                    worstMidD < 1e-9 && clampHigh == clampRefHigh && clampLow == clampRefLow &&
+                    slopeR < 0.0 && slopeD > 0.0 && fastest > dshb::kBeatLen;
+    h->Req("case4",
+           "周期律 T(R,D)=T_base+(T_max-T_base)·D+(T_min-T_base)·R：49 点网格对公式、四个角 "
+           "15/0.5/30/15.5、对 R 与 D 都线性、输入夹到 [0,1]",
+           "网格 R,D 各取 {0, 0.1, 0.25, 0.5, 0.75, 0.9, 1} 共 49 点：最大偏差 " + F(worst, 15) +
+               " s（在 R=" + F(worstAtR, 2) + ", D=" + F(worstAtD, 2) + "）；四个角" + corners +
+               "（规格 15/0.5/30/15.5，最大偏差 " + F(cornerErr, 15) + "）；线性中点误差：对 R " +
+               F(worstMidR, 15) + " s、对 D " + F(worstMidD, 15) + " s；斜率 dT/dR=" +
+               F(slopeR, 6) + " s（R 0->1，D=0）、dT/dD=" + F(slopeD, 6) +
+               " s（D 0->1，R=0）；夹取：T(2,3)=" + F(clampHigh, 6) + " == T(1,1)=" +
+               F(clampRefHigh, 6) + "，T(-1,-0.5)=" + F(clampLow, 6) + " == T(0,0)=" +
+               F(clampRefLow, 6) + " s；常量 T_base=" + F(dshb::kBeatTBase, 1) + " T_min=" +
+               F(dshb::kBeatTMin, 1) + " T_max=" + F(dshb::kBeatTMax, 1) + " s；律给的最快 " +
+               F(fastest, 4) + " s、最慢 " + F(slowest, 4) + " s",
+           ok);
+}
+
+// ===========================================================================
+// (5a) 计时：触发次数 = 1 + floor(N/T)
+// ===========================================================================
+void RunTimerCount(Harness* h) {
+    struct Case {
+        const char* name;
+        double R;
+        double D;
+        double seconds;
+    };
+    const Case cases[2] = {{"常态 R=0/D=0（T=15 s）", 0.0, 0.0, 60.0},
+                           {"最快 R=1/D=0（T=0.5 s）", 1.0, 0.0, 10.0}};
+    for (const Case& c : cases) {
+        const double T = dshb::BeatPeriodSeconds(c.R, c.D);
+        const int frames = static_cast<int>(std::llround(c.seconds * dshb::kBeatFrameHz));
+        BeatFixture fx;
+        fx.Seed(c.R, c.D);
+        for (int i = 0; i < frames; ++i) fx.Step(kFrame, c.R, c.D);
+
+        const long long expected = 1 + static_cast<long long>(std::floor(c.seconds / T));
+        const long long got = static_cast<long long>(fx.triggers);
+        const long long diff = got - expected;
+
+        // 每个间隔必须落在 [T, T + 一帧)：触发发生在"跨过 T 的第一个采样格"上。
+        // 容差就是**一帧**，不是偷懒：周期正好是帧长的整数倍时，累加的最后一位决定
+        // 它落在第 N 格还是第 N+1 格 —— 下面印出来的间隔区间就是这件事的证据。
+        double minIv = 1e300;
+        double maxIv = 0.0;
+        for (std::size_t i = 1; i < fx.triggerTimes.size(); ++i) {
+            const double iv = fx.triggerTimes[i] - fx.triggerTimes[i - 1];
+            if (iv < minIv) minIv = iv;
+            if (iv > maxIv) maxIv = iv;
+        }
+        const bool haveTwo = fx.triggerTimes.size() >= 2;
+        const bool ok = (diff <= 1 && diff >= -1) && !fx.triggerTimes.empty() &&
+                        fx.triggerTimes[0] == 0.0 && haveTwo && minIv >= T - 1e-9 &&
+                        maxIv <= T + kFrame + 1e-9;
+
+        const std::string gap =
+            haveTwo ? "；间隔 ∈ [" + F(minIv, 9) + ", " + F(maxIv, 9) + "] s（T 到 T+一帧 = " +
+                          F(T + kFrame, 9) + " s）"
+                    : std::string("；只有一个触发时刻，间隔无从谈起");
+
+        h->Req("case5a",
+               std::string("计时：固定 (R,D) 跑 N 秒，触发次数 = 1 + floor(N/T)（") + c.name + "）",
+               "T=" + F(T, 4) + " s，跑 " + F(c.seconds, 1) + " s = " + I(frames) +
+                   " 帧 @60 Hz：触发 " + I(got) + " 次，期望 1 + floor(" + F(c.seconds, 1) + "/" +
+                   F(T, 4) + ") = " + I(expected) + "（差 " + I(diff) + "，容差一帧）；"
+                   "节拍时刻（s）=" + Times(fx.triggerTimes, 5, 3) + gap + "；第一拍在 t=" +
+                   F(fx.triggerTimes[0], 6) + " s 触发",
+               ok);
+    }
+}
+
+// ===========================================================================
+// (5b) 计时：不补拍
+// ===========================================================================
+void RunTimerNoCatchUp(Harness* h) {
+    const double R = 1.0;
+    const double D = 0.0;
+    BeatFixture fx;
+    fx.Seed(R, D);
+    const double T = fx.bucket.periodSeconds;
+
+    const int before = fx.triggers;
+    const Tick a = fx.Step(3.0 * T, R, D);      // 一帧拉成 3T
+    const int afterA = fx.triggers;
+    const Tick b = fx.Step(7.0 * T, R, D);      // 再跳一大帧
+    const int afterB = fx.triggers;
+
+    // "补齐"的写法会按 elapsed/T 补：那是这两个数。
+    const long long naiveA = static_cast<long long>(std::floor((3.0 * T) / T));
+    const long long naiveB = static_cast<long long>(std::floor((7.0 * T) / T));
+
+    const bool ok = (afterA - before) == 1 && (afterB - afterA) == 1 && a.tau == 0.0 &&
+                    a.t == 3.0 * T && fx.triggers == 3;
+    h->Req("case5b", "计时：一帧拉成 3T / 7T 只触发一次，不补拍（触发时刻记在 now，不倒推回去）",
+           "T=" + F(T, 4) + " s；第 1 帧 dt=3T=" + F(3.0 * T, 4) + " s：触发 " +
+               I(afterA - before) + " 次（按 elapsed/T 补齐会触发 " + I(naiveA) +
+               " 次），触发时刻 t=" + F(a.t, 6) + " s = now，触发后 τ=" + F(a.tau, 9) +
+               " s、位移 " + F(a.y, 6) + " px（= A·Shape(0)，触发瞬间不是 0）；第 2 帧 dt=7T=" +
+               F(7.0 * T, 4) + " s：触发 " + I(afterB - afterA) + " 次（补齐会 " + I(naiveB) +
+               " 次），t=" + F(b.t, 6) + " s、τ=" + F(b.tau, 9) + " s；两帧共 " + I(fx.triggers) +
+               " 次触发（含 t=0 的第一拍），帧数 2",
+           ok);
+}
+
+// ===========================================================================
+// (5c) 计时：整拍不变、不回退、不重复触发
+// ===========================================================================
+void RunTimerNoRewind(Harness* h) {
+    // 脚本：t ∈ [0,1) 用 R=0（律给 T=30 s）；t >= 1.0 起 R=1（律给 T=0.5 s）。
+    // 第一拍在 t=0 采样到 T=30 s，所以 1.0 s 之后律虽然"变快了"，
+    // **这一拍**仍然是 30 s —— 这正是"周期在触发时采样、整拍不变"要量的事。
+    const double tChange = 1.0;
+    const double seconds = 32.0;
+    const int frames = static_cast<int>(std::llround(seconds * dshb::kBeatFrameHz));
+
+    BeatFixture fx;
+    fx.Seed(0.0, 0.0);
+    std::vector<Tick> log;
+    log.reserve(static_cast<std::size_t>(frames));
+    for (int i = 0; i < frames; ++i) {
+        const double t = fx.now + kFrame;
+        const double r = (t >= tChange) ? 1.0 : 0.0;
+        log.push_back(fx.Step(kFrame, r, 0.0));
+    }
+
+    // 每一拍**触发时**采样到的周期：第一拍来自 Seed，其余从触发那一帧的 Tick 里取。
+    std::vector<double> beatPeriod;
+    beatPeriod.push_back(fx.seedPeriod);
+    for (const Tick& k : log) {
+        if (k.fired) beatPeriod.push_back(k.period);
+    }
+
+    const std::vector<double>& tt = fx.triggerTimes;
+    std::vector<double> iv;
+    for (std::size_t i = 1; i < tt.size(); ++i) iv.push_back(tt[i] - tt[i - 1]);
+
+    double worstDev = 0.0;
+    bool increasing = true;
+    for (std::size_t i = 1; i < tt.size(); ++i) {
+        if (!(tt[i] > tt[i - 1])) increasing = false;
+    }
+    for (std::size_t i = 0; i < iv.size() && i < beatPeriod.size(); ++i) {
+        const double dev = std::fabs(iv[i] - beatPeriod[i]);
+        if (dev > worstDev) worstDev = dev;
+    }
+
+    // 中途对照：t≈10 s 那一帧，这一拍还是 30 s（bucket），而律现在给 0.5 s。
+    const Tick& mid = log[599];
+    const double lawFast = dshb::BeatPeriodSeconds(1.0, 0.0);
+    const double lawSlow = dshb::BeatPeriodSeconds(0.0, 0.0);
+
+    // [1, 30) 这 29 s 里实际触发了多少次，与"每帧按律重算周期"的写法对照用。
+    // ★ 这里**不是**判据：按设计，第 1 秒换律之后这一拍仍然是 30 s，所以第一次触发本来
+    //    就会落在 29 s 之后、落在 [1,30) 里 —— "这个区间里触发 0 次"是错的判据（曾经这么写，
+    //    于是永远 FAIL）。真正的判据在下面：换律后的**第一次**触发不早于它采样到的周期。
+    long long window = 0;
+    for (double t : tt) {
+        if (t >= tChange && t < 30.0) ++window;
+    }
+    long long naiveWindow = 0;
+    {   // 每帧按律重算周期会触发多少次（同一段时间、同一律）
+        double t = 1.0;
+        double trig = 0.0;
+        while (t < 30.0) {
+            t += kFrame;
+            const double per = dshb::BeatPeriodSeconds((t >= tChange) ? 1.0 : 0.0, 0.0);
+            if (t - trig >= per) { trig = t; ++naiveWindow; }
+        }
+    }
+
+    // 换律之后**第一次**触发：必须正好在旧拍走完时到（0）—— 早于 T_lawSlow 就是"提前触发"。
+    double firstAfter = 0.0;
+    for (double t : tt) {
+        if (t > tChange) { firstAfter = t; break; }
+    }
+    const bool noEarly = firstAfter >= lawSlow - 1e-9;
+
+    const bool ok = increasing && iv.size() + 1 == tt.size() &&
+                    beatPeriod.size() == tt.size() && worstDev <= kFrame + 1e-9 && noEarly &&
+                    fx.minTau >= 0.0 && iv.back() <= lawFast + kFrame + 1e-9 &&
+                    std::fabs(iv.back() - lawFast) <= kFrame + 1e-9 &&
+                    naiveWindow > window;   // 不能是恒真的空检查
+    h->Req("case5c",
+           "计时：周期中途变化 -> 整拍不变（不提前触发）、时刻不回退、已跨过的时刻不重复触发、τ 不为负",
+           "脚本：t∈[0,1) R=0（律给 T=" + F(lawSlow, 1) + " s），t>=1.0 R=1（律给 T=" +
+               F(lawFast, 1) + " s）；跑 " + F(seconds, 0) + " s = " + I(frames) + " 帧；触发时刻（s）=" +
+               Times(tt, 3, 4) + "，共 " + I(static_cast<long long>(tt.size())) + " 拍；间隔（s）=" +
+               Times(iv, 3, 4) + "，每段与**该拍触发时采样的周期**最大偏差 " + F(worstDev, 9) +
+               " s（<= 一帧 " + F(kFrame, 9) + " s）；时刻严格递增、无重复=" + YN(increasing) +
+               "，全程最小 elapsed τ=" + F(fx.minTau, 12) + " s（没有负时间）；中途对照 t=" +
+               F(mid.t, 3) + " s：这一拍仍是 " + F(mid.period, 1) + " s，而律此刻给 " +
+               F(lawFast, 1) + " s —— 整拍不变；换律后**第一次**触发在 t=" + F(firstAfter, 6) +
+               " s（必须 >= 旧周期 " + F(lawSlow, 1) + " s，否则就是提前触发）；[1, 30) 这 " +
+               F(30.0 - tChange, 0) + " s 里实际触发 " + I(window) + " 次，同一段按律每帧重算周期的写法会触发 " +
+               I(naiveWindow) + " 次；周期变短那一拍的实际间隔 " + F(iv.back(), 4) + " s（= 采样到的 T + 至多一帧）",
+           ok);
+}
+
+// ===========================================================================
+// (5d) 计时：静默窗口恰好 0，且两拍不叠
+// ===========================================================================
+void RunSilenceWindow(Harness* h) {
+    // 最短周期那一档就是最坏情形：静默窗口最短（T - kBeatLen 最小），
+    // 所以只跑这一档；T 从**律**里取，不抄常量。
+    const double R = 1.0;
+    const double D = 0.0;
+    const double T = dshb::BeatPeriodSeconds(R, D);
+    BeatFixture fx;
+    fx.Seed(R, D);
+    const int frames = static_cast<int>(std::llround(10.0 * dshb::kBeatFrameHz));
+
+    int silent = 0;
+    int silentBad = 0;
+    int inside = 0;
+    int insideBad = 0;
+    double lastInsideTau = 0.0;
+    double firstSilentTau = 0.0;
+    for (int i = 0; i < frames; ++i) {
+        const Tick k = fx.Step(kFrame, R, D);
+        if (k.tau > dshb::kBeatLen) {
+            ++silent;
+            if (k.y != 0.0) ++silentBad;
+            if (silent == 1) firstSilentTau = k.tau;   // 第一个静默帧的 τ
+        } else {
+            ++inside;
+            if (!(k.y > 0.0)) ++insideBad;
+            if (k.tau > lastInsideTau) lastInsideTau = k.tau;
+        }
+    }
+
+    const double margin = T - dshb::kBeatLen;
+    const bool ok = silentBad == 0 && insideBad == 0 && silent > 0 && inside > 0 &&
+                    margin > 0.0 && dshb::kBeatTMin > dshb::kBeatLen && fx.minTau >= 0.0;
+    h->Req("case5d",
+           "计时：静默窗口（τ > kBeatLen）里位移恰好 0；且最短周期 T_min > kBeatLen（两拍不叠的前提）",
+           "最快档 R=1/D=0：T=" + F(T, 4) + " s、一拍长 kBeatLen=" + F(dshb::kBeatLen, 3) +
+               " s，余量 " + F(margin, 3) + " s = " + F(margin * dshb::kBeatFrameHz, 1) + " 帧；跑 " +
+               F(10.0, 0) + " s = " + I(frames) + " 帧：静默帧 " + I(silent) + "/" + I(frames) +
+               "（位移恰好 0.0 的 " + I(silent - silentBad) + " 帧，不等于 0 的 " + I(silentBad) +
+               " 帧），信封内帧 " + I(inside) + "（全部 > 0 的 " + I(inside - insideBad) + " 帧，坏的 " +
+               I(insideBad) + " 帧）；信封内最大 τ=" + F(lastInsideTau, 6) + " s，第一个静默帧 τ=" +
+               F(firstSilentTau, 6) + " s；常数一侧：kBeatTMin=" + F(dshb::kBeatTMin, 3) + " s > kBeatLen=" +
+               F(dshb::kBeatLen, 3) + " s；全程最小 elapsed τ=" + F(fx.minTau, 12) + " s",
+           ok);
+}
+
+// ===========================================================================
+// (6) 确定性
+// ===========================================================================
+void RunDeterminism(Harness* h) {
+    // (a) 同一 (now, bucket) 反复求值逐位相同
+    BeatBucket b;
+    b.triggerSeconds = kT0;
+    b.periodSeconds = dshb::BeatPeriodSeconds(0.7, 0.3);
+    b.amplitudePx = dshb::BeatAmplitudePx(0.7, 0.3);
+    const double now = kT0 + 0.077;
+    const double first = dshb::BeatOffsetFromBucket(now, b);
+    bool same = true;
+    for (int i = 0; i < 2000; ++i) {
+        if (!BitSame(first, dshb::BeatOffsetFromBucket(now, b))) {
+            same = false;
             break;
         }
     }
-    out.peak = peak;
-    out.peakAt = peakAt * 1000.0;
-    out.fivePercentAt = five * 1000.0;
-    out.riseMs = (peakAt - five) * 1000.0;
-    out.riseFrames = (peakAt - five) * kHz;
-    out.atOnset = dshb::BeatOffsetPx(onset, h, 1.0);
-    return out;
+
+    // (b) 从同一初始状态重建：整段序列逐位相同
+    const std::vector<double> seqA = FixtureSequence(1.0, 0.0, 600);
+    const std::vector<double> seqB = FixtureSequence(1.0, 0.0, 600);
+    bool rebuild = seqA.size() == seqB.size();
+    for (std::size_t i = 0; rebuild && i < seqA.size(); ++i) rebuild = BitSame(seqA[i], seqB[i]);
+    // 这条不能是空检查：序列里必须真的有很多不同的值，而且换一拍必须变。
+    long long distinct = 0;
+    for (std::size_t i = 0; i < seqA.size(); ++i) {
+        bool seen = false;
+        for (std::size_t j = 0; j < i && !seen; ++j) seen = BitSame(seqA[i], seqA[j]);
+        if (!seen) ++distinct;
+    }
+    BeatBucket other = b;
+    other.triggerSeconds = kT0 - 0.02;   // 同样的 now，但这一拍不同 -> 位移必须不同
+    const double otherY = dshb::BeatOffsetFromBucket(now, other);
+
+    // (c) 位移与**绝对时间原点**无关：同一个 τ，触发时刻取 0 与取 1000 s 必须一致。
+    //     τ 只扫到 kBeatLen − 1e-6：正好压在 kBeatLen 上时，(1000+τ)−1000 的最后一位
+    //     可能把 τ 推到边界**外侧**（那里模块按约定返回恰好 0），差的就不是浮点噪声
+    //     而是一个真实的跳变（1.15e-4 px）。那是边界语义，不是原点依赖，不该混进来。
+    BeatBucket b0 = b;
+    b0.triggerSeconds = 0.0;
+    double worstOrigin = 0.0;
+    const double originSpan = dshb::kBeatLen - 1e-6;
+    for (int i = 0; i <= 200; ++i) {
+        const double tau = originSpan * static_cast<double>(i) / 200.0;
+        const double d = std::fabs(dshb::BeatOffsetFromBucket(tau, b0) -
+                                   dshb::BeatOffsetFromBucket(kT0 + tau, b));
+        if (d > worstOrigin) worstOrigin = d;
+    }
+
+    // (d) 诊断接口 CurrentBeatOnset：渲染循环不用它，但它是探针/自检的入口，
+    //     所以它的三个字段必须和夹具自己的记账一致。
+    const BeatOnset o = dshb::CurrentBeatOnset(now, b);
+    BeatBucket zero = b;
+    zero.amplitudePx = 0.0;
+    const BeatOnset oz = dshb::CurrentBeatOnset(now, zero);
+    const double yz = dshb::BeatOffsetFromBucket(now, zero);
+
+    const bool diagOk = o.valid && o.atSeconds == b.triggerSeconds &&
+                        o.tauSeconds == now - b.triggerSeconds && !oz.valid && yz == 0.0;
+    const bool ok = same && rebuild && distinct > 10 && otherY != first && worstOrigin < 1e-9 &&
+                    diagOk;
+    h->Req("case6",
+           "确定性：同一 (now, bucket) 逐位相同、同一初始状态重建逐位相同、位移与绝对时间原点无关",
+           "同一点求值 2000 次逐位相同=" + YN(same) + "（样本 " + F(first, 17) + " px @ now=1000.077 s）；"
+           "600 帧序列与重建序列逐位相同=" + YN(rebuild) + "（其中相异值 " + I(distinct) +
+           " 个；同一 now 换一拍给 " + F(otherY, 12) + " px != " + F(first, 12) +
+           " px，所以这不是一条恒真的空检查）；同一 τ∈[0, kBeatLen−1e-6] 在触发时刻 0 与 1000 s 上的最大差 " +
+           F(worstOrigin, 15) + " px；诊断接口：valid=" + YN(o.valid) + "、atSeconds-trigger=" +
+           F(o.atSeconds - b.triggerSeconds, 12) + " s、tauSeconds-(now-trigger)=" +
+           F(o.tauSeconds - (now - b.triggerSeconds), 12) + " s；幅度 0 的拍 valid=" + YN(oz.valid) +
+           " 且位移 " + F(yz, 12) + " px",
+           ok);
 }
-}  // namespace
 
 // ===========================================================================
-// (6) recovery
+// (7a) 守门：两个中心都在 95 ms
 // ===========================================================================
-namespace {
-struct RecoveryInfo {
-    double tRec = 0.0;
-    double fAtChange = 0.0;
-    double fAfterEase = 0.0;
-    double fMidRecovery = 0.0;
-    double fAtRecEnd = 0.0;
-    double fWellAfter = 0.0;
+//  把第一个中心放到 0 时，触发那一刻位移就已经是 3.61 px（A_max 的 72%），
+//  首帧落点最坏到 73.5% —— 上升段根本没被 60 Hz 采到。这条检查把那个对照数钉住，
+//  防止以后有人"为了好看"把中心挪回 0。对照曲线是探针内部重算的，不是模块的输出。
+struct FirstFrame {
+    double fraction = 0.0;   // 占幅度的比例
+    double at = 0.0;         // 出现在 τ（ms）
 };
 
-RecoveryInfo MeasureRecovery(double R, double D) {
-    RecoveryInfo out;
-    const std::vector<BeatChange> h = OneChange(R, D);
-    out.tRec = dshb::BeatRecoverySeconds(R, D);
-    const double t2 = dshb::BeatEaseT2Seconds();   // (1-rate^(60u))^c 落进 eps 以内的时刻
-    out.fAtChange = dshb::BeatFrequencyHz(kT0, h);
-    out.fAfterEase = dshb::BeatFrequencyHz(kT0 + t2 + 1e-9, h);
-    if (out.tRec > 0.0) {
-        // 恢复段是一条从 F2 到 F0_min 的**线性**斜坡，所以在 t2+T_rec 处它
-        // **恰好**等于 F_0_min —— 是等号，不是"趋近"。这条检查因此可以要求 1e-12。
-        out.fMidRecovery = dshb::BeatFrequencyHz(kT0 + t2 + out.tRec * 0.5, h);
-        out.fAtRecEnd = dshb::BeatFrequencyHz(kT0 + t2 + out.tRec, h);
-        out.fWellAfter = dshb::BeatFrequencyHz(kT0 + t2 + out.tRec + 10.0, h);
-    } else {
-        // T_rec = 0 -> 不需要恢复：缓动走完之后频率停在 F2，**不**降到 F0_min
-        out.fMidRecovery = dshb::BeatFrequencyHz(kT0 + t2 + 10.0, h);
-        out.fAtRecEnd = dshb::BeatFrequencyHz(kT0 + 600.0, h);
-        out.fWellAfter = out.fAtRecEnd;
+FirstFrame SweepFirstFrame(double mu1) {
+    FirstFrame out;
+    for (int q = 0; q < 1200; ++q) {
+        const double ph = (q + 0.5) / 1200.0;
+        const double tau = ph * kFrame;   // 触发之后第一个采样点
+        const double f = ShapeWithMu1(tau, mu1);
+        if (f > out.fraction) {
+            out.fraction = f;
+            out.at = tau * 1000.0;
+        }
     }
     return out;
 }
-}  // namespace
 
-// ===========================================================================
-// (10) K table: accuracy measured against a converged reference, and REAL memory
-// ===========================================================================
-namespace {
-//  ★ 这条是本轮新增的，为了回答"把表缩小之后精度有没有退"。
-//    做法：拿模块自己的 public 输出（BeatPhaseBeats）跟一个**收敛的**数值积分比。
-//    相位里 K 是被 (F2-F1) 加权后加进积分里的，所以下面的界要把 K 的误差乘回去。
-//
-//    K 的误差不能直接量（它不是公开接口）。但它的影响可以：R=1/D=0 时
-//      相位(1 s) = F1*e + (F2-F1)*K(e) + F2*(1-e)
-//    所以 K 的误差 * (F1-F2) 就是相位的误差。这里让积分走到 t2 之后一点点，
-//    也就是让 K 的实参恰好取到最大（e = t2 = 2.3126 s），这是表的**最坏工作点**。
-struct TableAccuracy {
-    double phaseErr = 0.0;      // |模块 - 收敛参考| 的相位误差（拍）
-    double kImpliedErr = 0.0;   // 折算回 K 的误差
-    double argMax = 0.0;        // K 的实参的上限（= t2）
-    double gotInc = 0.0;        // 模块给的增量
-    double wantInc = 0.0;       // 参考增量
-    double analytic = 0.0;      // 解析式给的增量
-    double T = 0.0;
-};
+void RunCentersGate(Harness* h) {
+    const bool equal = dshb::kBeatMu1 == dshb::kBeatMu2;
+    const bool at95 = dshb::kBeatMu1 >= 0.090 && dshb::kBeatMu1 <= 0.100;
 
-TableAccuracy MeasureTableAccuracy() {
-    TableAccuracy out;
-    const std::vector<BeatChange> h = OneChange(1.0, 0.0);   // F1=2, F2=0.05, T_rec=0
-    out.argMax = dshb::BeatEaseT2Seconds();
-    const double F1 = dshb::BeatF1(1.0), F2 = dshb::BeatF2(1.0);
+    const FirstFrame nowFirst = SweepFirstFrame(dshb::kBeatMu1);   // 现状：中心在 μ
+    const FirstFrame zeroFirst = SweepFirstFrame(0.0);             // 对照：第一个中心在 0
+    const double nowPct = 100.0 * nowFirst.fraction;
+    const double zeroPct = 100.0 * zeroFirst.fraction;
+    const double onsetNow = dshb::BeatShapeNorm(0.0);
+    const double onsetZero = ShapeWithMu1(0.0, 0.0);
 
-    // 取 T = t2 + 0.05：这一段里 K 的实参到达了最大值 t2。
-    //
-    //  ★ 量的是**增量** φ(kT0+T) − φ(kT0)，不是 φ 的绝对值：这个历史里 kT0 之前
-    //    还有一段常态，φ(kT0)=17.0；拿绝对值比会差出那 17 拍（假误差）。
-    //
-    //  ★★ 参考实现必须**避开 t2 处的折点**。我第一版用一条 n=2e6 的复化梯形直接
-    //     扫 [0,T]，得到 4.7246 —— 比真值 4.6272 高 0.097，看起来像"表不准"。
-    //     真正的原因是那个折点：w(t2)=eps=0.001，所以
-    //        F(t2−) = F1 + (F2−F1)·0.001 = 1.99805 而 F(t2+) = F2 = 0.0500
-    //     —— 相邻两个采样点之间 F 直接掉了 1.948，梯形在那两格上把面积算大了。
-    //     换句话说：那是我的参考错了，不是表错了。
-    //     正确做法是把 [0,t2] 与 [t2,T] **分开**积，而且上半段用 Simpson
-    //     （在光滑段上 Simpson 的误差是 h⁴ 量级，比梯形小得多）。
-    const double T = out.argMax + 0.05;
-    out.T = T;
-    out.gotInc = dshb::BeatPhaseBeats(kT0 + T, h) - dshb::BeatPhaseBeats(kT0, h);
-
-    // 参考 = ∫₀^t2 F1+(F2−F1)w du  +  ∫_t2^T F2 du
-    //      = F1·t2 + (F2−F1)·K(t2) + F2·(T−t2)
-    // K(t2) 用 Simpson，在 [0,t2] 上分 n 段（n 取偶数）。
-    auto integrand = [](double u) {
-        return std::pow(1.0 - std::pow(dshb::kBeatEaseRate, dshb::kBeatFrameHz * u),
-                        dshb::kBeatEaseC);
-    };
-    const int n = 200000;   // 偶数
-    const double hh = out.argMax / n;
-    double Kt2 = integrand(0.0) + integrand(out.argMax);
-    for (int i = 1; i < n; ++i) {
-        Kt2 += integrand(i * hh) * ((i % 2) ? 4.0 : 2.0);
-    }
-    Kt2 *= hh / 3.0;
-    out.wantInc = F1 * out.argMax + (F2 - F1) * Kt2 + F2 * (T - out.argMax);
-    // 第三条腿：模块自己的闭式（F1·e + (F2−F1)·K表(e) + F2·(T−t2)）与上面同式，
-    // 但 K 用的是**表**；两条腿一致就说明表与 Simpson 参考一致。
-    out.analytic = out.wantInc;
-    out.phaseErr = std::fabs(out.gotInc - out.wantInc);
-
-    const double dF = F1 - F2;
-    out.kImpliedErr = dF > 0.0 ? out.phaseErr / dF : out.phaseErr;
-    return out;
+    const bool ok = equal && at95 && zeroPct > 70.0 && nowPct <= 35.0;
+    h->Req("case7a", "守门：两个脉冲中心必须都在 95 ms（把第一个中心放回 0 -> 首帧跳变 73.5% 的对照）",
+           "常量 mu1=" + F(dshb::kBeatMu1 * 1000.0, 1) + " ms、mu2=" +
+               F(dshb::kBeatMu2 * 1000.0, 1) + " ms（相等=" + YN(equal) + "，规格 95 ms）"
+               "；对照（探针内部重算，只挪第一个中心）：中心在 0 时 τ=0 的位移占幅度 " +
+               F(100.0 * onsetZero, 2) + "%（A_max 下 " + F(onsetZero * dshb::kBeatAMax, 4) +
+               " px），首帧最坏 " + F(100.0 * zeroFirst.fraction, 2) + "% @ τ=" + F(zeroFirst.at, 2) +
+               " ms；现状（两个中心都在 " + F(dshb::kBeatMu1 * 1000.0, 0) + " ms）τ=0 的位移占幅度 " +
+               F(100.0 * onsetNow, 2) + "%（" + F(onsetNow * dshb::kBeatAMax, 4) + " px），首帧最坏 " +
+               F(nowPct, 2) + "% @ τ=" + F(nowFirst.at, 2) + " ms；倍数 " + F(zeroPct / nowPct, 2) + "x",
+           ok);
 }
+
+// ===========================================================================
+// (7b) 守门：脉冲不分段、无门闸
+// ===========================================================================
+//  ★ 老实说清楚本探针**量得出来**和**量不出来**的：
+//    · fma 与朴素减法的差别在本参数下只有 1e-16 量级（u 是小数减大数，差在最后一位），
+//      对形状的影响远低于任何可打印的位数 —— 探针**分不出**模块用的是哪一种。
+//    · 量得出来的是那个**门闸**（`if (τ < μ) return 0;`）：μ=0.095 时 τ→0 落进门里，
+//      函数返回 0，而正确值是 exp(-(0.095/σ)²/2)：第二个脉冲 0.164474、第一个 0.224941，
+//      整个包络在 τ=0 处是 0.204785（峰值的 20.48%）—— 一个 20% 到 67% 的洞。
+void RunPulseGate(Harness* h) {
+    const double taus[8] = {0.0,
+                            1e-18,
+                            1e-12,
+                            1e-9,
+                            dshb::kBeatMu1 * 0.5,
+                            dshb::kBeatMu1,
+                            dshb::kBeatLen * 0.5,
+                            dshb::kBeatLen};
+    int naiveZeros = 0;
+    int bitwiseAgree = 0;
+    double worstHole = 0.0;
+    double worstHoleAt = 0.0;
+    double worstFmaDiff = 0.0;
+    double atZeroModule = 0.0;
+    double atZeroNaive = 0.0;
+    for (double tau : taus) {
+        const double got = dshb::BeatShapeNorm(tau);
+        const double fma = FmaShapeNorm(tau);
+        const double naive = NaiveShapeNorm(tau);
+        const double fmaDiff = std::fabs(got - fma);
+        if (fmaDiff > worstFmaDiff) worstFmaDiff = fmaDiff;
+        if (BitSame(got, fma)) ++bitwiseAgree;
+        if (naive == 0.0) ++naiveZeros;
+        const double hole = std::fabs(got - naive);
+        if (hole > worstHole) {
+            worstHole = hole;
+            worstHoleAt = tau;
+        }
+        if (tau == 0.0) {
+            atZeroModule = got;
+            atZeroNaive = naive;
+        }
+    }
+    const double pulse1Zero = FmaPulse(0.0, dshb::kBeatMu1, dshb::kBeatSigma1);
+    const double pulse2Zero = FmaPulse(0.0, dshb::kBeatMu2, dshb::kBeatSigma2);
+    const double naivePulse2Zero = NaivePulse(0.0, dshb::kBeatMu2, dshb::kBeatSigma2);
+
+    // 断言的是"模块 == 不分段无门闸的 fma 重算"这件事本身（差 < 1e-15），
+    // 逐位相同的点数只作为证据印出来：fma 与朴素减法在最后一位上的差别取决于
+    // 编译器怎么排布这两份同源代码，拿逐位相等去卡会卡到编译器头上。
+    const bool ok = atZeroModule > 0.2 && atZeroNaive == 0.0 && naiveZeros == 5 &&
+                    worstHole > 0.6 && worstFmaDiff < 1e-15 && pulse2Zero > 0.16 &&
+                    naivePulse2Zero == 0.0;
+    h->Req("case7b",
+           "守门：脉冲不分段、无门闸 —— τ→0 时朴素写法（if (τ<μ) return 0）给 0，正确值 0.2048（包络）"
+           "/ 0.1645（第二个脉冲）",
+           "8 个 τ 点（0、1e-18、1e-12、1e-9、μ/2、μ、kBeatLen/2、kBeatLen）：模块与 fma 重算逐位相同 " +
+               I(bitwiseAgree) + "/8，最大差 " + F(worstFmaDiff, 18) + "；朴素门闸写法在其中 " +
+               I(naiveZeros) + " 个点上返回 0（全在 τ<μ 一侧），最大洞 " + F(worstHole, 9) +
+               " @ τ=" + F(worstHoleAt * 1000.0, 3) + " ms（= 峰值的 " + F(100.0 * worstHole, 2) +
+               "%，A_max 下 " + F(worstHole * dshb::kBeatAMax, 4) + " px）；τ=0 处：模块包络 " +
+               F(atZeroModule, 9) + "、朴素 " + F(atZeroNaive, 9) + "，逐个脉冲 pulse2(0)=" +
+               F(pulse2Zero, 9) + "（朴素 " + F(naivePulse2Zero, 9) + "，头文件写的 ≈0.165）、pulse1(0)=" +
+               F(pulse1Zero, 9) + "；位移换算：" + F(atZeroModule * dshb::kBeatAMax, 4) + " px vs " +
+               F(atZeroNaive * dshb::kBeatAMax, 4) + " px",
+           ok);
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -640,313 +1126,35 @@ int main(int argc, char** argv) {
     }
 
 #ifdef _WIN32
-    SetConsoleOutputCP(CP_UTF8);   // best effort; every number below is ASCII
+    SetConsoleOutputCP(CP_UTF8);   // 标题是中文；所有数字都是 ASCII
 #endif
 
     Harness h;
-    // ★ 在**任何**模块调用之前读一次工作集：这时 K 表（惰性构造）还没有被建立。
-    const std::size_t wsBefore = WorkingSetBytes();
-    std::printf("beatprobe: offline heartbeat-waveform proof (pure function, no clock, no file)\n");
-    std::printf("tuning: sigma1=%.0fms sigma2=%.0fms mu1=%.0fms mu2=%.0fms b2=%.2f "
-                "shapePeak=%.6f beatLen=%.3fs A_max=%.1fpx A_min=%.1fpx "
-                "F0min=%.4f F0max=%.4f Fmax=%.1f rate=%.4f c=%.1f recMax=%.0fs\n",
-                dshb::kBeatSigma1 * 1000.0, dshb::kBeatSigma2 * 1000.0, dshb::kBeatMu1 * 1000.0,
-                dshb::kBeatMu2 * 1000.0, dshb::kBeatB2, dshb::kBeatShapePeak, dshb::kBeatLen,
-                dshb::kBeatAMax, dshb::kBeatAMin, dshb::kBeatF0Min, dshb::kBeatF0Max,
-                dshb::kBeatFMax, dshb::kBeatEaseRate, dshb::kBeatEaseC, dshb::kBeatRecMax);
+    std::printf("beatprobe: 心跳位移波形的离线证明（纯函数：无时钟、无文件、无全局状态）\n");
+    std::printf("tuning: mu1=%.1f ms mu2=%.1f ms sigma1=%.1f ms sigma2=%.1f ms b2=%.2f "
+                "shapePeak=%.3f beatLen=%.3f s\n",
+                dshb::kBeatMu1 * 1000.0, dshb::kBeatMu2 * 1000.0, dshb::kBeatSigma1 * 1000.0,
+                dshb::kBeatSigma2 * 1000.0, dshb::kBeatB2, dshb::kBeatShapePeak, dshb::kBeatLen);
+    std::printf("        A: base=%.1f min=%.1f max=%.1f px | T: base=%.1f min=%.1f max=%.1f s "
+                "| frame=%.0f Hz\n",
+                dshb::kBeatABase, dshb::kBeatAMin, dshb::kBeatAMax, dshb::kBeatTBase,
+                dshb::kBeatTMin, dshb::kBeatTMax, dshb::kBeatFrameHz);
+    std::printf("scope: 量 src/heartbeat.cpp 的波形与两条律；生产层的计时循环在 src/widget_display.cpp "
+                "的 AdvanceBeat 里，本探针只把同一条规则当夹具复刻，那个循环由主代理用 --beat-frame "
+                "导帧验证\n");
 
-    RunHarnessSelfCheck(&h);
-    RunOneEnvelope(&h, verbose);
-
-    // ---- (2) worst-case single-frame jump, three cases ----
-    {
-        struct Case {
-            const char* name;
-            double R;
-            double D;
-        };
-        const Case cases[3] = {{"R=0/D=0", 0.0, 0.0},
-                               {"R=0.5/D=0.5", 0.5, 0.5},
-                               {"R=1/D=0", 1.0, 0.0}};
-        for (const Case& c : cases) {
-            const JumpSweep s = SweepJump(c.R, c.D);
-            const double pct = 100.0 * s.worst / s.amp;
-            h.Req("case2", std::string("worst single-frame jump <= 35% of amplitude (") +
-                              c.name + ")",
-                  "swept 1200 onset phases x 12 in-cell steps x 24 frames: worst jump=" +
-                      F(s.worst, 4) + " px = " + F(pct, 2) + "% of amplitude " +
-                      F(s.amp, 3) + " px, at onset+" + F(s.worstTau, 2) + " ms (onset phase " +
-                      F(s.worstPhase, 4) + " frame); first-frame value ranges " +
-                      F(s.atFirstFrame, 4) + ".." + F(s.atFirstFrameMax, 4) + " px",
-                  pct <= 35.0);
-        }
-    }
-
-    // ---- (2b) why the centres had to move ----
-    {
-        // 同样的两个高斯，只把第一个中心放回 t=0，量它的首帧跳变。
-        // ★ 这一段是**本地重算**的对比形状，不是模块的输出；它存在的唯一目的
-        //   是把"中心在 0 -> 首帧就已经吃掉大半个幅度"这个结论固定下来。
-        double worstNoShift = 0.0;
-        double worstNoShiftAt = 0.0;
-        for (int q = 0; q < 1200; ++q) {
-            const double ph = (q + 0.5) / 1200.0;
-            for (int c = 0; c <= 12; ++c) {
-                const double tau = (ph + c / 12.0) * kFrame;
-                if (tau > dshb::kBeatLen) continue;
-                const double y = ShapeHelperProbe(tau, 0.0);
-                if (y > worstNoShift) {
-                    worstNoShift = y;
-                    worstNoShiftAt = tau;
-                }
-            }
-        }
-        const JumpSweep nowSweep = SweepJump(0.0, 0.0);
-        const double nowPct = 100.0 * nowSweep.worst / dshb::kBeatAMax;
-        const double noShiftPct = 100.0 * worstNoShift;
-        h.Req("case2b",
-              "why the two centres had to move: with the first centre at t=0 the very first "
-              "frame already carries ~3/4 of the amplitude, versus ~1/3 with both centres at 95 ms",
-              "first centre at t=0 (what the previous spec version did): onset value=" +
-                  F(ShapeHelperProbe(0.0, 0.0) * dshb::kBeatAMax, 4) + " px, worst first-frame "
-                  "value=" + F(worstNoShift * dshb::kBeatAMax, 4) + " px = " +
-                  F(noShiftPct, 2) + "% of amplitude (at onset+" +
-                  F(worstNoShiftAt * 1000, 2) + " ms); both centres at mu=95 ms: onset value=" +
-                  F(dshb::BeatOffsetPx(OnsetForSampling(kT0, 0.0, 0.0), OneChange(0.0, 0.0), 1.0),
-                    4) +
-                  " px, worst first-frame value=" + F(nowSweep.worst, 4) + " px = " +
-                  F(nowPct, 2) + "%; reduction factor " + F(noShiftPct / nowPct, 2) + "x",
-              noShiftPct > 70.0 && nowPct <= 35.0);
-    }
-
-    // ---- (3) phase continuity vs naive sin(2*pi*F*t) ----
-    {
-        struct Case {
-            const char* name;
-            double R;
-            double D;
-        };
-        const Case cases[2] = {{"R=1/D=0", 1.0, 0.0}, {"R=0.5/D=0.5", 0.5, 0.5}};
-        for (const Case& c : cases) {
-            const ContinuityCase k = RunContinuity(c.R, c.D);
-            // 判据：朴素写法在变化那一刻**确实跳**（大于它自己正常的帧间步进），
-            // 而本模块的帧间跳变严格小于朴素写法的那个跳变（本例里是 0.0000）。
-            const bool ok = k.naiveJumpAtChange > k.naiveMaxPre * 0.5 &&
-                            k.beatJumpAtChange < k.naiveJumpAtChange * 0.5;
-            h.Req("case3", std::string("phase is continuous across a frequency change (") +
-                               c.name + ")",
-                  "F jumps " + F(k.fBefore, 4) + " -> " + F(k.fAfter, 4) + " Hz at t=" +
-                      F(2.0, 1) + " s; naive sin(2*pi*F*t) two-sided limit at that instant: " +
-                      F(k.naiveAtChangeBefore, 4) + " -> " + F(k.naiveAtChangeAfter, 4) +
-                      " px (discontinuity " + F(std::fabs(k.naiveAtChangeAfter -
-                                                         k.naiveAtChangeBefore), 4) +
-                      " px); this module's two-sided limit: " + F(k.beatAtChangeBefore, 6) +
-                      " -> " + F(k.beatAtChangeAfter, 6) + " px (discontinuity " +
-                      F(std::fabs(k.beatAtChangeAfter - k.beatAtChangeBefore), 6) +
-                      " px); worst frame jump straddling the change: naive " +
-                      F(k.naiveJumpAtChange, 4) + " px vs this module " +
-                      F(k.beatJumpAtChange, 4) + " px",
-                  ok);
-        }
-    }
-
-    // ---- (4) rise duration ----
-    {
-        const RiseInfo r = MeasureRise(0.0, 0.0);
-        const bool ok = r.riseFrames > 4.0 && r.riseFrames < 7.0 && r.atOnset > 0.5 &&
-                        r.atOnset < 1.5;
-        h.Req("case4", "rise duration: the displacement climbs from ~1 px at onset to the peak",
-              "onset value=" + F(r.atOnset, 4) + " px (" +
-                  F(100.0 * r.atOnset / dshb::kBeatAMax, 2) + "% of A_max); reaches 5% of peak at "
-                  "tau=" + F(r.fivePercentAt, 2) + " ms; peak " + F(r.peak, 6) + " px at tau=" +
-                  F(r.peakAt, 2) + " ms; rise duration=" + F(r.riseMs, 2) + " ms = " +
-                  F(r.riseFrames, 2) + " frames at 60 Hz",
-              ok);
-    }
-
-    // ---- (5) determinism ----
-    {
-        const std::vector<BeatChange> hh = OneChange(1.0, 0.5);
-        bool bitwise = true;
-        for (int i = 0; i < 2000; ++i) {
-            const double t = kT0 + 0.2 + i * 0.0007;
-            if (dshb::BeatOffsetPx(t, hh, 0.31) != dshb::BeatOffsetPx(t, hh, 0.31)) {
-                bitwise = false;
-                break;
-            }
-        }
-        bool rebuild = true;
-        for (int i = 0; i < 500; ++i) {
-            const double t = kT0 + 0.2 + i * 0.003;
-            const std::vector<BeatChange> h2 = OneChange(1.0, 0.5);
-            if (dshb::BeatOffsetPx(t, hh, 0.31) != dshb::BeatOffsetPx(t, h2, 0.31)) {
-                rebuild = false;
-                break;
-            }
-        }
-        // 同一帧反复求值（模拟"这一帧被重画两次"）也必须一致
-        bool reframe = true;
-        for (int i = 0; i < 1000; ++i) {
-            const double t = kT0 + 0.5 + i * 0.0003;
-            const double a = dshb::BeatOffsetPx(t, hh, 1.0);
-            const double b = dshb::BeatOffsetPx(t, hh, 1.0);
-            const double c = dshb::BeatOffsetPx(t, hh, 1.0);
-            if (!(a == b && b == c)) {
-                reframe = false;
-                break;
-            }
-        }
-        const double sample = dshb::BeatOffsetPx(kT0 + 0.7, hh, 0.31);
-        h.Req("case5", "determinism: the same (t, history, fade) always gives the same value",
-              "2000 pairwise evaluations bitwise equal=" + std::string(bitwise ? "yes" : "no") +
-                  "; 500 evaluations against a freshly built equal history=" +
-                  std::string(rebuild ? "yes" : "no") +
-                  "; 1000 frames evaluated 3x each identical=" +
-                  std::string(reframe ? "yes" : "no") + "; sample BeatOffsetPx(1000.7, R=1/D=0.5, "
-                  "fade=0.31)=" + F(sample, 12) + " px",
-              bitwise && rebuild && reframe);
-    }
-
-    // ---- (6) recovery ----
-    {
-        const RecoveryInfo r = MeasureRecovery(1.0, 1.0);
-        const bool ok = std::fabs(r.fAtRecEnd - dshb::kBeatF0Min) < 1e-12 &&
-                        std::fabs(r.fWellAfter - dshb::kBeatF0Min) < 1e-12 &&
-                        r.fAtChange > r.fAfterEase && r.fMidRecovery < r.fAfterEase;
-        h.Req("case6", "recovery: after T_rec the frequency is back to F_0_min (R=1/D=1)",
-              "T_rec=" + F(r.tRec, 2) + " s; F at change=" + F(r.fAtChange, 4) +
-                  " Hz (F1=" + F(dshb::BeatF1(1.0), 4) + "), after the ease=" +
-                  F(r.fAfterEase, 4) + " Hz (F2=" + F(dshb::BeatF2(1.0), 4) + "), mid-recovery=" +
-                  F(r.fMidRecovery, 4) + " Hz, exactly at t2+T_rec=" + F(r.fAtRecEnd, 9) +
-                  " Hz, 10 s later=" + F(r.fWellAfter, 9) + " Hz; F_0_min=" +
-                  F(dshb::kBeatF0Min, 4) + " Hz",
-              ok);
-    }
-
-    // ---- (6b) T_rec = 0 means "no recovery needed" ----
-    {
-        const RecoveryInfo r = MeasureRecovery(1.0, 0.0);
-        const double f2 = dshb::BeatF2(1.0);
-        const bool ok = r.tRec == 0.0 && std::fabs(r.fAtRecEnd - f2) < 1e-12;
-        h.Req("case6b", "T_rec == 0 means no recovery: the frequency stops at F2, not F_0_min",
-              "R=1/D=0 -> T_rec=" + F(r.tRec, 2) + " s; F at t2+10s = " + F(r.fMidRecovery, 6) +
-                  " Hz and at t2+60s = " + F(r.fAtRecEnd, 6) + " Hz; F2=" + F(f2, 6) +
-                  " Hz, F_0_min=" + F(dshb::kBeatF0Min, 4) + " Hz",
-              ok);
-    }
-
-    // ---- (7) silence is exactly 0 and beats never overlap ----
-    {
-        struct Case {
-            const char* name;
-            double R;
-            double D;
-        };
-        const Case cases[2] = {{"R=1/D=0 (fastest)", 1.0, 0.0}, {"R=0/D=0 (slowest)", 0.0, 0.0}};
-        for (const Case& c : cases) {
-            const std::vector<BeatChange> hh = OneChange(c.R, c.D);
-            // 跑 5 秒；对最慢那一档（58.8 s 一拍）这段时间里本来就没有第二拍，
-            // 所以"最小间隔"只对最快那一档有意义。
-            double minGap = 1e300;
-            double lastOnset = -1.0;
-            int zeros = 0;
-            int frames = 0;
-            for (int i = 0; i <= static_cast<int>(5.0 * kHz); ++i) {
-                const double t = kT0 + i * kFrame;
-                const double y = dshb::BeatOffsetPx(t, hh, 1.0);
-                const BeatOnset o = dshb::CurrentBeatOnset(t, hh);
-                if (o.valid) {
-                    if (lastOnset < 0.0 || o.atSeconds != lastOnset) {
-                        if (lastOnset > 0.0) {
-                            const double gap = o.atSeconds - lastOnset;
-                            if (gap < minGap) minGap = gap;
-                        }
-                        lastOnset = o.atSeconds;
-                    }
-                }
-                if (y == 0.0) ++zeros;
-                ++frames;
-            }
-            const bool gapOk = (minGap > dshb::kBeatLen) || (minGap > 1e299);
-            const bool ok = gapOk && zeros > 0 && dshb::kBeatLen < 1.0 / dshb::kBeatFMax;
-            h.Req("case7", std::string("beats never overlap and the tail is exactly 0 (") +
-                               c.name + ")",
-                  "over 5 s at 60 Hz: frames with displacement exactly 0=" + F(zeros, 0) + "/" +
-                      F(frames, 0) + "; min onset gap=" +
-                      (minGap > 1e299 ? std::string("n/a (only one beat in 5 s)")
-                                      : F(minGap, 6) + " s") +
-                      "; kBeatLen=" + F(dshb::kBeatLen, 3) + " s < 1/F_max=" +
-                      F(1.0 / dshb::kBeatFMax, 3) + " s",
-                  ok);
-        }
-    }
-
-    // ---- (8) the phase really is in BEATS ----
-    {
-        const std::vector<BeatChange> hh = OneChange(0.0, 0.0);   // F1 = F2 = F_0_min
-        const double f = dshb::kBeatF0Min;
-        double worstErr = 0.0;
-        std::string detail;
-        for (int nbeat = 1; nbeat <= 3; ++nbeat) {
-            const double want = kT0 + nbeat / f;
-            const BeatOnset o = dshb::CurrentBeatOnset(want + 1e-9, hh);
-            const double err = std::fabs(o.atSeconds - want);
-            if (err > worstErr) worstErr = err;
-            detail += " n=" + F(nbeat, 0) + ": want " + F(nbeat / f, 6) + " s got " +
-                      F(o.atSeconds - kT0, 6) + " s";
-        }
-        h.Req("case8", "the phase is in BEATS: with constant F the n-th onset is exactly n/F",
-              "F_0_min=" + F(f, 6) + " Hz;" + detail + "; worst error=" + F(worstErr, 12) + " s",
-              worstErr < 1e-6);
-    }
-
-    // ---- (9) fade scales the displacement and leaves the phase alone ----
-    {
-        const std::vector<BeatChange> hh = OneChange(0.0, 0.0);
-        const double onset = OnsetAbsolute(kT0, 0.0, 0.0);
-        const double t = onset + dshb::kBeatMu2;   // 峰值处
-        const double full = dshb::BeatOffsetPx(t, hh, 1.0);
-        const double half = dshb::BeatOffsetPx(t, hh, 0.5);
-        const double zero = dshb::BeatOffsetPx(t, hh, 0.0);
-        const BeatOnset o = dshb::CurrentBeatOnset(t, hh);
-        const bool ok = std::fabs(full - dshb::kBeatAMax) < 5e-3 &&
-                        std::fabs(half - 0.5 * full) < 1e-12 && zero == 0.0 &&
-                        std::fabs(o.atSeconds - onset) < 1e-9;
-        h.Req("case9", "fade multiplies the displacement but leaves the phase untouched",
-              "at the peak (tau=mu2=" + F(dshb::kBeatMu2 * 1000, 0) + " ms): fade=1 -> " +
-                  F(full, 6) + " px, fade=0.5 -> " + F(half, 6) + " px, fade=0 -> " +
-                  F(zero, 6) + " px; CurrentBeatOnset().atSeconds - onset = " +
-                  F(o.atSeconds - onset, 12) + " s",
-              ok);
-    }
-
-    // ---- (10) K table accuracy + measured memory ----
-    {
-        const TableAccuracy ta = MeasureTableAccuracy();
-        // 验收：K 的折算误差要远小于相位验收用的 1e-6（差两个数量级即可）。
-        const bool accOk = ta.kImpliedErr < 1e-8;
-
-        // 实测内存：跑完所有检查之后再读一次工作集。
-        const std::size_t wsAfter = WorkingSetBytes();
-        const long long grew = static_cast<long long>(wsAfter) - static_cast<long long>(wsBefore);
-        // K 表是惰性构造的，所以上面那两次读数之差就是它的真实代价。
-        const bool memOk = wsAfter > 0 && grew >= 0 && grew < 4LL * 1024 * 1024;
-
-        h.Req("case10",
-              "K table: accuracy against a converged reference, and MEASURED memory < 4 MB",
-              "K's argument tops out at e=min(u,t2)=t2=" + F(ta.argMax, 6) +
-                  " s (provable: BeatFPrime clamps it), so the table only needs [0, t2]; "
-                  "integrate past t2 (T=" + F(ta.T, 6) + " s) so K is used at its maximum: "
-                  "module increment=" + F(ta.gotInc, 12) + " beats, Simpson reference (split at "
-                  "the t2 kink)=" + F(ta.wantInc, 12) + ", difference " +
-                  F(ta.gotInc - ta.wantInc, 3) + " beats -> K error <= " +
-                  F(ta.kImpliedErr, 12) + " s (acceptance needs << 1e-6); "
-                  "MEASURED working set: before any module call " + HumanBytes(wsBefore) +
-                  ", after all checks " + HumanBytes(wsAfter) + ", growth " +
-                  HumanBytes(static_cast<std::size_t>(grew)) +
-                  " (the K table is lazily built on first call, so the growth IS its cost)",
-              accOk && memOk);
-    }
+    RunSelfCheck(&h);
+    RunEnvelope(&h, verbose);
+    RunJumpSweeps(&h);
+    RunAmplitudeLaw(&h);
+    RunPeriodLaw(&h);
+    RunTimerCount(&h);
+    RunTimerNoCatchUp(&h);
+    RunTimerNoRewind(&h);
+    RunSilenceWindow(&h);
+    RunDeterminism(&h);
+    RunCentersGate(&h);
+    RunPulseGate(&h);
 
     std::printf("\n%d passed, %d failed\n", h.passed, h.failed);
     if (!h.failures.empty()) {
