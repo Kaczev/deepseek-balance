@@ -1786,7 +1786,7 @@ void dshb::SetCurveStorePath(const std::wstring& path) {
 }
 
 // ---------------------------------------------------------------------------
-// "今日已X.XX¥"（所有者 2026-09-19）—— 口径与两个边界都在 widget_display.h 里
+// "今日已 X.XX¥"（所有者 2026-09-19）—— 口径与两个边界都在 widget_display.h 里
 // ---------------------------------------------------------------------------
 //  ★ 这里只说两件代码里看不出来的事：
 //
@@ -1883,10 +1883,10 @@ std::string TodayUsageText() {
     } else {
         amount = L"--.--";
     }
-    // ★ 数字**紧跟在"今日已"后面**，中间没有空格（所有者 2026-09-19："可以改成
-    //   '今日已15.32¥'"）。两种文案（有值 / --.--）都走这一行，所以"去空格"只在这里
-    //   发生一次 —— 分两处拼字符串就一定会有一处漏掉。
-    return Utf8FromWide(L"今日已" + amount + L"\u00A5");
+    // ★ 数字前面**有一个空格**（所有者 2026-09-19：先要求去掉、随后又要求加回来 ——
+    //   "我感觉没有空格好奇怪"）。两种文案（有值 / --.--）都走这一行，所以这个空格只在
+    //   这里发生一次 —— 分两处拼字符串就一定会有一处漏掉。
+    return Utf8FromWide(L"今日已 " + amount + L"\u00A5");
 }
 
 WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, bool currencyKnown,
@@ -1895,7 +1895,7 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     f.state = state;
     f.statusText = StatusTextFor(state);
     f.countdownText = CountdownText();
-    // "今日已X.XX¥"（所有者 2026-09-19）：标题那一行后面的灰色小字。
+    // "今日已 X.XX¥"（所有者 2026-09-19）：标题那一行后面的灰色小字。
     // ★ 它与状态无关，只与曲线存储和"现在"有关 —— 所以状态是"读不到余额"时它照样在
     //   （今天花了多少与"这一秒能不能读到余额"是两件事）。关闭态是唯一例外，见
     //   TodayUsageText 的第一行。
