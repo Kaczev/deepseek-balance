@@ -19,6 +19,7 @@
 #include "tray.h"       // 托盘图标 + 右键菜单（设计 §10.3）
 #include "tuning.h"     // 常量：所有可调值只有这一处来源（曾把 10000 硬编码在下面，改常量无效）
 #include "balance_source.h"
+#include "fx_rate.h"     // 汇率地址的默认值（--fx-url= 的测试旁路改它）
 
 #include <windows.h>
 #include <objbase.h>    // CoInitializeEx / COINIT_APARTMENTTHREADED
@@ -99,6 +100,22 @@ bool g_apiPlainHttp = false;
 int g_apiTimeoutMs = 5000;
 int g_apiIntervalMs = static_cast<int>(dshb::kApiIntervalMs);   // 唯一来源：常量（曾在这里硬编码 10000，改常量无效）
 dshb::BalanceSource g_apiSource;
+
+// ---- 汇率（所有者 2026-09-19：只在启动时取一次）----
+// 默认值全部来自 dshb::fx::RateEndpoint（fx_rate.h 里写了为什么是 frankfurter/ECB）。
+// --fx-url= 是**测试旁路**，与 --api-host= / --config= 同一条理由："取不到汇率不崩、
+// 不卡、退回 --.--"这句话必须在**不重编译**的前提下可复发 —— 指向一个故意连不上的
+// 本地端口，就是那条失败路径。--fx=off 则整段不发请求。
+bool g_fxOff = false;                                  // --fx=off
+std::wstring g_fxHost = dshb::fx::RateEndpoint{}.host;
+int g_fxPort = dshb::fx::RateEndpoint{}.port;
+bool g_fxPlainHttp = false;                            // --fx-plain-http
+std::wstring g_fxPath = dshb::fx::RateEndpoint{}.path;
+int g_fxTimeoutMs = dshb::fx::RateEndpoint{}.timeoutMs;
+// 汇率缓存文件（fx.json，数据目录里）。--fx-cache=<路径> 是测试旁路。
+bool g_fxCacheGiven = false;
+std::wstring g_fxCachePathGiven;
+std::wstring g_fxCachePath;      // 启动时定一次：这次到底读写哪个文件
 
 // ---- 币种点击（只认单击；拖动与长按都不算）----
 int g_pressX = 0, g_pressY = 0;
@@ -1841,6 +1858,44 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_apiTimeoutMs = _wtoi(argv[i] + 17);
         } else if (wcsncmp(argv[i], L"--api-interval-ms=", 18) == 0) {
             g_apiIntervalMs = _wtoi(argv[i] + 18);
+        } else if (wcscmp(argv[i], L"--fx=off") == 0) {
+            g_fxOff = true;
+        } else if (wcsncmp(argv[i], L"--fx-url=", 9) == 0) {
+            // 形如 host[:port][/path]，例：--fx-url=127.0.0.1:18080/latest?from=USD&to=CNY
+            // 只服务测试：解析失败就报一行并保持默认地址，**不猜**。
+            std::wstring url = argv[i] + 9;
+            std::wstring host = url;
+            std::wstring path = L"/";
+            const std::size_t slash = url.find(L'/');
+            if (slash != std::wstring::npos) {
+                host = url.substr(0, slash);
+                path = url.substr(slash);
+            }
+            const std::size_t colon = host.rfind(L':');
+            int port = 443;
+            if (colon != std::wstring::npos) {
+                port = _wtoi(host.c_str() + colon + 1);
+                host = host.substr(0, colon);
+            }
+            if (host.empty() || port <= 0 || port > 65535) {
+                SelfTestLog(L"[argv] --fx-url=%ls 解析不出可用的 host/port：保持默认 %ls",
+                            url.c_str(), g_fxHost.c_str());
+            } else {
+                g_fxHost = host;
+                g_fxPort = port;
+                g_fxPath = path;
+                SelfTestLog(L"[argv] --fx-url -> host=%ls port=%d path=%ls", g_fxHost.c_str(),
+                            g_fxPort, g_fxPath.c_str());
+            }
+        } else if (wcscmp(argv[i], L"--fx-plain-http") == 0) {
+            g_fxPlainHttp = true;
+        } else if (wcsncmp(argv[i], L"--fx-cache=", 11) == 0) {
+            // 测试旁路：任何会写存储的运行都必须把缓存写到临时路径上，
+            // 绝不碰数据目录里那一份（与 --config= / --curve-store= 同一条规矩）。
+            g_fxCacheGiven = true;
+            g_fxCachePathGiven = argv[i] + 11;
+        } else if (wcsncmp(argv[i], L"--fx-timeout-ms=", 16) == 0) {
+            g_fxTimeoutMs = _wtoi(argv[i] + 16);
         } else if (wcsncmp(argv[i], L"--scenario=", 11) == 0) {
             // Accepts a 1-based number (as printed by ScenarioName) or an ASCII alias.
             // A name that is not recognised USED to be swallowed by _wtoi and silently
@@ -2210,6 +2265,16 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             }
             dshb::SetCurveStorePath(curvePath);
             SelfTestLog(L"[paths] 曲线=%ls", curvePath.c_str());
+        }
+        // 汇率缓存：和 config.json / curve.json 同一个数据目录（所有者追加要求的第 1 条）。
+        // --fx-cache= 是测试旁路，与 --config= / --curve-store= 同一条理由：任何会写存储的
+        // 运行都绝不能碰真实数据目录里的那一份。
+        {
+            g_fxCachePath = paths.dataDir;
+            if (!g_fxCachePath.empty() && g_fxCachePath.back() != L'\\') g_fxCachePath += L'\\';
+            g_fxCachePath += L"fx.json";
+            if (g_fxCacheGiven) g_fxCachePath = g_fxCachePathGiven;
+            SelfTestLog(L"[paths] 汇率缓存=%ls", g_fxCachePath.c_str());
         }
         if (!paths.writable) {
             SelfTestLog(L"[paths] 降级：目录不可写（%ls），采样只留在内存，重启后没有历史",
@@ -2942,10 +3007,23 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             cfg.intervalMs = g_apiIntervalMs;
             cfg.once = g_apiOnce;
             cfg.apiKey = g_apiKey;   // 循环之前读好的，绝不打印
+            cfg.fxEnabled = !g_fxOff;
+            cfg.fxHost = g_fxHost;
+            cfg.fxPort = g_fxPort;
+            cfg.fxPlainHttp = g_fxPlainHttp;
+            cfg.fxPath = g_fxPath;
+            cfg.fxTimeoutMs = g_fxTimeoutMs;
+            cfg.fxCachePath = g_fxCachePath;
             g_apiSource.Start(cfg);
             g_realApiOn = true;
             SelfTestLog(L"[api] 真接口已启动：host=%ls port=%d 起始间隔=%dms 超时=%dms",
                         g_apiHost.c_str(), g_apiPort, g_apiIntervalMs, g_apiTimeoutMs);
+            // 汇率那一行（[fx] ...）由后台线程排在同一个日志队列里，所以它的时间戳
+            // 就是"取汇完成"的时刻；这里只记本次用的是哪个地址、缓存写在哪、有没有关掉。
+            SelfTestLog(L"[fx] 本次启动取汇：%ls host=%ls port=%d timeout=%dms 缓存=%ls"
+                        L"（fx_rate.h：只取一次，取不到用缓存）",
+                        g_fxOff ? L"关闭" : L"开启", g_fxHost.c_str(), g_fxPort, g_fxTimeoutMs,
+                        g_fxCachePath.c_str());
         }
 
         // 布局诊断：**每帧绘制结束、回到这里之后**才写文件（不在绘制路径里写，
@@ -3012,7 +3090,25 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             }
             std::string apiLine;
             // 带时间戳（设计 §10.5 的日志要求）：这样"暂停期间没请求""唤醒立刻补一次"可验证
-            while (g_apiSource.PollLog(&apiLine)) SelfTestLog(L"[api t=%.1fs] %hs", elapsed, apiLine.c_str());
+            // ★ 这里必须走 WidenUtf8，**不能**用 %hs：%hs 在宽格式里是按当前 C 区域设置
+            //   转换窄串的，而这一行现在是 UTF-8 字节（[fx] 那两行带中文）。逐字节当宽字符
+            //   的后果实测就是日志里出现 "ï¼frankfurter/ECB..." 这种乱码 —— 同一个坑
+            //   WidenUtf8 上面那段注释早就写过，这里只是又多了一个踩它的入口。
+            while (g_apiSource.PollLog(&apiLine)) {
+                // 含非 ASCII 字节 -> 是 UTF-8 文本，必须解码；纯 ASCII 两路等价。
+                bool nonAscii = false;
+                for (const char c : apiLine) {
+                    if (static_cast<unsigned char>(c) >= 0x80) {
+                        nonAscii = true;
+                        break;
+                    }
+                }
+                if (nonAscii) {
+                    SelfTestLog(L"[api t=%.1fs] %ls", elapsed, WidenUtf8(apiLine).c_str());
+                } else {
+                    SelfTestLog(L"[api t=%.1fs] %hs", elapsed, apiLine.c_str());
+                }
+            }
             // 连续失败到第 5 次才显示 --.--（阈值在 tuning.h）。
             // 跨过阈值/恢复各记一行：J6 要求日志能还原"为什么显示成这样"。
             static bool gaveUp = false;

@@ -27,6 +27,8 @@ add_executable(dshb
     src/state_machine.cpp
     src/widget_display.cpp src/heartbeat.cpp
     src/api_client.cpp
+    src/http_get.cpp
+    src/fx_rate.cpp
     src/json_min.cpp
     src/balance_source.cpp
     src/curve.cpp
@@ -60,10 +62,24 @@ target_include_directories(tauprobe PRIVATE src)
 
 # api probe: balance endpoint transport + parsing + error routing, with an offline case
 # runner. Same shape as coordprobe above; winhttp is the only extra library.
-add_executable(apiprobe tools/apiprobe.cpp src/api_client.cpp src/json_min.cpp)
+add_executable(apiprobe tools/apiprobe.cpp src/api_client.cpp src/http_get.cpp src/json_min.cpp)
 target_compile_definitions(apiprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(apiprobe PRIVATE src)
 target_link_libraries(apiprobe PRIVATE winhttp)
+
+# fx probe: the USD->CNY rate that a session fetches once, and the "give a CNY-only sample
+# a USD counterpart" step (src/fx_rate.h/.cpp). Two halves, and both are needed:
+#   * the INJECTION is offline and pure -- fixed rate in, entries out -- which is the only
+#     way to pin the boundary cases (a rate that lands on a half-cent, a sample that already
+#     has USD, a session with no rate at all) without waiting for an account to change.
+#   * the FETCH is one live request through the real transport, because "the URL answers"
+#     is not something an offline case can prove -- apiprobe has the same split (--live).
+# It also drives the curve store across two currencies, which is the owner's own sentence
+# ("加一个 USD 就可以正常使用") turned into a file: both keys in the same JSON point.
+add_executable(fxprobe tools/fxprobe.cpp src/fx_rate.cpp src/http_get.cpp src/curve_store.cpp src/amount.cpp src/json_min.cpp)
+target_compile_definitions(fxprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_include_directories(fxprobe PRIVATE src)
+target_link_libraries(fxprobe PRIVATE winhttp)
 
 # store probe: curve data layer (12-point ring, append-on-change, curve.json,
 # invalidation). Offline, no network and no shared state; like apiprobe and tauprobe

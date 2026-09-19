@@ -5,6 +5,7 @@
 // reachable from the offline case runner without a socket.
 #include "api_client.h"
 
+#include "http_get.h"
 #include "json_min.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -311,33 +312,15 @@ std::string LogLine(const BalanceResult& result) {
 }
 
 // --- live fetch --------------------------------------------------------------
+//
+// ★ 2026-09-19: the WinHTTP plumbing that used to live here moved to src/http_get.cpp,
+//   because a second host (the FX rate endpoint) needed the same thirty lines. What stays
+//   here is everything that is a *decision*: the endpoint check, the key check, and the
+//   routing of a status code + body through ClassifyTransport / ParseBalanceBody. Every
+//   message and every status this function produced before the move it still produces;
+//   the ["api t=..."] log lines of an existing run are unchanged.
 
 namespace {
-
-constexpr std::size_t kMaxBodyBytes = 1024 * 1024; // a balance answer is a few hundred bytes
-
-struct InternetHandle {
-    HINTERNET handle = nullptr;
-    InternetHandle() = default;
-    explicit InternetHandle(HINTERNET h) : handle(h) {}
-    ~InternetHandle() {
-        if (handle) WinHttpCloseHandle(handle);
-    }
-    InternetHandle(const InternetHandle&) = delete;
-    InternetHandle& operator=(const InternetHandle&) = delete;
-    explicit operator bool() const { return handle != nullptr; }
-};
-
-std::string ToUtf8(const std::wstring& text) {
-    if (text.empty()) return std::string();
-    const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
-                                         nullptr, 0, nullptr, nullptr);
-    if (size <= 0) return std::string();
-    std::string out(static_cast<std::size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), size,
-                        nullptr, nullptr);
-    return out;
-}
 
 BalanceResult TransportFailure(const char* what, unsigned long code) {
     BalanceResult result;
@@ -362,145 +345,53 @@ BalanceResult FetchBalance(const std::wstring& apiKey, const Endpoint& endpoint)
         return result;
     }
 
-    InternetHandle session(WinHttpOpen(L"deepseek-balance/0.2", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                       WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
-    if (!session) return TransportFailure("WinHttpOpen", GetLastError());
+    http::Request request;
+    request.host = endpoint.host;
+    request.port = endpoint.port;
+    request.secure = endpoint.secure;
+    request.path = endpoint.path;
+    request.timeoutMs = endpoint.timeoutMs;
+    request.authorization = L"Bearer " + apiKey;
 
-    WinHttpSetTimeouts(session.handle, endpoint.timeoutMs, endpoint.timeoutMs, endpoint.timeoutMs,
-                       endpoint.timeoutMs);
+    const http::Response response = http::Get(request);
 
-    // A balance request must go exactly where it was addressed: never let a redirect carry
-    // the Authorization header somewhere else.
-    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-    WinHttpSetOption(session.handle, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy,
-                     sizeof(redirectPolicy));
-
-    InternetHandle connection(WinHttpConnect(session.handle, endpoint.host.c_str(), endpoint.port, 0));
-    if (!connection) return TransportFailure("WinHttpConnect", GetLastError());
-
-    const DWORD flags = endpoint.secure ? WINHTTP_FLAG_SECURE : 0;
-    InternetHandle request(WinHttpOpenRequest(connection.handle, L"GET", endpoint.path.c_str(), nullptr,
-                                              WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
-    if (!request) return TransportFailure("WinHttpOpenRequest", GetLastError());
-
-    {
-        std::wstring header = L"Authorization: Bearer ";
-        header += apiKey;
-        if (!WinHttpAddRequestHeaders(request.handle, header.c_str(), static_cast<DWORD>(-1),
-                                      WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE)) {
-            const unsigned long code = GetLastError();
-            SecureZeroMemory(header.data(), header.size() * sizeof(wchar_t));
-            return TransportFailure("WinHttpAddRequestHeaders", code);
-        }
-        SecureZeroMemory(header.data(), header.size() * sizeof(wchar_t));
-    }
-
-    if (!WinHttpSendRequest(request.handle, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0,
-                            0, 0)) {
-        return TransportFailure("WinHttpSendRequest", GetLastError());
-    }
-    if (!WinHttpReceiveResponse(request.handle, nullptr)) {
-        return TransportFailure("WinHttpReceiveResponse", GetLastError());
-    }
-
-    DWORD statusCode = 0;
-    DWORD statusSize = sizeof(statusCode);
-    const bool haveStatus =
-        WinHttpQueryHeaders(request.handle, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize,
-                            WINHTTP_NO_HEADER_INDEX) != FALSE;
-
-    int retryAfter = -1;
-    {
-        wchar_t buffer[256] = {};
-        DWORD size = sizeof(buffer);
-        if (WinHttpQueryHeaders(request.handle, WINHTTP_QUERY_RETRY_AFTER, WINHTTP_HEADER_NAME_BY_INDEX,
-                                buffer, &size, WINHTTP_NO_HEADER_INDEX)) {
-            int seconds = 0;
-            if (ParseRetryAfterSeconds(ToUtf8(buffer), &seconds)) retryAfter = seconds;
-        }
-    }
-
-    // A cut-off transfer looks like a clean end-of-body to WinHTTP, so remember what the
-    // server promised. Without this, "the connection died mid-body" is indistinguishable
-    // from "the server sent malformed JSON" in the log (design 10.5 / steps J6).
-    long long declaredLength = -1;
-    {
-        wchar_t buffer[64] = {};
-        DWORD size = sizeof(buffer);
-        if (WinHttpQueryHeaders(request.handle, WINHTTP_QUERY_CONTENT_LENGTH,
-                                WINHTTP_HEADER_NAME_BY_INDEX, buffer, &size, WINHTTP_NO_HEADER_INDEX)) {
-            wchar_t* end = nullptr;
-            const long long parsed = std::wcstoll(buffer, &end, 10);
-            if (end != buffer && parsed >= 0) declaredLength = parsed;
-        }
-    }
-
-    std::string body;
-    bool readFailed = false;
-    bool tooLarge = false;
-    unsigned long readError = 0;
-    for (;;) {
-        DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(request.handle, &available)) {
-            readFailed = true;
-            readError = GetLastError();
-            break;
-        }
-        if (available == 0) break;
-        if (body.size() + available > kMaxBodyBytes) {
-            tooLarge = true;
-            break;
-        }
-        const std::size_t offset = body.size();
-        body.resize(offset + available);
-        DWORD read = 0;
-        if (!WinHttpReadData(request.handle, body.data() + offset, available, &read)) {
-            readFailed = true;
-            readError = GetLastError();
-            body.resize(offset);
-            break;
-        }
-        body.resize(offset + read);
-        if (read == 0) break;
-    }
-
-    if (!haveStatus) return TransportFailure("WinHttpQueryHeaders(status code)", GetLastError());
-
-    if (!readFailed && declaredLength >= 0 && static_cast<long long>(body.size()) < declaredLength) {
+    // The status code travels on every failure path that had one, exactly as before: the
+    // sampling loop's backoff and the log both read it.
+    if (!response.transportOk) {
         BalanceResult failure;
         failure.status = Status::TransportError;
-        failure.httpStatus = static_cast<int>(statusCode);
-        failure.retryAfterSeconds = retryAfter;
-        failure.detail = "body cut short: got " + std::to_string(body.size()) + " of " +
-                         std::to_string(declaredLength) + " declared bytes";
+        failure.httpStatus = response.httpStatus;
+        failure.retryAfterSeconds = response.retryAfterSeconds;
+        failure.detail = response.error;
         return failure;
     }
 
-    const Status classified = ClassifyTransport(readFailed, static_cast<int>(statusCode));
-    if (readFailed) {
-        BalanceResult failure = TransportFailure("WinHttpReadData", readError);
-        failure.httpStatus = static_cast<int>(statusCode);
-        return failure;
-    }
-    if (tooLarge) {
+    // A body that is not usable as a body: a transfer cut short by the server's own
+    // Content-Length, or one past the size cap. The HTTP code did arrive, so it is kept.
+    // The two map to different statuses here on purpose: "the answer never finished
+    // arriving" is a transport problem, while "the answer was told to be enormous" is a
+    // problem with the body we are looking at (design 4.4 leaves both to this layer).
+    if (!response.error.empty()) {
         BalanceResult failure;
-        failure.status = Status::ParseError;
-        failure.httpStatus = static_cast<int>(statusCode);
-        failure.detail = "response body is larger than " + std::to_string(kMaxBodyBytes) + " bytes";
+        failure.status = response.bodyTooLarge ? Status::ParseError : Status::TransportError;
+        failure.httpStatus = response.httpStatus;
+        failure.retryAfterSeconds = response.retryAfterSeconds;
+        failure.detail = response.error;
         return failure;
     }
+
+    const Status classified = ClassifyTransport(false, response.httpStatus);
     if (classified != Status::Ok) {
         result.status = classified;
-        result.httpStatus = static_cast<int>(statusCode);
-        result.retryAfterSeconds = retryAfter;
-        result.detail = "HTTP " + std::to_string(statusCode);
+        result.httpStatus = response.httpStatus;
+        result.retryAfterSeconds = response.retryAfterSeconds;
+        result.detail = "HTTP " + std::to_string(response.httpStatus);
         return result;
     }
 
-    result = ParseBalanceBody(body);
-    result.httpStatus = static_cast<int>(statusCode);
-    result.retryAfterSeconds = retryAfter;
+    result = ParseBalanceBody(response.body);
+    result.httpStatus = response.httpStatus;
+    result.retryAfterSeconds = response.retryAfterSeconds;
     return result;
 }
 
