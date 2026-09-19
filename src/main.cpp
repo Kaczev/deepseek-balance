@@ -1523,31 +1523,54 @@ bool g_haveStash = false;
 // ★ 起点从曲线存储里取（`curve.json` 最新那个点就是上次关掉前显示的余额），**不判它多老**：
 //   超过 86400 秒的存储在加载时已被整份丢弃（curve_store 的 §2.3 规则），所以这里拿到的
 //   必然在一天之内。取不到（首次运行、存储为空）时才退回原来的"首个采样直接显示"。
+// ★★ 但"起点"与"当前采样"是**同一笔余额**时不能演（所有者 2026-09-19 报的第二个现象）：
+//   曲线**只在余额变化时记点**（规格 §2.1），所以存储里最新那个点与现在的真实值之间
+//   完全可能什么都没发生 —— 那时"上次关掉前"就是"现在"，凭空演一次从旧值滚到新值，
+//   用户会以为余额降了，其实没降。判据就是下面那个整数比较：**真的不同才演**。
+//   ★ 为什么用整数比而不是"元的 double"：余额本来就是 1/10000 元的整数（设计 §3.1），
+//     走一趟浮点再比，等于把"相同"也交给舍入去裁决；两边都是 raw 整数时，"相同"是
+//     逐位相等的确定结论。
+//   ★ 为什么**不**引入"差得不多就不演"：那是一个新的隐式常量，会让"余额到底动没动"
+//     取决于一个没人写下来的阈值。不一致就是不演，一致就是演，只有两种。
 void CommitDelayed() {
     const dshb::Sample& s = g_states.lastGood();
     if (!g_haveStash) {
         g_haveStash = true;
         g_stash = s;
-        double startYuan = 0.0;
-        const bool haveStart = dshb::CurveStartBalance(&startYuan);
-        if (haveStart) {
+        dshb::Amount startAmount{};
+        const bool haveStart = dshb::CurveStartBalance(&startAmount);
+        // 比的是**屏幕上那一笔**的整数余额：`s.total` 就是接口的优先条目
+        // （balance_source 按 api::PreferredEntryIndex 挑出来的那一条，见那个文件），
+        // 也就是 `OnSample` 与 `FeedCurve` 用的同一个数。
+        // ★ 方向（余额涨了）不单独分支：起点在上、现在在下是"跌"，起点在下、现在在上是
+        //   "涨"，两者都由同一句过渡演出来（数字往上滚与往下滚是同一套行程，只是符号不同）。
+        //   单独为"涨"加一条判据会多出一个没有依据的口径 —— 而且"开机看见余额涨了"与
+        //   "开机看见余额跌了"一样，是真的发生了的事，都该演。
+        if (haveStart && startAmount != s.total) {
             dshb::Sample start = s;      // 币种/条目沿用当前样本，只把余额换成起点
-            start.total = dshb::Amount::FromYuanDouble(startYuan);
+            start.total = startAmount;
             start.amountsOk = true;
             g_display.OnSample(start);   // 先落位到"上次关掉前"
             g_display.OnSample(s);       // 再落到真实值：这一步会滚动（hasValue_ 已为真）
-            SelfTestLog(L"[commit] t=%.1fs 启动过渡：先落位到上次的 %.2f，再滚到 %.2f", g_elapsed,
-                        startYuan, s.total.ToDouble());
+            SelfTestLog(L"[commit] t=%.1fs 启动过渡：先落位到上次的 %hs，再滚到 %hs",
+                        g_elapsed, startAmount.ToString2().c_str(), s.total.ToString2().c_str());
             return;
         }
         g_display.OnSample(s);
-        SelfTestLog(L"[commit] t=%.1fs 首个采样直接显示：%.2f（存储里没有可用起点）", g_elapsed,
-                    s.total.ToDouble());
+        if (haveStart) {
+            // ★ 这一条就是"余额没变"：起点与当前是同一笔钱，没有过渡可演。
+            SelfTestLog(L"[commit] t=%.1fs 首个采样直接显示：%hs（存储里最新那个点就是它，"
+                        L"余额没变 -> 不演过渡）",
+                        g_elapsed, s.total.ToString2().c_str());
+        } else {
+            SelfTestLog(L"[commit] t=%.1fs 首个采样直接显示：%hs（存储里没有可用起点）",
+                        g_elapsed, s.total.ToString2().c_str());
+        }
         return;
     }
     g_display.OnSample(g_stash);
-    SelfTestLog(L"[commit] t=%.1fs 提交上一个采样 %.2f（最新 %.2f 已收到，压着等下一点）",
-                g_elapsed, g_stash.total.ToDouble(), s.total.ToDouble());
+    SelfTestLog(L"[commit] t=%.1fs 提交上一个采样 %hs（最新 %hs 已收到，压着等下一点）",
+                g_elapsed, g_stash.total.ToString2().c_str(), s.total.ToString2().c_str());
     g_stash = s;
 }
 

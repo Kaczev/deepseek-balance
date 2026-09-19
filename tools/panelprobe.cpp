@@ -288,6 +288,71 @@ int main(int argc, char** argv) {
                ok);
     }
 
+    // -----------------------------------------------------------------------
+    // (4) The restart transition's START POINT (CurveStartBalance): what it must hand back,
+    //     and what it must hand back when there is nothing to hand back.
+    //
+    //     ★ Why this belongs here rather than in storeprobe: the function lives in
+    //     widget_display.cpp, and the failure it guards is a *restart* failure. The store
+    //     records a point ONLY when the value changes, so the newest point and the live
+    //     balance are the same number whenever nothing happened while the app was closed --
+    //     and getting that case wrong made the widget perform a fall it had not had.
+    //     The whole fix rests on this function returning an amount that can be compared
+    //     EXACTLY (1/10000 yuan, Amount::raw) against the incoming sample, so a lossy
+    //     round trip through "yuan as a double" would put the bug back.
+    //
+    //     A single-point store is the resting shape of a real curve.json: quit after one
+    //     recorded change, or quit after a quiet hour. The value read back out of the FILE
+    //     must equal the value that went in, or "the balance did not change" cannot be
+    //     recognized as equality.
+    //
+    //     What this case does NOT cover: whether main.cpp's CommitDelayed actually treats
+    //     equality as "do not play". That is one `!=` on these two values, and the
+    //     end-to-end evidence for it is the widget's own `[commit]` log line.
+    // -----------------------------------------------------------------------
+    {
+        dshb::CurveStore store;
+        FeedStore(&store, 1, 48.80, 0.0, now - 600, 60);
+        (void)Install(store, "single48");
+        dshb::Amount start{};
+        const bool have = dshb::CurveStartBalance(&start);
+        // The same number the API would hand the widget, parsed the same way.
+        dshb::Amount current{};
+        const bool parsed = dshb::ParseAmount("48.80", &current);
+        const bool equal = have && parsed && start == current;
+        h.Req("case4a", "a one-point store hands back that point's amount, exactly "
+                        "(Amount::raw), so \"unchanged\" is recognizable as equality",
+               "stored \"48.80\" + one token -> CurveStartBalance=" +
+                   std::string(have ? start.ToString2() : "(none)") + " raw=" +
+                   Num(have ? static_cast<long long>(start.raw) : -1) + "; incoming \"48.80\" raw=" +
+                   Num(parsed ? static_cast<long long>(current.raw) : -1) +
+                   " -> equality=" + (equal ? "yes" : "NO"),
+               equal);
+
+        // Same store, and the one case that must still play: the balance really moved.
+        dshb::Amount lower{};
+        const bool parsedLower = dshb::ParseAmount("47.72", &lower);
+        const bool differs = have && parsedLower && start != lower;
+        h.Req("case4b", "the same start point is NOT equal to a lower balance, so the restart "
+                        "transition still has both endpoints and still plays",
+               "start \"48.80\" raw=" + Num(have ? static_cast<long long>(start.raw) : -1) +
+                   " vs \"47.72\" raw=" +
+                   Num(parsedLower ? static_cast<long long>(lower.raw) : -1) +
+                   " -> different=" + (differs ? "yes" : "NO"),
+               differs);
+
+        // No store at all: nothing to hand back, and the caller must fall back to "show the
+        // first sample directly" rather than invent a start value.
+        dshb::CurveStore empty;
+        (void)Install(empty, "none");
+        dshb::Amount fromEmpty{};
+        const bool got = dshb::CurveStartBalance(&fromEmpty);
+        h.Req("case4c", "an empty store reports \"no start point\" instead of inventing one",
+               std::string("0 points -> CurveStartBalance returned ") +
+                   (got ? "true (WRONG)" : "false"),
+               !got);
+    }
+
     std::printf("checks: %d passed, %d failed\n", h.passed, h.failed);
     for (const std::string& failure : h.failures) std::printf("failed line: %s\n", failure.c_str());
     std::printf("RESULT: %s\n", h.failed == 0 && h.passed > 0 ? "PASS" : "FAIL");

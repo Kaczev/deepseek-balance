@@ -820,18 +820,21 @@ void DiffSpan(const std::string& a, const std::string& b, int* from, int* to) {
 
 }  // namespace
 
-// 曲线存储里最新那个点的余额（元）。
+// 曲线存储里最新那个点的余额。
 // ★ 给启动过渡用（main.cpp 的 CommitDelayed）：起点就取它 —— "上次关掉前显示的余额"
 //   就是存储里最新那个点，不必在别处再存一份。取不到（存储为空）时返回 false。
 // ★ 不判它多老：超过 86400 秒的存储在加载时已被整份丢弃（curve_store 的 §2.3 规则），
 //   所以这里拿到的一定在一天之内。
-bool CurveStartBalance(double* outYuan) {
-    if (outYuan == nullptr) return false;
+// ★ 返回 Amount 而不是"元"的 double：调用方要拿它和**当前采样**判"变没变"，而两个
+//   整数（1/10000 元的 raw）比两个 double 更靠得住 —— 余额本来就是整数量，走一趟
+//   浮点再比等于把"相同"也交给舍入去裁决（设计 §3.1 就是为此定下的整数存储）。
+bool CurveStartBalance(Amount* outAmount) {
+    if (outAmount == nullptr) return false;
     const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
     for (std::size_t i = points.size(); i-- > 0;) {
         Amount amount;
         if (CurveValueOfEntry(points[i], &amount)) {
-            *outYuan = amount.ToDouble();
+            *outAmount = amount;
             return true;
         }
     }

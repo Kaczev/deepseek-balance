@@ -453,11 +453,13 @@ void SetCurveStorePath(const std::wstring& path);
 const std::string& CurveStorePath();
 const wchar_t* CountdownText();
 
-// 曲线存储里**最新那个点**的余额（元）。没有可用点（首次运行、存储为空/size<2 之外的
-// 任何情况）时返回 false，`*outYuan` 不动。
+// 曲线存储里**最新那个点**的余额。没有可用点（首次运行、存储为空/size<2 之外的
+// 任何情况）时返回 false，`*outAmount` 不动。
 // ★ 用途只有一个：启动过渡时给显示值一个"上次关掉前"的起点（main.cpp 的 CommitDelayed）。
 //   存储在这里是权威来源 —— "上次关机前显示的余额"就是它最新那个点，不用另存一份状态。
-bool CurveStartBalance(double* outYuan);
+// ★ 给的是 Amount（整数），不是"元"的 double：调用方必须拿它和当前采样**逐整数**比
+//   "变没变"，浮点比较会把"相同"交给舍入去裁决（见 .cpp 里那一段）。
+bool CurveStartBalance(Amount* outAmount);
 
 // ---- 曲线的滚动计时（规格 §3，导帧口子）----
 // --curve-frame=k：把滚动计时器**冻结**在 k/60 秒，于是"滚动中的第 k 帧"可以用
