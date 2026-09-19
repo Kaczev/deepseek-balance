@@ -4,7 +4,7 @@ rem  Roll viewer. ASCII ONLY.
 rem
 rem  Shows the widget and repeats the balance jump every 2 seconds
 rem  so the digit rolling can be judged by eye. Close this console
-rem  window (or press Esc) to stop.
+rem  window to stop (Esc no longer closes the widget).
 rem
 rem  SIZE: the panel is 315 x 129 SCREEN PIXELS, by owner decision.
 rem  (An earlier build scaled it by display DPI and produced 630 x 258

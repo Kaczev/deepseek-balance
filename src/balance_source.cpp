@@ -2,7 +2,6 @@
 
 #include "amount.h"
 #include "api_client.h"
-#include "fx_rate.h"
 #include "tuning.h"
 
 #include <windows.h>
@@ -32,13 +31,7 @@ std::wstring Widen(const std::string& s) {
 // 把 api_client 的结果变成一条 Sample。**成功与失败都要变成 Sample**：
 // 状态机靠"有没有成功样本"判断连接状态；界面靠 amountsOk 决定要不要动显示值——
 // 失败时 amountsOk=false，界面就保持原样（所有者："姑且先当作没变显示"）。
-//
-// ★ 汇率就在这一层用掉（`rate` 参数）。为什么是这里、而不是显示层或 OnSample：
-//   1. 这是**唯一**把 api::BalanceEntry 变成 CurrencyAmount 的地方 —— 换算是"再产生
-//      一个 CurrencyAmount"，和接口自己给的条目走同一条路，下游一个分支都不用加。
-//   2. 它在后台线程里跑，UI 线程每帧只做 Poll；显示层那一层没有网络、也不该有网络。
-//   3. 曲线记录（FeedCurve）吃的是 Sample::entries，所以补在这里 = 曲线自动有 USD 键。
-Sample MakeSample(const api::BalanceResult& r, const fx::Rate& rate) {
+Sample MakeSample(const api::BalanceResult& r) {
     Sample s{};
     s.wallMs = NowWallMsLocal();
     s.monotonicMs = static_cast<int64_t>(GetTickCount64());
@@ -71,20 +64,6 @@ Sample MakeSample(const api::BalanceResult& r, const fx::Rate& rate) {
         }
         s.entries.push_back(ca);
     }
-    // ---- 汇率原样带上（**折成元那个方向**：危险度 D 与曲线颜色唯一的换算口）----
-    // ★ 这是 `rate` 的第二个用处，而且方向相反：InjectUsdCounterpart 用它把元折成美元
-    //   （显示用，截断到分）；这里把"1 美元 = 多少元"逐字带给样本，供 fx::UsdAmountToYuan
-    //   把美元折回元。
-    // ★ 两者是**同一个响应**里的同一个数（base=USD&symbols=CNY 读出来就是美元->元），
-    //   所以不需要第二次请求；时机也没变 —— 仍然是启动时那一次（Run 的最前面）。
-    // ★ ok 逐字跟着 rate.ok：没有汇率 = "美元折不成元"，下游据此决定
-    //   （D 取什么值见 widget_display.cpp 的 AdvanceAmbience）。
-    s.usdToCnyOk = rate.ok;
-    s.usdToCnyText = rate.ok ? rate.rateText : std::string();
-
-    // 只有 CNY 的账号（大陆账号）在这里多出一个 USD 条目，形状和接口给的一模一样。
-    // 海外账号（已经有 USD）这条调用什么都不做，逐字段不变。
-    fx::InjectUsdCounterpart(&s, rate);
     s.note = r.detail;
     return s;
 }
@@ -136,39 +115,7 @@ void BalanceSource::Stop() {
     started_ = false;
 }
 
-void BalanceSource::Note(const std::string& line) {
-    std::lock_guard<std::mutex> lk(mu_);
-    logs_.push_back(line);
-}
-
 void BalanceSource::Run(BalanceSourceConfig cfg) {
-    // ---- 汇率：整条线程生命周期里只取这一次（所有者 2026-09-19）----
-    // ★ 放在 Run 的最前面、第一次采样之前，所以后台线程第一次交付样本时汇率已经就位；
-    //   UI 线程从头到尾不知道有"取汇"这回事，也不会因此掉一帧。
-    // ★ 它确实会推迟第一次采样：最长 = fxTimeoutMs + 读缓存。5 s 的硬超时就是这个代价
-    //   的上限，而暂停/唤醒（Pause/ResumeNow）走的是下面那个循环，**不会**再取第二次。
-    // ★ 回退顺序（所有者追加）：本次取汇 -> 磁盘缓存 -> 没有汇率。三步都在
-    //   fx::ResolveRate 里，这里只负责把地址和缓存路径给它、把结果记进日志。
-    fx::Rate fxRate{};
-    if (cfg.fxEnabled) {
-        fx::RateEndpoint fxEp{};
-        fxEp.host = cfg.fxHost;
-        fxEp.port = static_cast<unsigned short>(cfg.fxPort);
-        fxEp.secure = !cfg.fxPlainHttp;
-        fxEp.path = cfg.fxPath;
-        fxEp.timeoutMs = cfg.fxTimeoutMs;
-        fxRate = fx::ResolveRate(fxEp, cfg.fxCachePath);
-    } else {
-        fxRate.error = "--fx=off";
-    }
-    // 启动过渡那一行：成败都记，值/来源/日期/是否来自缓存/为什么回退都在里面。
-    Note(fxRate.LogLine());
-    if (!fxRate.cacheSaveError.empty()) {
-        // 取到了、这个会话能用，但下一次开机不会有它 —— 这一句是给"为什么下次还得再取"
-        // 留的解释，不是错误。
-        Note("[fx] 本次取到了汇率，但没能写进缓存：" + fxRate.cacheSaveError);
-    }
-
     // 设计 §4.1：启动后立即采一次，不等第一个 10 秒。
     bool first = true;
     while (!stop_.load()) {
@@ -214,7 +161,7 @@ void BalanceSource::Run(BalanceSourceConfig cfg) {
 
         const api::BalanceResult r = api::FetchBalance(Widen(cfg.apiKey), ep);
 
-        const Sample s = MakeSample(r, fxRate);
+        const Sample s = MakeSample(r);
         {
             std::lock_guard<std::mutex> lk(mu_);
             pending_.push_back(s);

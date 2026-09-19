@@ -583,7 +583,7 @@ void CheckMenuCloseFiresInOneShot() {
     const bool again = dshb::ShutdownFireNow();
     const bool clickAfter = dshb::ShutdownClick();
     const bool cancelAfter = dshb::ShutdownCancel();
-    const bool enterAfter = dshb::ShutdownEnter();
+    const bool enterAfter = dshb::ShutdownEnter(true);   // 取消路这里不相关：状态是 Fired，本来就拒绝
     Req("T20",
         "菜单那一项（id=kTrayMenuClose，见 T14）= 一下即 Fired：一次 ShutdownFireNow 就到第三击的"
         "终点状态（clicks=3 / R_d=1.00），不需要后续点击；进入段照跑，此后不受理任何输入",

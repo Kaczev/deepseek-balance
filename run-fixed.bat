@@ -11,7 +11,7 @@ rem
 rem  Uses --fixed-amount, which feeds ONE sample at startup and then skips every data
 rem  source, so the number never moves.
 rem
-rem  Press Esc to close the window.
+rem  Close it from the tray menu (Esc no longer closes the widget).
 rem ============================================================
 setlocal
 
@@ -28,5 +28,5 @@ rem Optional first argument changes the pinned amount: run-fixed.bat 1234.56
 set "AMOUNT=100.00"
 if not "%~1"=="" set "AMOUNT=%~1"
 
-echo [run-fixed] pinned at %AMOUNT% ; press Esc in the window to close.
+echo [run-fixed] pinned at %AMOUNT% ; close it from the tray menu.
 "%EXE%" --fixed-amount=%AMOUNT%

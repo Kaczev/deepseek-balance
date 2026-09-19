@@ -6,6 +6,11 @@
 // 一句话：**右键进入 → 三次点击即关 → 只有取消能把进度归零**，而第 1/2 击各把 R 的
 // 下限抬到 0.5 / 1.0（光晕颜色与心跳周期、幅度都读同一个 R）。
 //
+// ★ 进入关闭态还有一个前置条件：**得先有出去的路**。0.2 删掉全局 Esc 钩子之后，取消只剩
+//   "点到面板实体之外"一条，而那条路要靠宿主的全局鼠标钩子 —— 钩子装不上时状态机拒绝进入
+//   （case1a）。判"装上了没有"是宿主的事（InstallShutdownMouseHook 的返回值），本文件只收
+//   那一个 bool；离线没有钩子这回事，所以除 case1a 外一律按"宿主已备好取消路"进入。
+//
 // ★ 为什么这条性质要离线证：真机上 R 只抬不降（R(t)=a^t，抬升靠数据刷新或这两次点击），
 //   而进程冷启动时 R = 1.0（ambienceSeconds_ 初值 0）。要看到"第 1 击把 R 抬到 0.50"，
 //   真机上必须先等 R 衰减到 0.5 以下 —— 那是 75 秒的墙钟。这里用同一份 DisplayedAmount
@@ -187,8 +192,32 @@ int main(int argc, char** argv) {
               rCold == 0.0 && unreadableCold && rFlat == 0.0);
     }
 
+    // ---- 1c) 没有取消路 -> **不进关闭态**（0.2 的坑：全局 Esc 钩子删掉之后，取消只剩
+    //          "点到面板实体之外"一条，而它要靠宿主的全局鼠标钩子）----
+    // ★ 为什么这条要在这里、case1 之前：关闭态是模块级状态，只有此刻是 Off。
+    // ★ 那个 bool 就是宿主 `InstallShutdownMouseHook()` 的返回值（装上了/没装上只判那一处）；
+    //   本机平时装得上 WH_MOUSE_LL，所以"装不上"那一档在本文件里就是传 false 造出来的
+    //   （真机上由 dshb.exe 的 --no-mouse-hook 旁路造）。
+    {
+        const bool enteredNoPath = dshb::ShutdownEnter(false);
+        const bool untouched = !dshb::ShutdownActive() && !dshb::ShutdownFired() &&
+                               dshb::ShutdownClicks() == 0 && dshb::ShutdownFrame() == -1 &&
+                               dshb::ShutdownFloorRatio() == 0.0;
+        h.Req("case1a",
+              "没有取消路（钩子没装上）时进入关闭态被拒，且状态**一位都不改**"
+              "（保持 Off、clicks=0、frame=-1、R_d=0）—— 紧接着的 case1 证明这一拒没有把门卡住："
+              "备好取消路照样进得去",
+              "ShutdownEnter(cancelPathReady=false)=" +
+                  std::string(enteredNoPath ? "true" : "false") + " -> active=" +
+                  std::string(dshb::ShutdownActive() ? "yes" : "no") + " clicks=" +
+                  std::to_string(dshb::ShutdownClicks()) + " frame=" +
+                  std::to_string(dshb::ShutdownFrame()) + " R_d=" +
+                  F4(dshb::ShutdownFloorRatio()),
+              !enteredNoPath && untouched);
+    }
+
     // ---- 2) 右键进入：画面换掉，但 R 一动不动（还没点）----
-    const bool entered = dshb::ShutdownEnter();
+    const bool entered = dshb::ShutdownEnter(true);
     d.Update(1.0 / 60.0);
     h.Req("case1", "右键进入：状态机进 Armed、帧号从 0 开始，R_d 仍为 0（第 1 击才做那次运算），"
                    "R 只按时间走了一帧（1/60 s 的衰减）",
@@ -250,7 +279,7 @@ int main(int argc, char** argv) {
         for (int tier = 0; tier <= 2; ++tier) {
             dshb::DisplayedAmount c;
             SeedAndDecay(&c, 100);
-            dshb::ShutdownEnter();
+            dshb::ShutdownEnter(true);
             for (int k = 0; k < tier; ++k) dshb::ShutdownClick();
             const double rAtTier = c.ambienceRatioShown();
             const bool cancelled = dshb::ShutdownCancel();
@@ -269,8 +298,8 @@ int main(int argc, char** argv) {
                       " 取消后R=" + F4(rAfter) + " 再跑60s R=" + F4(rDecayed) +
                       std::string(releases ? "(继续掉)" : "(没掉!)") + "; ";
         }
-        h.Req("case6", "取消（Esc 或点到别处走同一个 ShutdownCancel）：0/1/2 击三档都能取消，"
-                       "进度归零、R_d 归零、R 交回时间自己衰减",
+        h.Req("case6", "取消（宿主唯一的取消入口是「点到别处」，走 ShutdownCancel）：0/1/2 击三档"
+                       "都能取消，进度归零、R_d 归零、R 交回时间自己衰减",
               detail, ok);
     }
 
@@ -308,7 +337,7 @@ int main(int argc, char** argv) {
     {
         dshb::DisplayedAmount c;
         RunSeconds(&c, 0, 10);
-        const bool enteredNow = dshb::ShutdownEnter();
+        const bool enteredNow = dshb::ShutdownEnter(true);
         const double p0 = dshb::ShutdownEntryProgress(0);
         const double p3 = dshb::ShutdownEntryProgress(3);
         const double p7 = dshb::ShutdownEntryProgress(dshb::kShutdownEntryFrames);
@@ -330,8 +359,8 @@ int main(int argc, char** argv) {
 
     // ---- 10) 第 3 击：发信号，此后不再受理、不重复触发（放在最后：它钉住 Fired）----
     // ★ 先取状态再试着动它：三下之后每一次输入都必须被拒，且状态**一位都不许变**
-    //   （少了 Fired 那道闸，一次 Esc 就能把该关的挂件留在屏幕上）。
-    dshb::ShutdownEnter();
+    //   （少了 Fired 那道闸，"点到别处"就能把该关的挂件留在屏幕上）。
+    dshb::ShutdownEnter(true);
     dshb::ShutdownClick();
     dshb::ShutdownClick();
     const bool fired3 = dshb::ShutdownClick();
@@ -339,7 +368,7 @@ int main(int argc, char** argv) {
     const int clicksAfterFired = dshb::ShutdownClicks();
     const bool clickAfterFired = dshb::ShutdownClick();
     const bool cancelAfterFired = dshb::ShutdownCancel();
-    const bool enterAfterFired = dshb::ShutdownEnter();
+    const bool enterAfterFired = dshb::ShutdownEnter(true);
     h.Req("case5", "第 3 击：ShutdownFired=yes；再点、再取消、再进入**都不受理**（不重复触发、不产生第二个实例）",
           "fired3=" + std::string(fired3 ? "yes" : "no") + " ShutdownFired=" +
               std::string(firedState ? "yes" : "no") + " 点满后 clicks=" + std::to_string(clicksAfterFired) +
@@ -375,7 +404,7 @@ int main(int argc, char** argv) {
         const bool fireAgain = dshb::ShutdownFireNow();
         const bool clickAfter = dshb::ShutdownClick();
         const bool cancelAfter = dshb::ShutdownCancel();
-        const bool enterAfter = dshb::ShutdownEnter();
+        const bool enterAfter = dshb::ShutdownEnter(true);
         h.Req("case9",
               "托盘「关闭」那个口子（ShutdownFireNow）：已在关闭态（Armed、已点 1 下）时"
               "**一次调用**就到第三击的终点状态（clicks=3 / Fired / R_d=1.00 / 亮度按第 2 击那一档），"

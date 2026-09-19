@@ -313,9 +313,8 @@ std::string LogLine(const BalanceResult& result) {
 
 // --- live fetch --------------------------------------------------------------
 //
-// ★ 2026-09-19: the WinHTTP plumbing that used to live here moved to src/http_get.cpp,
-//   because a second host (the FX rate endpoint) needed the same thirty lines. What stays
-//   here is everything that is a *decision*: the endpoint check, the key check, and the
+// ★ 2026-09-19: the WinHTTP plumbing that used to live here moved to src/http_get.cpp.
+//   What stays here is everything that is a *decision*: the endpoint check, the key check, and the
 //   routing of a status code + body through ClassifyTransport / ParseBalanceBody. Every
 //   message and every status this function produced before the move it still produces;
 //   the ["api t=..."] log lines of an existing run are unchanged.

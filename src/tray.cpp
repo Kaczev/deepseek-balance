@@ -324,8 +324,9 @@ LRESULT CALLBACK MenuPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                           static_cast<int>(static_cast<short>(HIWORD(lp))));
         return 0;
     case WM_KEYDOWN:
-        // Esc 关掉（不选任何东西）。★ 这一支**不是**主要入口：面板会拿到键盘焦点，
-        //   但主窗口那一侧的 Esc 钩子照样能关整个程序 —— 两者不冲突，各关各的。
+        // Esc 关掉（不选任何东西）。★ 这一支**只关系到这个托盘面板自己**：弹出菜单按 Esc
+        //   收起是 Windows 惯例，与挂件的生死无关。
+        //   （挂件那边的全局 Esc 钩子已在 0.2 删除 —— 它会在**任何程序**里按 Esc 就关掉挂件。）
         if (wp == VK_ESCAPE) ActivateMenuPanel(2, -1, -1);
         return 0;
     default:

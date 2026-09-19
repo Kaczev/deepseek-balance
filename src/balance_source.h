@@ -32,19 +32,6 @@ struct BalanceSourceConfig {
     int intervalMs = static_cast<int>(kApiIntervalMs);   // 默认 = 上限（自适应会自己缩短）
     std::string apiKey;
     bool once = false;               // 只取一次就停（自检用）
-
-    // ---- 汇率（所有者 2026-09-19：只在启动时取一次）----
-    // 地址可换，理由与上面的 host/port 一样：失败路径必须能在不重编译的前提下复发
-    // （指向一个故意连不上的本地端口）。默认 = frankfurter/ECB，理由与实测地址见 fx_rate.h。
-    bool fxEnabled = true;
-    std::wstring fxHost = L"api.frankfurter.dev";
-    int fxPort = 443;
-    bool fxPlainHttp = false;
-    std::wstring fxPath = L"/v1/latest?base=USD&symbols=CNY";
-    int fxTimeoutMs = 5000;
-    // 汇率缓存文件（fx.json）。空 = 不读也不写缓存，直接走"取不到就没有"。
-    // 所有者追加的要求：取到了要落盘，本次取不到就用上一次存下来的。
-    std::wstring fxCachePath;
 };
 
 class BalanceSource {
@@ -64,11 +51,6 @@ public:
     bool Poll(Sample* out);
     // UI 线程：取走一行日志（J6）。行内不含 Key。
     bool PollLog(std::string* out);
-    // 在**同一个日志队列**里排一行（供后台线程/夹具使用，行内不含 Key）。
-    // 为什么要有它：汇率那一行是在后台线程里、第一个样本之前产生的，而日志队列是
-    // UI 线程唯一读日志的地方；排进同一条队列，就能保证它和样本按同一顺序出现在
-    // 主日志里（而不是被写到一个没人读的地方）。
-    void Note(const std::string& line);
     // 连续失败次数。所有者定的规则：失败时先"当作没变"，连续 5 次才显示 --.--
     int consecutiveFailures() const { return failures_.load(); }
     // 距离下一次请求还有多少毫秒（给右上角倒计时用）。没有排定则 0。

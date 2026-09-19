@@ -19,7 +19,6 @@
 #include "tray.h"       // 托盘图标 + 右键菜单（设计 §10.3）
 #include "tuning.h"     // 常量：所有可调值只有这一处来源（曾把 10000 硬编码在下面，改常量无效）
 #include "balance_source.h"
-#include "fx_rate.h"     // 汇率地址的默认值（--fx-url= 的测试旁路改它）
 
 #include <windows.h>
 #include <objbase.h>    // CoInitializeEx / COINIT_APARTMENTTHREADED
@@ -40,7 +39,7 @@ constexpr wchar_t kClassName[] = L"DshbWnd";
 constexpr wchar_t kSelfTestLog[] = L"selftest.log";
 
 bool g_selfTest = false;
-double g_runSeconds = 0.0;        // 0 = 不自动退出，等用户按 Esc（--seconds=N 可改）
+double g_runSeconds = 0.0;        // 0 = 不自动退出，一直跑到关闭流程或 WM_CLOSE（--seconds=N 可改）
 double g_selfTestSeconds = 1.5;
 bool g_exportFrame = false;       // 离屏导一帧，然后退出
 bool g_premulProbe = false;       // 预乘自检（A8c）
@@ -48,11 +47,7 @@ wchar_t g_exportPath[MAX_PATH] = L"frame.png";
 int g_frameNo = 1;
 HWND g_hwnd = nullptr;
 
-// Defined further down; declared here because WndProc (which runs before them) calls them.
-void InstallEscHook();
-
-void RemoveEscHook();
-// 关闭态的三个判定口（同样定义在下面，WndProc 先用）：进入 / 计数 / 取消。
+// 关闭态的三个判定口（定义在下面，WndProc 先用）：进入 / 计数 / 取消。
 void EnterShutdownState();
 void HandleShutdownClick(int which);
 void CancelShutdownState(const wchar_t* why);
@@ -101,22 +96,6 @@ int g_apiTimeoutMs = 5000;
 int g_apiIntervalMs = static_cast<int>(dshb::kApiIntervalMs);   // 唯一来源：常量（曾在这里硬编码 10000，改常量无效）
 dshb::BalanceSource g_apiSource;
 
-// ---- 汇率（所有者 2026-09-19：只在启动时取一次）----
-// 默认值全部来自 dshb::fx::RateEndpoint（fx_rate.h 里写了为什么是 frankfurter/ECB）。
-// --fx-url= 是**测试旁路**，与 --api-host= / --config= 同一条理由："取不到汇率不崩、
-// 不卡、退回 --.--"这句话必须在**不重编译**的前提下可复发 —— 指向一个故意连不上的
-// 本地端口，就是那条失败路径。--fx=off 则整段不发请求。
-bool g_fxOff = false;                                  // --fx=off
-std::wstring g_fxHost = dshb::fx::RateEndpoint{}.host;
-int g_fxPort = dshb::fx::RateEndpoint{}.port;
-bool g_fxPlainHttp = false;                            // --fx-plain-http
-std::wstring g_fxPath = dshb::fx::RateEndpoint{}.path;
-int g_fxTimeoutMs = dshb::fx::RateEndpoint{}.timeoutMs;
-// 汇率缓存文件（fx.json，数据目录里）。--fx-cache=<路径> 是测试旁路。
-bool g_fxCacheGiven = false;
-std::wstring g_fxCachePathGiven;
-std::wstring g_fxCachePath;      // 启动时定一次：这次到底读写哪个文件
-
 // ---- 币种点击（只认单击；拖动与长按都不算）----
 int g_pressX = 0, g_pressY = 0;
 unsigned long long g_pressTick = 0;
@@ -129,7 +108,6 @@ bool g_pressValid = false;
 bool g_configGiven = false;
 std::wstring g_configPath;
 std::wstring g_configFile;   // 启动时定一次：这次到底读写哪个文件
-bool g_currenciesGiven = false;   // --currencies=：合成一条多币种样本（验证切换用）
 bool g_curveStoreGiven = false; // --curve-store=：把曲线记录文件改到别处（测试专用，绝不碰真实数据）
 std::wstring g_curveStorePath;
 bool g_logGlowStats = false;    // TEMPORARY (task 2): --log-glow-stats
@@ -137,7 +115,6 @@ int g_ambienceGlide = 0;        // TEMPORARY (task 2): --ambience-glide=N
 int g_realFrames = 0;           // TEMPORARY: --real-frames=N (bounded real-loop run)
 int g_realFrameCount = 0;       // TEMPORARY
 bool g_forceNewInstance = false; // TEMPORARY: --force-new-instance (run beside the live widget)
-std::string g_currenciesSpec;   // 形如 "CNY:19.20,USD:2.70"
 bool g_realApiPlanned = false;  // 进循环之前就定下"本次要不要用真接口"
 
 bool g_countdownGiven = false;  // --countdown=N：导帧时给倒计时一个固定值（导帧不取样）
@@ -146,20 +123,23 @@ std::string g_apiKey;           // 只在内存里，绝不写日志
 bool g_clickTest = false;         // --click-test：注入三次手势
 // ---- 关闭态（设计 §10.2）：夹具、剧本 ----
 double g_shutdownTest = -1.0;      // --shutdown-test=GAP：三击剧本（-1 = 不跑）；GAP = 第 2/3 击之间
-bool g_shutdownEscTest = false;    // --shutdown-esc-test：三档各取消一次
-bool g_shutdownEnterHold = false;  // --shutdown-enter-at=N：进入关闭态后不再受理脚本输入
+bool g_shutdownEnterHold = false;  // --shutdown-hold：进入关闭态后不再受理脚本输入
 double g_shutdownEnterAt = 1.0;
 int g_shutdownFixtureFrame = -1;   // --shutdown-frame=k：导帧夹具（-1 = 未给）
 int g_shutdownFixtureClicks = 1;   // --shutdown-clicks=N：导帧夹具（已点几下）
-// 关闭态的日志标志：消息处理、Esc 钩子、鼠标钩子里**只置位**，日志一律回主循环写。
+// --no-mouse-hook：**测试旁路**（生产默认关）。让"全局鼠标钩子装不上"这条路能被造出来 ——
+// 本机平时装得上 WH_MOUSE_LL，而"装不上就不进关闭态"这条规则只有装不上时才看得见，
+// 一条永远走不到的分支等于没验过。它只改 InstallShutdownMouseHook 的返回值，不动别的行为。
+bool g_noMouseHook = false;
+// 关闭态的日志标志：消息处理与鼠标钩子里**只置位**，日志一律回主循环写。
 // ★ 理由与钩子那条硬约束有关：WH_MOUSE_LL 的回调超过约 300 ms 不返回会被系统静默摘除，
 //   而写文件是慢的（见下面关闭态那一块的说明）。
 bool g_closeEnterPending = false;      // 刚进入关闭态
 const wchar_t* g_closeEnterWhy = L"右键";  // 谁让它进的：日志要分得清（右键点窗口 / 托盘菜单）
 int g_closeClickPending = -1;          // >= 0 = 待记的那一击（1..3）
 int g_closeWhichPending = 0;           // 0 = 左键，1 = 右键
-bool g_closeCancelPending = false;     // Esc / 点到别处 -> 取消
-const wchar_t* g_closeCancelWhy = L""; // "Esc" / "点到别处"
+bool g_closeCancelPending = false;     // 点到别处 -> 取消
+const wchar_t* g_closeCancelWhy = L""; // "点到别处"
 bool g_closeRefusedPending = false;    // 粒子期间不受理输入：这一下被拒了
 bool g_closeWaitParticles = false;     // 第 3 击之后：粒子播完就退出进程
 int64_t g_lastSymClickMs = 0;      // 上次点击符号的墙钟毫秒（双击判定用）
@@ -727,12 +707,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_DESTROY:
-        RemoveEscHook();
         RemoveShutdownMouseHook();   // 关闭态里的全局鼠标钩子绝不能活过窗口
         // ★ 托盘图标必须在这里摘掉，不能等进程退出：NIM_ADD 之后进程直接死掉会在任务栏
         //   上留一个**僵尸图标**（悬停还有提示、点它没反应，只有鼠标扫过去才消失），
         //   而用户看到的正是"程序关了图标还在" —— 设计 §10.3 明确否掉了这种形态。
-        //   WM_CLOSE 与 Esc 都走 DestroyWindow -> 这里，所以每条退出路径都收得到。
+        //   WM_CLOSE（含关闭流程走完）走 DestroyWindow -> 这里，所以每条退出路径都收得到。
         RemoveTrayIcon();
         g_running = false;
         PostQuitMessage(0);
@@ -787,11 +766,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HandleTrayMenuCommand(static_cast<UINT>(wp));
         return 0;
     case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) {
-            g_running = false;
-            PostQuitMessage(0);
-            return 0;
-        }
         // ---- B6/B7 的调试热键：F1..F9 选情形，R 触发充值，C 触发时钟跳变 ----
         if (wp >= VK_F1 && wp < VK_F1 + static_cast<WPARAM>(dshb::Scenario::Count)) {
             const auto idx = static_cast<dshb::Scenario>(wp - VK_F1);
@@ -842,49 +816,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// ---------------------------------------------------------------------------
-// Esc：**关闭态里只取消，非关闭态直接关窗口**（所有者 2026-09-19 定的分寸）。
-//
-// WHY a keyboard hook instead of WM_KEYDOWN: this window is deliberately
-// non-activating (it must never steal focus from what the user is doing), so it
-// never receives keyboard messages -- the WM_KEYDOWN branch in WndProc below is
-// unreachable in practice. A low-level hook sees the key before any window does
-// and needs no focus at all. It is installed only while the widget is on screen,
-// never in the offscreen export / self-test runs.
-//
-// The hook does NOT swallow the key: it returns CallNextHookEx unconditionally, so
-// Esc still reaches whatever the user was actually typing into.
-// ---------------------------------------------------------------------------
-HHOOK g_escHook = nullptr;
-
-// 判定口在下面（关闭态那一块里）定义：钩子与测试剧本走**同一个**函数，
-// 所以"两条路径行为一致"是结构上的，不是靠两处都写对。
-void HandleEscapeKeyPress();
-
-LRESULT CALLBACK EscHookProc(int code, WPARAM wp, LPARAM lp) {
-    if (code == HC_ACTION && (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)) {
-        const KBDLLHOOKSTRUCT* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
-        // Any Escape closes it, injected or not. NOTE: do NOT filter on the LLKHF_INJECTED
-        // bit here -- measured, that bit is set on ordinary hardware key presses too (a
-        // keyboard hook receiving events destined for another process sees injected=1),
-        // so filtering on it silently disables the feature. Esc is harmless to accept.
-        if (kb && kb->vkCode == VK_ESCAPE) {
-            // 关闭态里 Esc **只取消**（不关窗口）；非关闭态维持原样（直接关窗口，所有者一直在用）。
-            // 这条判断只在 HandleEscapeKeyPress 一处，日志也因此分得清两种行为。
-            HandleEscapeKeyPress();
-        }
-    }
-    return CallNextHookEx(g_escHook, code, wp, lp);
-}
-
-void InstallEscHook() {
-    if (!g_escHook) g_escHook = SetWindowsHookExW(WH_KEYBOARD_LL, EscHookProc, nullptr, 0);
-}
-
-void RemoveEscHook() {
-    if (g_escHook) { UnhookWindowsHookEx(g_escHook); g_escHook = nullptr; }
-}
-
 // ===========================================================================
 // 关闭态（设计 §10.2）：输入侧的判定、"点到别处就取消"、以及三击剧本
 // ===========================================================================
@@ -892,7 +823,7 @@ void RemoveEscHook() {
 //    走同一条路径，那是显示层的事。这一块只管三件输入侧的事：
 //      1. 把消息翻译成 Enter / Click / Cancel（右键的两种含义按**当前相位**分派）；
 //      2. 全局鼠标钩子：判"这一下点在哪"，面板之外就取消；
-//      3. 三击剧本（--shutdown-test / --shutdown-esc-test）走真实消息路径注入。
+//      3. 三击剧本（--shutdown-test）走真实消息路径注入。
 //
 //  为什么"点到别处就取消"必须是全局低级钩子（WH_MOUSE_LL），而不是 SetCapture 或
 //  一个全屏透明窗口：后两种会**吃掉**那一次点击 —— 你点别的程序，那个程序收不到。
@@ -902,8 +833,8 @@ void RemoveEscHook() {
 //  ★ 回调里只做判定（WindowFromPoint / GetClassNameW / 矩形比较），**不写日志、不做 I/O**：
 //    WH_MOUSE_LL 的回调超过约 300 ms 不返回会被系统**静默摘除**（之后再也没有回调，
 //    而屏幕上什么都看不出来）。结论塞进标志，回主循环再落日志。
-//  ★ 装不上（返回空）不是崩溃点：退化成"只有 Esc 能取消"，并记一行说明 ——
-//    宁可少一个取消入口，也不要"点外面没反应"且没人知道为什么。
+//  ★ 装不上（返回空）不是崩溃点，但"点到别处"是关闭态**唯一**的取消路 ——
+//    装不上就是出不来，所以必须记一行说明，而不是留下一个没有任何解释的关闭态。
 //  （这一块就在本文件那个匿名 namespace 里，末尾那个 `}  // namespace` 收的就是它。）
 
 // 一次点击落在哪：只有 Cancel 会导致取消。
@@ -981,14 +912,28 @@ LRESULT CALLBACK ShutdownMouseHookProc(int code, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(g_mouseHook, code, wp, lp);
 }
 
-void InstallShutdownMouseHook() {
-    if (g_mouseHook) return;
-    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, ShutdownMouseHookProc, nullptr, 0);
-    if (!g_mouseHook) {
-        // 装不上不是崩溃点：退化成"只有 Esc 能取消"（规格给的降级口径），但必须留痕
-        SelfTestLog(L"[close] 全局鼠标钩子装不上（err=%lu）：点面板之外不再取消，只剩 Esc",
-                    GetLastError());
+// 关闭态**有没有出去的路**：取消只剩"点到面板实体之外"一条，而它要靠这把全局鼠标钩子。
+// ★ 这是宿主读 g_mouseHook 的**唯一**一处：装钩子的结果、日志里的"已装/未装"都从这里取。
+//   两处各判一遗的写法，症状是"装不上却进了关闭态"，或者日志说未装而行为当作已装。
+bool ShutdownCancelPathReady() { return g_mouseHook != nullptr; }
+
+// 装全局鼠标钩子。返回值 = 装完之后"出去的路"在不在，调用方据此决定进不进关闭态。
+bool InstallShutdownMouseHook() {
+    if (ShutdownCancelPathReady()) return true;   // 已在关闭态里：上一轮装上的那把还在用
+    if (g_noMouseHook) {
+        // 测试旁路（--no-mouse-hook，生产默认关）：故意走"装不上"那一支。本机平时装得上
+        // WH_MOUSE_LL，而"装不上就不进关闭态"这条规则只有在装不上时才看得见。
+        SelfTestLog(L"[close][test] --no-mouse-hook 开着：**故意不装**全局鼠标钩子，"
+                    L"本轮当作 SetWindowsHookEx 失败");
+        return false;
     }
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, ShutdownMouseHookProc, nullptr, 0);
+    if (!ShutdownCancelPathReady()) {
+        // ★ 失败原因必须留痕：这个返回值决定"右键进不进关闭态"，而失败的症状是
+        //   "右键什么都不发生"——没有这一行，日志里就没有任何线索。
+        SelfTestLog(L"[close] 全局鼠标钩子装不上（err=%lu）", GetLastError());
+    }
+    return ShutdownCancelPathReady();
 }
 
 void RemoveShutdownMouseHook() {
@@ -1386,15 +1331,26 @@ DWORD WINAPI TrayMenuFixtureDeadline(LPVOID param) {
     }
 }
 
-// 进入关闭态。装钩子是"进入"这件事的一部分：钩子只在关闭态期间存在。
+// 进入关闭态。
+// ★ 顺序是"先装钩子、再改状态"，而且**装不上就整个不进入**：关闭态唯一的取消路是"点到
+//   面板实体之外"，那条路要靠这把钩子（0.2 删掉全局 Esc 钩子之后没有第二条）。钩子装不上
+//   时进去，用户只能靠三击把它关掉、点面板之外毫无反应 —— 那不是关闭态，那是一个没有出口
+//   的状态。所以宁可这一下右键当作没发生。
+// ★ "装上了没有"只有 InstallShutdownMouseHook 一处判（它的返回值），状态机只收这个结论。
 void EnterShutdownState() {
-    if (!dshb::ShutdownEnter()) return;   // 已经在里面：不重置、不重复计时
+    const bool cancelPathReady = InstallShutdownMouseHook();
+    if (!dshb::ShutdownEnter(cancelPathReady)) {
+        if (!cancelPathReady) {
+            SelfTestLog(L"[close] 钩子装不上，因此**不进关闭态**：进去之后点面板之外毫无反应、"
+                        L"只能靠三击关掉（没有第二条取消路）。这一下右键当作没发生");
+        }
+        return;   // 已经在里面：不重置、不重复计时
+    }
     g_closeEnterPending = true;
     g_closeEnterWhy = L"右键";
-    InstallShutdownMouseHook();
 }
 
-// 取消（Esc，或点到别处）。why 只用于日志：两种入口的日志必须分得开。
+// 取消关闭态。**唯一**入口是"点到面板之外"（ApplyOutsideClickVerdict）。why 只用于日志。
 void CancelShutdownState(const wchar_t* why) {
     if (!dshb::ShutdownCancel()) return;  // 不在关闭态 / 粒子期间不受理
     g_closeCancelPending = true;
@@ -1416,7 +1372,7 @@ void FireShutdownParticles(const wchar_t* what) {
 
 // 关闭态内的一次点击。**左键与右键走同一条**（所有者定：右键也算一次）。
 // 点满三次 = 发"该放粒子了"的信号：粒子由另一步做（Renderer + src/particles.cpp），
-// 这里只发信号，并从此不再受理任何输入（WndProc 与 Esc 判定都先问 ShutdownFired）。
+// 这里只发信号，并从此不再受理任何输入（WndProc 与鼠标钩子判定都先问 ShutdownFired）。
 void HandleShutdownClick(int which) {
     if (dshb::ShutdownFired()) {          // 粒子期间：不重复触发，也不受理
         g_closeRefusedPending = true;
@@ -1427,19 +1383,6 @@ void HandleShutdownClick(int which) {
     g_closeWhichPending = which;
     if (!fired) return;
     FireShutdownParticles(which ? L"第 3 击（右键）" : L"第 3 击（左键）");
-}
-
-// Esc 的**唯一**判定口：关闭态里只取消；非关闭态维持原样（直接关窗口，所有者一直在用）。
-// 钩子与测试剧本走同一个函数，所以"两条路径行为一致"是结构上的，不是靠两处都写对。
-void HandleEscapeKeyPress() {
-    if (dshb::ShutdownActive()) {
-        if (dshb::ShutdownFired()) { g_closeRefusedPending = true; return; }  // 粒子期间不受理
-        CancelShutdownState(L"Esc");
-        return;
-    }
-    SelfTestLog(L"[key] Esc -> closing the widget");
-    g_running = false;
-    if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
 }
 
 // 关闭态的所有日志在这里落盘。
@@ -1459,7 +1402,7 @@ void FlushCloseLogs() {
                     g_closeEnterWhy, dshb::ShutdownClicks(), dshb::ShutdownFloorRatio(),
                     g_display.ambienceRatioTarget(), r, hex.c_str(),
                     dshb::ShutdownJitterDip(), dshb::ShutdownFrame(),
-                    g_mouseHook ? L"已装" : L"未装");
+                    ShutdownCancelPathReady() ? L"已装" : L"未装");
     }
     if (g_closeClickPending >= 0) {
         SelfTestLog(L"[close] 第 %d 击（%ls）：R_d=%.2f R_new=%.6f R=%.6f color=%ls intensity=%.4f "
@@ -1554,52 +1497,6 @@ void RunShutdownTestScript(double elapsed) {
         PostMessageW(g_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp);
         PostMessageW(g_hwnd, WM_LBUTTONUP, 0, lp);
         at = elapsed + 1.0;
-    }
-    ++stage;
-}
-
-//  --shutdown-esc-test：三档各取消一次（0 击 / 1 击 / 2 击），每次取消都要看到进度归零。
-//  Esc 走的是与键盘钩子**同一个** HandleEscapeKeyPress（见那里的说明）。
-void RunShutdownEscScript(double elapsed) {
-    if (!g_shutdownEscTest) return;
-    static int stage = 0;
-    static double at = 1.0;
-    if (stage >= 10 || elapsed < at) return;
-    const POINT c = PanelCenterClient();
-    const LPARAM lp = MAKELPARAM(static_cast<short>(c.x), static_cast<short>(c.y));
-    if (stage == 9) {
-        // 收尾：关闭态**之外**的 Esc 必须照旧关窗口（所有者一直在用的那条行为）。
-        // 三种取消都走完、状态已经回到 Off，这里再按一次 Esc。
-        SelfTestLog(L"[close][esc] t=%.3f 收尾：非关闭态注入 Esc -> 应当关窗口（旧行为不变）", elapsed);
-        HandleEscapeKeyPress();
-        at = elapsed + 1.0;
-        ++stage;
-        return;
-    }
-    const int step = stage % 3;
-    if (step == 0) {
-        SelfTestLog(L"[close][esc] t=%.3f 轮次 %d：右键进入关闭态", elapsed, stage / 3 + 1);
-        PostMessageW(g_hwnd, WM_RBUTTONDOWN, MK_RBUTTON, lp);
-        PostMessageW(g_hwnd, WM_RBUTTONUP, 0, lp);
-        at = elapsed + 0.6;
-    } else if (step == 1) {
-        if (stage >= 4) {   // 第 2、3 轮：先点 1 下（第 3 轮再点第 2 下）
-            PostMessageW(g_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp);
-            PostMessageW(g_hwnd, WM_LBUTTONUP, 0, lp);
-        }
-        if (stage >= 7) {
-            PostMessageW(g_hwnd, WM_RBUTTONDOWN, MK_RBUTTON, lp);
-            PostMessageW(g_hwnd, WM_RBUTTONUP, 0, lp);
-        }
-        at = elapsed + 0.6;
-    } else {
-        SelfTestLog(L"[close][esc] t=%.3f 注入 Esc：clicks 现在 = %d（应当被取消、归零）", elapsed,
-                    dshb::ShutdownClicks());
-        HandleEscapeKeyPress();
-        SelfTestLog(L"[close][esc] 取消之后立刻核对：active=%d clicks=%d R_d=%.2f frame=%d", 
-                    dshb::ShutdownActive() ? 1 : 0, dshb::ShutdownClicks(),
-                    dshb::ShutdownFloorRatio(), dshb::ShutdownFrame());
-        at = elapsed + 0.8;
     }
     ++stage;
 }
@@ -1777,8 +1674,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_shutdownTest = _wtof(argv[i] + 16);
             SelfTestLog(L"[argv] --shutdown-test=%.1fs（第 2 击之后停这么久再点第 3 击）",
                         g_shutdownTest);
-        } else if (wcscmp(argv[i], L"--shutdown-esc-test") == 0) {
-            g_shutdownEscTest = true;
         } else if (wcsncmp(argv[i], L"--shutdown-enter-at=", 20) == 0) {
             // 三击剧本的**起始时刻**（秒）。为什么要能推迟：R 只抬不降，而"第 1 击把 R 抬到
             // 0.50"只有在 R 低于 0.5 时才看得出效果；冷启动的 R 现在是 0（2026-09-19 起），
@@ -1805,6 +1700,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // （探针进程跑完就退，NIM_ADD 之后直接死掉会在任务栏上留一个点不动的图标）。
             g_noTray = true;
             SelfTestLog(L"[argv] --no-tray：本次不挂托盘图标");
+        } else if (wcscmp(argv[i], L"--no-mouse-hook") == 0) {
+            // 测试旁路（见 g_noMouseHook）：造出"全局鼠标钩子装不上"那一条路。
+            g_noMouseHook = true;
+            SelfTestLog(L"[argv] --no-mouse-hook：本轮当作全局鼠标钩子装不上"
+                        L"（测试旁路，右键因此不进关闭态）");
         } else if (wcsncmp(argv[i], L"--tray-probe=", 13) == 0) {
             // 一次性把托盘的事实逐条写进日志：图标矩形的来源与矩形本身、菜单项数与文字、
             // 窗口句柄与 uID。它**不弹菜单**（弹菜单是 --tray-menu-test 的事）。
@@ -1823,27 +1723,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                         L"（本次不挂真图标，见上面那条 [tray] 行）；"
                         L"=5 只弹不点、=7 连点 5 次右键（每次照外壳的样子投两条消息）",
                         g_trayMenuTest, g_trayMenuTest);
-        } else if (wcsncmp(argv[i], L"--currencies=", 13) == 0) {
-            // 合成一条带**全部币种条目**的样本：形如 CNY:19.20,USD:2.70。
-            // 用途：真实账户只有 CNY，切换功能没有真数据可测，所以给一个测试夹具。
-            g_currenciesGiven = true;
-            const wchar_t* v = argv[i] + 13;
-            char narrow[512]{};
-            WideCharToMultiByte(CP_UTF8, 0, v, -1, narrow, sizeof(narrow), nullptr, nullptr);
-            std::string spec(narrow);
-            std::string cur;
-            size_t pos = 0;
-            while (pos <= spec.size()) {
-                const size_t comma = spec.find(',', pos);
-                const std::string item = spec.substr(pos, (comma == std::string::npos) ? std::string::npos : comma - pos);
-                const size_t colon = item.find(':');
-                if (colon != std::string::npos) {
-                    cur += item.substr(0, colon) + "=" + item.substr(colon + 1) + " ";
-                }
-                if (comma == std::string::npos) break;
-                pos = comma + 1;
-            }
-            g_currenciesSpec = cur;
         } else if (wcscmp(argv[i], L"--api=off") == 0) {
             g_apiOff = true;
         } else if (wcscmp(argv[i], L"--api-once") == 0) {
@@ -1858,44 +1737,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_apiTimeoutMs = _wtoi(argv[i] + 17);
         } else if (wcsncmp(argv[i], L"--api-interval-ms=", 18) == 0) {
             g_apiIntervalMs = _wtoi(argv[i] + 18);
-        } else if (wcscmp(argv[i], L"--fx=off") == 0) {
-            g_fxOff = true;
-        } else if (wcsncmp(argv[i], L"--fx-url=", 9) == 0) {
-            // 形如 host[:port][/path]，例：--fx-url=127.0.0.1:18080/latest?from=USD&to=CNY
-            // 只服务测试：解析失败就报一行并保持默认地址，**不猜**。
-            std::wstring url = argv[i] + 9;
-            std::wstring host = url;
-            std::wstring path = L"/";
-            const std::size_t slash = url.find(L'/');
-            if (slash != std::wstring::npos) {
-                host = url.substr(0, slash);
-                path = url.substr(slash);
-            }
-            const std::size_t colon = host.rfind(L':');
-            int port = 443;
-            if (colon != std::wstring::npos) {
-                port = _wtoi(host.c_str() + colon + 1);
-                host = host.substr(0, colon);
-            }
-            if (host.empty() || port <= 0 || port > 65535) {
-                SelfTestLog(L"[argv] --fx-url=%ls 解析不出可用的 host/port：保持默认 %ls",
-                            url.c_str(), g_fxHost.c_str());
-            } else {
-                g_fxHost = host;
-                g_fxPort = port;
-                g_fxPath = path;
-                SelfTestLog(L"[argv] --fx-url -> host=%ls port=%d path=%ls", g_fxHost.c_str(),
-                            g_fxPort, g_fxPath.c_str());
-            }
-        } else if (wcscmp(argv[i], L"--fx-plain-http") == 0) {
-            g_fxPlainHttp = true;
-        } else if (wcsncmp(argv[i], L"--fx-cache=", 11) == 0) {
-            // 测试旁路：任何会写存储的运行都必须把缓存写到临时路径上，
-            // 绝不碰数据目录里那一份（与 --config= / --curve-store= 同一条规矩）。
-            g_fxCacheGiven = true;
-            g_fxCachePathGiven = argv[i] + 11;
-        } else if (wcsncmp(argv[i], L"--fx-timeout-ms=", 16) == 0) {
-            g_fxTimeoutMs = _wtoi(argv[i] + 16);
         } else if (wcsncmp(argv[i], L"--scenario=", 11) == 0) {
             // Accepts a 1-based number (as printed by ScenarioName) or an ASCII alias.
             // A name that is not recognised USED to be swallowed by _wtoi and silently
@@ -2056,42 +1897,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         g_states.OnSample(fs, fs.wallMs);
         g_display.OnSample(g_states.lastGood());
         SelfTestLog(L"[pin] 余额钉在 %.2f（不再取样、不再变化）", g_fixedAmount);
-    }
-
-    // --currencies=：合成一条带**全部币种条目**的样本。
-    // 用途：真实账户只有 CNY，切换币种没有真数据可测，所以给一个夹具，
-    // 走的就是真实样本那条路（entries + 优先条目），不是特例分支。
-    if (g_currenciesGiven) {
-        dshb::Sample cs{};
-        cs.wallMs = NowWallMs();
-        cs.monotonicMs = static_cast<int64_t>(GetTickCount64());
-        cs.transportOk = true;
-        cs.httpStatus = 200;
-        cs.isAvailable = true;
-        cs.currency = "CNY";
-        cs.amountsOk = false;
-        std::string spec = g_currenciesSpec;
-        size_t pos = 0;
-        while (pos < spec.size()) {
-            const size_t sp = spec.find(' ', pos);
-            const std::string item = spec.substr(pos, (sp == std::string::npos) ? std::string::npos : sp - pos);
-            const size_t eq = item.find('=');
-            if (eq != std::string::npos) {
-                dshb::CurrencyAmount ca{};
-                ca.currency = item.substr(0, eq);
-                if (dshb::ParseAmount(item.substr(eq + 1), &ca.total)) ca.ok = true;
-                if (ca.currency == "CNY" && ca.ok) {
-                    cs.total = ca.total;
-                    cs.amountsOk = true;
-                }
-                cs.entries.push_back(ca);
-            }
-            if (sp == std::string::npos) break;
-            pos = sp + 1;
-        }
-        g_states.OnSample(cs, cs.wallMs);
-        if (cs.amountsOk) g_display.OnSample(g_states.lastGood());
-        SelfTestLog(L"[cur] 合成样本：%hs 条", std::to_string(cs.entries.size()).c_str());
     }
 
     // 手动设定三件参数（所有者定的接口）：实际数字 R、上次的实际数字 L、运算了 k 帧。
@@ -2266,16 +2071,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             dshb::SetCurveStorePath(curvePath);
             SelfTestLog(L"[paths] 曲线=%ls", curvePath.c_str());
         }
-        // 汇率缓存：和 config.json / curve.json 同一个数据目录（所有者追加要求的第 1 条）。
-        // --fx-cache= 是测试旁路，与 --config= / --curve-store= 同一条理由：任何会写存储的
-        // 运行都绝不能碰真实数据目录里的那一份。
-        {
-            g_fxCachePath = paths.dataDir;
-            if (!g_fxCachePath.empty() && g_fxCachePath.back() != L'\\') g_fxCachePath += L'\\';
-            g_fxCachePath += L"fx.json";
-            if (g_fxCacheGiven) g_fxCachePath = g_fxCachePathGiven;
-            SelfTestLog(L"[paths] 汇率缓存=%ls", g_fxCachePath.c_str());
-        }
         if (!paths.writable) {
             SelfTestLog(L"[paths] 降级：目录不可写（%ls），采样只留在内存，重启后没有历史",
                         paths.unwritableReason.c_str());
@@ -2283,10 +2078,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     }
 
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
-
-    // Esc closes the widget. Installed here (the widget is on screen from now on) and
-    // removed in WM_DESTROY. See EscHookProc for why a low-level hook is needed.
-    InstallEscHook();
 
     // ---- 预乘自检（A8c）：先于导帧，因为它可能顺便导一张探针 PNG ----
     // 判据不是"R 等于多少"，而是 **R 与 A 的关系**：
@@ -2340,7 +2131,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         }
         g_states.SetNoKey(!haveKey);
 
-        const bool manualRun = g_currenciesGiven || g_fixedGiven || g_realGiven || g_lastGiven ||
+        const bool manualRun = g_fixedGiven || g_realGiven || g_lastGiven ||
                                g_frames >= 0 || !g_seq.empty();
         g_realApiPlanned = haveKey && !g_apiOff && !manualRun;
         if (g_realApiPlanned) {
@@ -2953,7 +2744,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 所以换数据源不需要动它——这正是把这两件事分开的目的。
         {
             const dshb::Sample s = g_fake.NextIfDue(elapsed);
-            if (s.wallMs != 0 && !g_realApiPlanned && !g_currenciesGiven && !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0 && g_seq.empty()) {   // 钉值/真接口/合成样本时不喂
+            if (s.wallMs != 0 && !g_realApiPlanned && !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0 && g_seq.empty()) {   // 钉值/真接口时不喂
                 g_states.OnSample(s, s.wallMs);
                 // ★ 显示层**只在新样本到达时**喂（见下面删掉的那行每帧喂入）。
                 //   每帧重复喂同一条样本，会让 L 恒等于 R（D=0）——滚动动画永远不动，
@@ -3007,23 +2798,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             cfg.intervalMs = g_apiIntervalMs;
             cfg.once = g_apiOnce;
             cfg.apiKey = g_apiKey;   // 循环之前读好的，绝不打印
-            cfg.fxEnabled = !g_fxOff;
-            cfg.fxHost = g_fxHost;
-            cfg.fxPort = g_fxPort;
-            cfg.fxPlainHttp = g_fxPlainHttp;
-            cfg.fxPath = g_fxPath;
-            cfg.fxTimeoutMs = g_fxTimeoutMs;
-            cfg.fxCachePath = g_fxCachePath;
             g_apiSource.Start(cfg);
             g_realApiOn = true;
             SelfTestLog(L"[api] 真接口已启动：host=%ls port=%d 起始间隔=%dms 超时=%dms",
                         g_apiHost.c_str(), g_apiPort, g_apiIntervalMs, g_apiTimeoutMs);
-            // 汇率那一行（[fx] ...）由后台线程排在同一个日志队列里，所以它的时间戳
-            // 就是"取汇完成"的时刻；这里只记本次用的是哪个地址、缓存写在哪、有没有关掉。
-            SelfTestLog(L"[fx] 本次启动取汇：%ls host=%ls port=%d timeout=%dms 缓存=%ls"
-                        L"（fx_rate.h：只取一次，取不到用缓存）",
-                        g_fxOff ? L"关闭" : L"开启", g_fxHost.c_str(), g_fxPort, g_fxTimeoutMs,
-                        g_fxCachePath.c_str());
         }
 
         // 布局诊断：**每帧绘制结束、回到这里之后**才写文件（不在绘制路径里写，
@@ -3066,7 +2844,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             swprintf_s(line,
                        L"state=%hs  bal=%ls%ls  scenario=%d  samples=%d  t=%.1fs\n"
                        L"hasGood=%d  key=%d  focus=%d  speed=%.0fx\n"
-                       L"F1..F9=scenario  R=recharge  C=clockjump  Esc=quit",
+                       L"F1..F9=scenario  R=recharge  C=clockjump",
                        ConnStateNameUtf8(st), g_states.hasGood() ? last.CurrencySymbolW() : L"",
                        numW.c_str(), static_cast<int>(g_fake.scenario()),
                        static_cast<int>(g_states.samples().size()), elapsed,
@@ -3091,9 +2869,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             std::string apiLine;
             // 带时间戳（设计 §10.5 的日志要求）：这样"暂停期间没请求""唤醒立刻补一次"可验证
             // ★ 这里必须走 WidenUtf8，**不能**用 %hs：%hs 在宽格式里是按当前 C 区域设置
-            //   转换窄串的，而这一行现在是 UTF-8 字节（[fx] 那两行带中文）。逐字节当宽字符
-            //   的后果实测就是日志里出现 "ï¼frankfurter/ECB..." 这种乱码 —— 同一个坑
-            //   WidenUtf8 上面那段注释早就写过，这里只是又多了一个踩它的入口。
+            //   转换窄串的，而日志行里可能有 UTF-8 字节（api_client 的中文说明）。逐字节当
+            //   宽字符的后果实测就是日志里出现乱码 —— 同一个坑 WidenUtf8 上面那段注释
+            //   早就写过，这里只是又多了一个踩它的入口。
             while (g_apiSource.PollLog(&apiLine)) {
                 // 含非 ASCII 字节 -> 是 UTF-8 文本，必须解码；纯 ASCII 两路等价。
                 bool nonAscii = false;
@@ -3170,7 +2948,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                         g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64() - 900; g_pressValid = true;
                         FinishLeftGesture(cx, cy);
                     } else {
-                        SelfTestLog(L"[click-test] 手势 4：双击符号（应当切换）");
+                        SelfTestLog(L"[click-test] 手势 4：双击符号（假数据源只有 CNY 一个币种，"
+                                    L"预期写『当前只有一个币种：忽略』）");
                         g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
                         FinishLeftGesture(cx, cy);   // 第一次：只记时间
                         g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
@@ -3189,7 +2968,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         //      画上去的数（R_d 的下限在 AdvanceAmbience 里生效）。
         ApplyOutsideClickVerdict();
         RunShutdownTestScript(elapsed);
-        RunShutdownEscScript(elapsed);
         RunShutdownEnterHold(elapsed);
         RunTrayMenuTestScript(elapsed);
         g_display.Update(dt);

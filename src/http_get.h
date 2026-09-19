@@ -1,18 +1,16 @@
 // http_get.h -- "one HTTPS GET, give me the status code and the body".
 //
-// ★ Why this file exists (2026-09-19): the project now talks to TWO hosts -- the balance
-//   endpoint (api.deepseek.com) and the FX rate endpoint (api.frankfurter.app). Both need
-//   exactly the same thirty lines of WinHTTP: session, timeouts, redirect policy, connect,
+// ★ Why this is its own file (2026-09-19): the WinHTTP plumbing was lifted out of
+//   api_client.cpp, so the thirty lines of session, timeouts, redirect policy, connect,
 //   send, read with a size cap, and the "the server promised more bytes than it sent"
-//   check. Copying those thirty lines into a second file would have produced two
-//   transports that drift -- and this project has already paid for "the same thing
+//   check have one home. A second caller then costs no copy of them, instead of producing
+//   two transports that drift -- and this project has already paid for "the same thing
 //   written twice" once (see widget_display.cpp's note about the three store scans).
 //
 // ★ What is deliberately NOT here: every decision that can be *wrong*. Whether a 402 means
-//   "out of money", whether a body is a usable balance, whether a rate is plausible --
-//   none of that is transport. api_client.cpp keeps its own classification
-//   (ClassifyTransport), fx_rate.cpp keeps its own parsing, and both are reachable from an
-//   offline case runner without a socket.
+//   "out of money", whether a body is a usable balance -- none of that is transport.
+//   api_client.cpp keeps its own classification (ClassifyTransport) and is reachable from
+//   an offline case runner without a socket.
 //
 // ★ Redirects are pinned OFF, not followed. For the balance call that is a security rule
 //   (the Authorization header must never be carried to another host); it stays the rule
@@ -28,7 +26,7 @@ struct Request {
     std::wstring host;             // e.g. L"api.deepseek.com"
     unsigned short port = 443;
     bool secure = true;            // false only for a local plain-HTTP test server
-    std::wstring path;             // e.g. L"/latest?from=USD&to=CNY"
+    std::wstring path;             // e.g. L"/user/balance"
     int timeoutMs = 5000;          // applied to resolve, connect, send and receive
     // Empty means "send no such header". Passing a request header is a data decision, so
     // whoever holds the secret decides (api_client builds its Bearer header, and wipes it).

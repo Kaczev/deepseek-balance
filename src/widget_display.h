@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "amount.h"           // Amount（AmountInYuan 的入参：主币种的一笔钱）
+#include "amount.h"           // Amount：本头文件已不直接用，但 renderer.cpp / tauprobe.cpp 经它拿这个类型
 #include "heartbeat.h"        // 心跳位移（E 段）：纯函数，状态由本层保管
 #include "rate_estimator.h"
 #include "roll_axis.h"
@@ -63,18 +63,6 @@ double StepPerMinute(double previousYuan, double currentYuan, double dtSeconds);
 //  G <= 0 -> 返回 0（不做除法，"E 蒙光.md" §3.3）。
 //  余额为 0 或负 -> 饱和到 1。
 double BalanceDepth(double balanceYuan);
-
-// 一笔**主币种**的金额值多少元。
-// ★★ 这是 D（危险度）与曲线颜色**共用的唯一换算口**：屏幕上显示哪个币种与它无关 ——
-//    "这笔钱低不低"只跟钱有关，阈值统一是 kLowBalanceThresholdYuan = 10 元。
-//      · "CNY"：恒等（1 元 = 1 元），**不看汇率**。大陆账号因此永远不需要汇率，
-//        切到 USD 显示时 D / 颜色 / 心跳逐位不变（所有者 2026-09-19 的口径）。
-//      · "USD"：× 启动时取到的那一次 USD->CNY 汇率（fx_rate.h 的 UsdAmountToYuan）。
-//      · 其他币种 / USD 而没有汇率 / 文本读不出来 -> 返回 false，*outYuan 不动。
-//        "不知道"绝不当成"安全"或"危险"中的哪一个 —— 由调用方各自决定（D 取 0，
-//        理由写在 widget_display.cpp 的 AdvanceAmbience 里）。
-bool AmountInYuan(const std::string& currency, const Amount& amount,
-                  const std::string& usdToCnyText, bool usdToCnyOk, double* outYuan);
 
 // ---- 颜色管线 ----
 // 第一步：氛围初色 C_0 —— 两段 RGB 线性插值（不动饱和度）。
@@ -189,9 +177,9 @@ public:
     //   数据里算出来的那个值（= 刷新时 R 应当跳到的高度）由 ambienceRatioTarget() 给。
     // 本帧刷新的目标高度：clamp(min{max(s, 2B), 0} / 2B, 0, 1)，s = 最近一步的元/分钟。
     double ambienceRatioTarget() const { return ambienceRatioTarget_; }
-    // 本帧的 D。★ 它的输入是**主币种余额折成元**（AmountInYuan），不是屏幕上那个币种的
-    //   数字 —— 所以点击币种符号切换显示时它逐位不变（所有者 2026-09-19 的口径）；
-    //   折不成元（海外账号 + 没有汇率）时它是 0（理由见 .cpp 的 AdvanceAmbience）。
+    // 本帧的 D。★ 它的输入是**主币种余额**，不是屏幕上那个币种的数字 ——
+    //   所以点击币种符号切换显示时它逐位不变（所有者 2026-09-19 的口径）；
+    //   主币种那一笔读不出来时它是 0（理由见 .cpp 的 AdvanceAmbience）。
     double ambienceDepth() const { return ambienceDepth_; }
     // 本帧**应当显示**的低余额程度（含"读不到余额按 D=1"这条状态规则）。
     double ambienceDepthShown() const { return depthShown_; }
@@ -270,15 +258,18 @@ private:
     std::vector<CurrencyAmount> lastEntries_;       // 最近一次样本的条目（切换时要用金额）
     double lastSwitchTarget_ = -1.0;
 
-    // ---- D 的输入：**本帧主币种余额折成元**（见 AmountInYuan 与 .cpp 的 AdvanceAmbience）----
+    // ---- D 的输入：**本帧主币种余额**（写它的只有 OnSample，见 .cpp）----
     // ★ 它**不随显示币种变**：切币种改的只是屏幕上的数字与符号，同一笔钱只有一个 D。
     //   这一条就是所有者 2026-09-19 报的那个 bug 的反面：原来 D 吃的是 `value_`
     //   （显示币种的数），显示 USD 时 "$2.81" 被当成"¥2.81"去比 10 元阈值。
-    // ★ 只有 OnSample 会写它（换算需要样本带来的汇率）；SelectCurrency **不许**碰它。
-    // ★ primaryYuanOk_ = false 表示折不成元（海外账号 + 没有汇率，或主币种那一笔读不出来）：
-    //   AdvanceAmbience 据此取 D = 0，理由写在那个函数里。
-    double primaryYuan_ = 0.0;
-    bool primaryYuanOk_ = false;
+    // ★ 阈值 kLowBalanceThresholdYuan = 10 与它必须同量纲。这里取的就是主币种的数，
+    //   同量纲靠"主币种是 CNY"成立（真实账户只有 CNY；2026-09-19 去掉美元显示时
+    //   汇率整条路一起删了，海外账号的美元数没有再折成元的依据）。
+    // ★ SelectCurrency **不许**碰它。
+    // ★ primaryBalanceOk_ = false 表示主币种那一笔读不出来：AdvanceAmbience 据此取 D = 0，
+    //   理由写在那个函数里。
+    double primaryBalance_ = 0.0;
+    bool primaryBalanceOk_ = false;
 
     // 这一段的起点值，用于自检报告"走了多少比例"
     double rollFromValue_ = 0.0;
@@ -500,8 +491,10 @@ std::string CurveStateLine();
 bool SetAmbienceGiven(const char* text);
 
 // ===========================================================================
-// 关闭态（设计 §10.2）：右键进入 → 三次点击即关 → 只有 `Esc`（或点到面板之外）能取消
+// 关闭态（设计 §10.2）：右键进入 → 三次点击即关 → 只有「点到面板之外」能取消
 // ===========================================================================
+//  ★ 0.2 起 `Esc` 不再是取消路（那个全局 Esc 钩子会让**任何程序**里按 Esc 都关掉挂件，
+//    所有者判定为调试遗留，整条删除）。故取消**只有一个入口**：点到面板实体之外。
 //  ★ 状态机为什么在显示层而不在 main：R 的下限（R_d）必须与 R(t) 的抬升走**同一条**
 //    代码路径 —— `AdvanceAmbience` 一处改动，光晕与心跳一起拿到（心跳按 R 取 §6 的两条律，
 //    而 R 只有这一个来源）。main 只把输入翻译成 Enter/Click/Cancel 三个调用。
@@ -513,7 +506,7 @@ bool SetAmbienceGiven(const char* text);
 //      · 进入关闭态之后**左键与右键都算一次**（所有者定）—— 所以 main 必须按
 //        "当前是否关闭态"分派右键的两种含义（进入 / 计数），不能写成一个；
 //      · 点满三次 = 发一次"该放粒子了"的信号，此后**不再计数、不再受理任何输入**；
-//      · 取消（`Esc` 或点到别处）之后进度归零、文字恢复、R_d 归零（R 交回时间自己衰减）。
+//      · 取消（点到别处）之后进度归零、文字恢复、R_d 归零（R 交回时间自己衰减）。
 //  ★ 抖动与进入段是**帧号的纯函数**（下面两个自由函数）：生产路径每帧给一个帧号、
 //    导帧路径把帧号钉在第 k 帧、探针能离线复算 —— 三条加起来才让"抖动"量得出来。
 enum class ShutdownPhase { Off, Armed, Fired };
@@ -522,7 +515,17 @@ bool ShutdownActive();             // Off 之外都算（Fired = 粒子期间）
 bool ShutdownFired();              // 已经点满三下：宿主据此去发粒子信号
 int ShutdownClicks();              // 已计数的点击（0..3）
 int ShutdownFrame();               // 进入以来第几帧（进入那一帧 = 0）
-bool ShutdownEnter();              // 右键（非关闭态）→ 进入；已在关闭态返回 false
+// 右键（非关闭态）→ 进入关闭态。
+//  `cancelPathReady` = 宿主已经备好关闭态**唯一**那条取消路。0.2 删掉全局 Esc 钩子之后，
+//  "点到面板实体之外"是仅剩的一条取消路，而它要靠宿主的全局鼠标钩子 —— 宿主把这个 bool
+//  从 SetWindowsHookEx 的结果算出来（装上了/没装上只判那一处）。
+//  ★ 为什么这个前置条件在状态机里，而不是宿主自己 `if` 一下：钩子装不上时进去就出不来
+//    （点面板之外毫无反应，只能靠三击把它关掉），"进不去"与"进去了"的差别正是这里要守的
+//    东西。判定与状态改动写在同一个函数里，探针才能在不建窗口、不装钩子的地方逐位验证它
+//    （closeprobe 的 case1a）。
+//  ★ 返回 false 的两种情形**都不动任何一位**：已经在关闭态（不重置、不重复计时）、
+//    或者没有取消路。
+bool ShutdownEnter(bool cancelPathReady);
 bool ShutdownClick();              // 关闭态内的一次点击（左/右键都算）；true = 这一下点满
 // 托盘菜单的「关闭」：**直接进第三击**（所有者 2026-09-19）—— 需要时先进入（帧号与进入段
 // 都从"进入那一刻"算起，与右键进入完全一样），然后一步把状态推到"已发粒子信号"。
