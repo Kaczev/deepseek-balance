@@ -152,7 +152,11 @@ target_link_libraries(dragprobe PRIVATE shell32 ole32)
 #   pixels: the numbers to look at are the alpha ramp and the darkest ring pixel.
 # ★ A bare `trayprobe` never touches the tray (no NIM_ADD); the cases that do (installing a
 #   real icon, popping the real menu) print the flag to pass instead of doing it silently.
-add_executable(trayprobe tools/trayprobe.cpp src/tray.cpp src/tray.rc)
+# ★ It also links the display layer (as closeprobe does) for exactly one assertion: what the
+#   menu's single item DOES -- one cmd reaches Fired in one shot (T20). That claim belongs to
+#   the menu contract, and a fresh process is the only place where the shutdown state is
+#   naturally Off, i.e. the state the user is in when they click 关闭.
+add_executable(trayprobe tools/trayprobe.cpp src/tray.cpp src/tray.rc src/widget_display.cpp src/heartbeat.cpp src/state_machine.cpp src/amount.cpp src/curve_store.cpp src/json_min.cpp src/rate_estimator.cpp)
 target_compile_definitions(trayprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(trayprobe PRIVATE src)
 target_link_libraries(trayprobe PRIVATE shell32 ole32 windowscodecs gdi32 user32)

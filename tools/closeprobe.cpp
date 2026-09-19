@@ -142,7 +142,8 @@ int main(int argc, char** argv) {
                 dshb::kShutdownJitterDip[0], dshb::kShutdownJitterDip[1],
                 dshb::kShutdownJitterDip[2]);
     std::printf("scope: 量 src/widget_display.cpp 的关闭态（自由函数 + DisplayedAmount）；"
-                "宿主把左/右键都翻译成同一个 ShutdownClick（那条由真机剧本证）\n");
+                "宿主把左/右键都翻译成同一个 ShutdownClick、把托盘菜单「关闭」翻译成"
+                " ShutdownFireNow（那两条由真机剧本证）\n");
 
     // ---- 1) 起点：平静运行的挂件（一次陡降已经过去 100 s，余额一直上涨 -> R_new = 0）----
     dshb::DisplayedAmount d;
@@ -351,6 +352,54 @@ int main(int argc, char** argv) {
           fired3 && firedState && clicksAfterFired == 3 && !clickAfterFired && !cancelAfterFired &&
               !enterAfterFired && dshb::ShutdownFired() && dshb::ShutdownClicks() == 3 &&
               std::fabs(dshb::ShutdownFloorRatio() - dshb::kShutdownRd2) < 1e-12);
+
+    // ---- 11) 托盘菜单「关闭」那个口子：不是"第一击"，而是"直接到第三击" ----
+    // ★ 为什么这一条在 case5 之后、而且只量"已经在关闭态"那一半：Fired 是**单向门**
+    //   （取消 / 再进入 / 再点击一律不受理，case5 量的就是它），而 ShutdownFireNow 的每一条路
+    //   都要走到 Fired —— 一个进程里只走得了一次。所以"从 Off 出发"那一半由 trayprobe 在
+    //   **新进程**里量（在那里它正好就是菜单路径：用户点托盘「关闭」时状态天然是 Off）。
+    //   这里量另一半：已经在关闭态里再点托盘「关闭」= "我改主意了，现在就关"。
+    // ★ Armed 那一档只能用导帧夹具摆出来：Fired 回不去 Off，而 ShutdownEnter 在 Fired 里
+    //   不受理。夹具写的正是这个状态机自己的三个字段（clicks/phase/frame），而 ShutdownFireNow
+    //   只读其中两个 —— 所以它是"输入"，不是另一套实现。
+    {
+        const double rdBefore = dshb::ShutdownFloorRatio();
+        dshb::SetShutdownFixture(1, 0);          // Armed、clicks=1（= 窗口上点过 1 下）
+        const bool armed = dshb::ShutdownActive() && !dshb::ShutdownFired() &&
+                           dshb::ShutdownClicks() == 1;
+        const bool firedNow = dshb::ShutdownFireNow();
+        const int clicksNow = dshb::ShutdownClicks();
+        const double rdNow = dshb::ShutdownFloorRatio();
+        const double glowNow = dshb::ShutdownGlowLevel();
+        // 一次性到 Fired 之后：不重复触发，四种输入一位都不许改状态
+        const bool fireAgain = dshb::ShutdownFireNow();
+        const bool clickAfter = dshb::ShutdownClick();
+        const bool cancelAfter = dshb::ShutdownCancel();
+        const bool enterAfter = dshb::ShutdownEnter();
+        h.Req("case9",
+              "托盘「关闭」那个口子（ShutdownFireNow）：已在关闭态（Armed、已点 1 下）时"
+              "**一次调用**就到第三击的终点状态（clicks=3 / Fired / R_d=1.00 / 亮度按第 2 击那一档），"
+              "此后不重复触发、也不受理任何输入",
+              "夹具摆出的起点: active=yes fired=no clicks=1 R_d=" + F4(rdBefore) + "（= case5 留下的"
+              " Fired 之后用夹具摆回来的，Fired 回不去 Off）; FireNow=" +
+                  std::string(firedNow ? "yes" : "no") + " -> clicks=" + std::to_string(clicksNow) +
+                  " fired=" + std::string(dshb::ShutdownFired() ? "yes" : "no") + " R_d=" + F4(rdNow) +
+                  " 亮度倍率=" + F4(glowNow) + "（第 2 击及以后那一档 = " +
+                  F4(dshb::kShutdownGlowLevel2) + "）; 再 FireNow=" +
+                  std::string(fireAgain ? "true" : "false") + " 再点击=" +
+                  std::string(clickAfter ? "true" : "false") + " 再取消=" +
+                  std::string(cancelAfter ? "true" : "false") + " 再进入=" +
+                  std::string(enterAfter ? "true" : "false") + " -> clicks=" +
+                  std::to_string(dshb::ShutdownClicks()) + " fired=" +
+                  std::string(dshb::ShutdownFired() ? "yes" : "no") + " R_d=" +
+                  F4(dshb::ShutdownFloorRatio()) + "（与 case5 三击那条**同一个终点状态**）",
+              armed && firedNow && dshb::ShutdownFired() && clicksNow == 3 &&
+                  std::fabs(rdNow - dshb::kShutdownRd2) < 1e-12 &&
+                  std::fabs(glowNow - dshb::kShutdownGlowLevel2) < 1e-12 && !fireAgain &&
+                  !clickAfter && !cancelAfter && !enterAfter && dshb::ShutdownClicks() == 3 &&
+                  dshb::ShutdownFired() &&
+                  std::fabs(dshb::ShutdownFloorRatio() - dshb::kShutdownRd2) < 1e-12);
+    }
 
     std::printf("checks: %d passed, %d failed\n", h.passed, h.failed);
     if (!h.failures.empty()) {

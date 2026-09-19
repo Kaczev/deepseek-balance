@@ -498,6 +498,15 @@ int ShutdownClicks();              // 已计数的点击（0..3）
 int ShutdownFrame();               // 进入以来第几帧（进入那一帧 = 0）
 bool ShutdownEnter();              // 右键（非关闭态）→ 进入；已在关闭态返回 false
 bool ShutdownClick();              // 关闭态内的一次点击（左/右键都算）；true = 这一下点满
+// 托盘菜单的「关闭」：**直接进第三击**（所有者 2026-09-19）—— 需要时先进入（帧号与进入段
+// 都从"进入那一刻"算起，与右键进入完全一样），然后一步把状态推到"已发粒子信号"。
+// true = 宿主该去发粒子了，与 ShutdownClick 第三次的返回值同一个含义。
+//  ★ 它不是"连调三次 ShutdownClick"的马甲：那会绕过次序约束（每一次点击都要写日志、抬 R_d、
+//    推帧号），以后每加一条点击规则就得多改一处调用点。它就是"把 clicks 补齐到 3 再走第三次
+//    点击那一步"，终点状态与在面板上点满三下**逐位相同**（clicks=3 + Fired）。
+//  ★ 只有 Fired 时返回 false 且一位都不改（粒子期间不重复触发，与 ShutdownClick 同一道闸）；
+//    已经在关闭态（Armed）时照样一次到 Fired —— 用户的意思是"我改主意了，现在就关"。
+bool ShutdownFireNow();
 bool ShutdownCancel();             // 取消；true = 刚才确实在关闭态里（日志要分得清）
 double ShutdownFloorRatio();       // 本帧的 R 下限（0 / kShutdownRd1 / kShutdownRd2）
 // 本帧内蒙光的**亮度倍率**（乘在 5.5 的 k(R,D) 上）：非关闭态 1.0，

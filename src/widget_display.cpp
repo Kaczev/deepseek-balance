@@ -1552,16 +1552,38 @@ bool ShutdownEnter() {
     return true;
 }
 
+namespace {
+
+// 把状态钉在"已发粒子信号"。两条入口（窗口上点满第三下、托盘菜单「关闭」）共用这一句，
+// 于是"Fired 时 clicks 必为 3"这条不变量只有一处能写坏 —— 它是 R 的下限（ShutdownFloorRatio）
+// 与两档亮度（ShutdownGlowLevel）的输入。
+void LatchShutdownFired(ShutdownState& s) {
+    s.clicks = 3;
+    s.phase = ShutdownPhase::Fired;
+}
+
+}  // namespace
+
 bool ShutdownClick() {
     ShutdownState& s = Shutdown();
     if (s.phase == ShutdownPhase::Off) return false;     // 非关闭态：调用方走错了
     if (s.phase == ShutdownPhase::Fired) return false;   // 粒子期间不重复触发
     ++s.clicks;
-    if (s.clicks >= 3) {
-        s.phase = ShutdownPhase::Fired;
-        return true;                                    // 调用方据此去发"该放粒子了"的信号
-    }
-    return false;
+    if (s.clicks < 3) return false;
+    LatchShutdownFired(s);
+    return true;                                    // 调用方据此去发"该放粒子了"的信号
+}
+
+// 托盘菜单「关闭」那一下（见头文件里它为什么不是"连调三次 ShutdownClick"的马甲）。
+//  ★ 这里一个帧号都不碰：clicks/phase 之外不动任何字段，于是"进入段照跑"是结构上的 ——
+//    帧号与"先右键、再点三下"一样从 -1 走到 0（进入段的抖动与两档亮度照跑），
+//    粒子信号的时机也一样。为了"立刻炸"而跳过进入段会让两条入口的画面不一样。
+bool ShutdownFireNow() {
+    ShutdownState& s = Shutdown();
+    if (s.phase == ShutdownPhase::Fired) return false;   // 粒子期间不重复触发
+    if (s.phase == ShutdownPhase::Off) ShutdownEnter();  // 先进入：clicks=0、帧号从头数
+    LatchShutdownFired(s);
+    return true;
 }
 
 bool ShutdownCancel() {
@@ -1599,10 +1621,14 @@ double ShutdownJitterDip() {
 //    右键之后除了抖动几乎看不出发生了什么。亮度是**与色相正交**的通道：不管当时面板是
 //    蓝还是红，一暗就看得见。所以关闭态不是换个颜色，而是**把光压下去**。
 //  ★ 两档的亮度是**各自相对原始亮度**的比例（不是逐档相乘）：
-//      第 1 击 -> ×kShutdownGlowLevel1（0.4）   第 2 击及以后 -> ×kShutdownGlowLevel2（0.8）
-//    于是两次点击各带来一次可见的亮度变化（1.0 → 0.4 → 0.8，先是猛地暗下去、再回一点）。
-//  ★ 倍率乘在**目标值**上：上面那段 glowIntensity_ 的缓动照旧生效，所以亮度是滑过去的，
-//    不是一帧跳变（与项目"不许突变"的纪律一致）。
+//      第 1 击 -> ×kShutdownGlowLevel1   第 2 击及以后 -> ×kShutdownGlowLevel2
+//    两次点击各把光压下去一档（取值见 tuning.h 那一段），是**单向变暗**。
+//  ★ 乘的位置：**只在这一处算倍率，乘法落在 `BuildWidgetFrame` 那个两条路共用的落点上**
+//    （`f.ambientIntensity = amount.ambienceIntensity() * ShutdownGlowLevel()`）。
+//    为什么不在这里乘进 `glowIntensity_`：导帧路径从不跑 `Update`，在这里乘的话**导出来的
+//    帧亮度不变、量不到**，整套像素验收就作废了。
+//    代价（已知、可接受）：亮度是**一帧到位**，不走 `glowIntensity_` 那条缓动 —— 而这与
+//    "点击带来一次突变"的意图一致（要的就是"啪地暗下去"）。
 double ShutdownGlowLevel() {
     const ShutdownState& s = Shutdown();
     if (s.phase == ShutdownPhase::Off) return 1.0;

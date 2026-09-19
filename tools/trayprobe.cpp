@@ -3,7 +3,7 @@
 //   trayprobe                  跑全部检查（不碰通知区域：不 NIM_ADD、不弹菜单）
 //   trayprobe --out=<目录>      把每档 HICON 导成 PNG，并连浅色/深色底对照图一起导出来
 //
-// 它验四件事，每件只有一种问法：
+// 它验五件事，每件只有一种问法：
 //   1. **图标资源真的在 exe 里**：本程序带 src/tray.rc，所以这里读到的 RCDATA 与
 //      dshb.exe 里那份是**同一份字节**（都来自编译期的 icon.png），而不是从磁盘读 PNG。
 //      "重新编译不需要外部文件存在"要验的正是"字节在二进制里"。
@@ -13,6 +13,8 @@
 //   3. **命中测试**：我们自己图标的矩形内 -> 不取消；菜单矩形内 -> 不取消；
 //      别的程序的托盘图标 / 时钟 / 任务栏空白 / 桌面 -> **一律取消**（这次修的就是这条）。
 //   4. **菜单里只有「关闭」**：GetMenuItemCount + GetMenuStringW，比截图硬。
+//   5. **那一项的效果是"一下即 Fired"**：点一下就到第三击的终点状态（clicks=3 / R_d=1.00），
+//      不需要后续点击 —— 量的是 main.cpp 的菜单处理函数调的那个口子（T20）。
 //
 // ★ 缩放与建图标用的是 src/tray.cpp 里**同一个** detail::CreateScaledIcon：探针里再抄
 //   一遍那段代码，量到的就是抄件而不是托盘里那个东西。
@@ -20,6 +22,7 @@
 //   （Shell_NotifyIconGetRect），菜单窗口属于创建它的进程。在 dshb 进程里"顺手量一下"
 //   量到的是 dshb 的内部状态，量不出"外壳到底给了什么"。
 #include "tray.h"
+#include "widget_display.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -28,6 +31,7 @@
 #include <shellapi.h>
 #include <wincodec.h>
 
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -555,6 +559,51 @@ void CheckMessageContract() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 5) 菜单那一项的**效果**：一下即 Fired（所有者 2026-09-19）
+// ---------------------------------------------------------------------------
+// ★ 为什么这条属于托盘探针：菜单里只有「关闭」一项（T11..T15 量的就是它），而这一版它
+//   点一下就到第三击 —— 也就是"一条命令直接到 Fired，不再需要后续点击"。量的是状态机那个
+//   口子（ShutdownFireNow）在**新进程**里的表现：这里状态天然是 Off，正是用户点托盘「关闭」
+//   那一刻的状态。端到端那一次（真注入鼠标、真走面板 -> 属主窗口）由 dshb.exe 的
+//   --tray-menu-test 夹具在日志里证 —— 面板是属主窗口的，托盘探针不驱动它。
+// ★ 进入段没有被跳过：帧号与"先右键再点三下"一样停在 -1（下一帧才轮到 0），所以进入段的
+//   抖动与两档亮度会照跑，粒子信号的时机也与窗口三击那条一致。
+void CheckMenuCloseFiresInOneShot() {
+    const bool offBefore =
+        !dshb::ShutdownActive() && !dshb::ShutdownFired() && dshb::ShutdownClicks() == 0;
+    const bool fired = dshb::ShutdownFireNow();        // 菜单那一下：一次调用
+    const int clicks = dshb::ShutdownClicks();
+    const int frameAtEntry = dshb::ShutdownFrame();    // 必须是 -1 = "进入那一刻"
+    const double rd = dshb::ShutdownFloorRatio();
+    const double glow = dshb::ShutdownGlowLevel();
+    const double jitter = dshb::ShutdownJitterDip();   // frame<0 -> 取第 0 帧那一档
+    const bool layerVisible = dshb::ShutdownCurveLayerVisible();
+    // 此后不受理任何输入（与"点满三下"同一道闸）
+    const bool again = dshb::ShutdownFireNow();
+    const bool clickAfter = dshb::ShutdownClick();
+    const bool cancelAfter = dshb::ShutdownCancel();
+    const bool enterAfter = dshb::ShutdownEnter();
+    Req("T20",
+        "菜单那一项（id=kTrayMenuClose，见 T14）= 一下即 Fired：一次 ShutdownFireNow 就到第三击的"
+        "终点状态（clicks=3 / R_d=1.00），不需要后续点击；进入段照跑，此后不受理任何输入",
+        offBefore && fired && dshb::ShutdownFired() && clicks == 3 &&
+            std::fabs(rd - dshb::kShutdownRd2) < 1e-12 &&
+            std::fabs(glow - dshb::kShutdownGlowLevel2) < 1e-12 && frameAtEntry == -1 &&
+            layerVisible && jitter == dshb::ShutdownJitterAt(0, 3) && !again && !clickAfter &&
+            !cancelAfter && !enterAfter && dshb::ShutdownClicks() == 3 && dshb::ShutdownFired(),
+        Fmt("起点: Off（active=no clicks=0 帧号=%d）-> FireNow=%s -> clicks=%d fired=%s R_d=%.2f "
+            "亮度倍率=%.2f（第 2 击及以后那一档）帧号=%d（-1 = 进入那一刻，与右键进入同口径）"
+            "曲线层=%s 抖动=%.4fDIP（= ShutdownJitterAt(0,3)）; 再 FireNow=%s 再点击=%s 再取消=%s "
+            "再进入=%s -> clicks=%d fired=%s",
+            frameAtEntry, fired ? "yes" : "no", clicks,
+            dshb::ShutdownFired() ? "yes" : "no", rd, glow, frameAtEntry,
+            layerVisible ? "画（进入段里）" : "不画", jitter, again ? "true" : "false",
+            clickAfter ? "true" : "false", cancelAfter ? "true" : "false",
+            enterAfter ? "true" : "false", dshb::ShutdownClicks(),
+            dshb::ShutdownFired() ? "yes" : "no"));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -585,6 +634,7 @@ int main(int argc, char** argv) {
     CheckClassifier();
     CheckMenu();
     CheckMessageContract();
+    CheckMenuCloseFiresInOneShot();
 
     std::printf("-- 小计：通过 %d，失败 %d\n", g_passed, g_failed);
     CoUninitialize();

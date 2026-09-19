@@ -56,6 +56,8 @@ void EnterShutdownState();
 void HandleShutdownClick(int which);
 void CancelShutdownState(const wchar_t* why);
 void RemoveShutdownMouseHook();
+// "该放粒子了"之后的收尾（发信号 + 摘钩子 + 记日志）：两条入口共用，见它的定义。
+void FireShutdownParticles(const wchar_t* what);
 // ---- 托盘（设计 §10.3）：WndProc 与主循环都要用，所以在这里先声明 ----
 void InstallTrayIcon();
 void RemoveTrayIcon();
@@ -136,6 +138,7 @@ int g_shutdownFixtureClicks = 1;   // --shutdown-clicks=N：导帧夹具（已�
 // ★ 理由与钩子那条硬约束有关：WH_MOUSE_LL 的回调超过约 300 ms 不返回会被系统静默摘除，
 //   而写文件是慢的（见下面关闭态那一块的说明）。
 bool g_closeEnterPending = false;      // 刚进入关闭态
+const wchar_t* g_closeEnterWhy = L"右键";  // 谁让它进的：日志要分得清（右键点窗口 / 托盘菜单）
 int g_closeClickPending = -1;          // >= 0 = 待记的那一击（1..3）
 int g_closeWhichPending = 0;           // 0 = 左键，1 = 右键
 bool g_closeCancelPending = false;     // Esc / 点到别处 -> 取消
@@ -1059,30 +1062,35 @@ void RemoveTrayIcon() {
     g_tray.Remove();
 }
 
-// 菜单面板选了一项（kMsgTrayMenu 到了，wParam 就是那个 id）。「关闭」= **等价于右键点窗口**
-// （所有者 2026-09-19，设计 §10.2 的「两个入口完全等价」）：直接进关闭态，并且**同时算第一击**
-// —— 与右键点窗口那一支走的是同两个函数（EnterShutdownState + HandleShutdownClick），
-// 所以两个入口的状态是同一个来源，不可能是两套。日志因此会打出与右键点窗口**完全相同**的
-// `active=1 clicks=1 R_d=0.50`。
-//
-// ★ 为什么"进关闭态"和"第一击"要在同一次处理里做完：菜单的选择只发生一次，
-//   用户点的是「关闭」而不是"进入关闭态"；若只进入不计第一击，屏幕上会出现一个
-//   点了「关闭」却停在 0 击的状态 —— 那既不是取消也不是关闭，两个入口也就不等价了。
+// 菜单面板选了一项（kMsgTrayMenu 到了，wParam 就是那个 id）。
+// 「关闭」= **直接进第三击**（所有者 2026-09-19：点一下就关），但**保留粒子过渡** ——
+// 面板整层消失 + 径向四散爆开，与"窗口上点满三下"是同一个终点状态、同一个粒子信号。
+// ★ 走状态机自己的口子 `ShutdownFireNow()`，不在这里连调三次 HandleShutdownClick：那会绕过
+//   次序约束（每一次点击都要写日志、抬 R_d、推帧号），以后每加一条点击规则就得多改一处。
+// ★ 进入段照跑：帧号同样从进入那一刻从 0 数起（StateMachine 那一步一个帧号都不碰），
+//   所以两条入口的画面一致 —— 不是"为了立刻炸"把进入段跳过去。
+// ★ 已经在关闭态（窗口上先右键、再从托盘点「关闭」）：这一下**就是第三击** ——
+//   用户的意思是"我改主意了，现在就关"，与在面板上点第三下同效。
 void HandleTrayMenuCommand(UINT cmd) {
     if (cmd == 0) return;   // 点别处 / 取消：菜单什么都没选
     if (cmd != dshb::kTrayMenuClose) return;   // 菜单里只有一项，走到这里说明是别的来源
-    if (dshb::ShutdownActive()) {
-        // 已经在关闭态里（窗口上先右键、再从托盘点「关闭」）：菜单这一下**就是一次点击**，
-        // 与"关闭态内点窗口"同一口径（右键点窗口在关闭态里也是计数）。
-        HandleShutdownClick(1);
+    const bool wasActive = dshb::ShutdownActive();
+    if (!dshb::ShutdownFireNow()) {            // 粒子已经发过：与再点一下同一道闸
+        g_closeRefusedPending = true;
         return;
     }
-    EnterShutdownState();
-    HandleShutdownClick(1);
-    SelfTestLog(L"[tray] 菜单选「关闭」-> 等价于右键点窗口（EnterShutdownState + 一次点击）");
+    if (!wasActive) {
+        // 这一下同时是"进入"：进入那一行日志要打出来（帧号也从这一刻从 0 数起）。
+        // ★ 不装鼠标钩子：它只在 Armed 期间有意义（"点别处取消"），而这里一步就进了 Fired，
+        //   输入已经一律不受理 —— 装完立刻摘掉只是假装做了一件事。
+        g_closeEnterPending = true;
+        g_closeEnterWhy = L"托盘菜单「关闭」";
+    }
+    SelfTestLog(L"[tray] 菜单选「关闭」-> 直接进第三击（ShutdownFireNow）：不再需要后续点击");
+    FireShutdownParticles(L"托盘菜单「关闭」（直接进第三击）");
 }
 
-// --tray-menu-test=N（N 秒后动手）：**走真实路径**验"菜单入口等价"。
+// --tray-menu-test=N（N 秒后动手）：**走真实路径**验"菜单那一下 = 点一下就关"。
 //
 // 这条链上没有任何一步是我们自己调的：
 //   ① 往窗口投一条真正的托盘回调消息（kMsgTrayIcon + WM_RBUTTONUP）—— WndProc 那一支
@@ -1091,7 +1099,12 @@ void HandleTrayMenuCommand(UINT cmd) {
 //   ③ 用 SendInput 往面板里「关闭」那一条注入一次真鼠标左键 —— 走的是面板自己的
 //      WM_LBUTTONDOWN，与用户手点完全同一条路；
 //   ④ 面板 PostMessage(kMsgTrayMenu) 给属主窗口 -> WndProc 那一支 -> HandleTrayMenuCommand。
-// 所以最后打出来的 `active=1 clicks=1 R_d=0.50` 是**菜单入口真的产生出来的**状态。
+// 所以最后打出来的那些行是**菜单入口真的产生出来的**状态：`[tray] 菜单选「关闭」-> 直接进
+// 第三击` 与 `[close] 托盘菜单「关闭」（直接进第三击）：已发粒子信号 ... -> N 颗`。
+// ★ 从那两行之后**不再需要任何点击**：粒子上限 0.5 s，播完进程自己退出（设计 §10.3 的
+//   "任务管理器里无残留"），所以这条路径上"注入之后再等一拍看状态"是没有落点的 —— 进程
+//   已经没了。要问"发完信号之后还受不受理输入"，离线那两侧量（closeprobe 的 case5/case9、
+//   trayprobe 的 T20），它们与这里同一个闸（ShutdownFired）。
 //
 // ★ 会动真实光标（SendInput 必须移到那里），所以它只在显式传了这个参数时才动。
 // ★ 与上一版的区别只有一处（但它是关键）：上一版点的是**系统菜单窗口**，而 TrackPopupMenu
@@ -1302,8 +1315,12 @@ void RunTrayMenuTestScript(double elapsed) {
     }
 
     if (stage == 2 && elapsed >= at) {
+        // ★ 这一行只在"注入之后进程还在"的剧本里打得出：默认那条（真的点「关闭」）现在
+        //   0.5 s 后进程就退出了，所以它由面板上点**右键**那个剧本（= 取消）读到 ——
+        //   "什么都没发生"在那里就是正确结果。关闭那一条的证据是紧接着注入打出的
+        //   `已发粒子信号 ... -> N 颗` 与收尾的 `粒子播完：关闭 = 进程退出`。
         SelfTestLog(L"[tray][menu-test] 收尾：注入之后面板窗口 %ls，关闭态 active=%d clicks=%d "
-                    L"R_d=%.2f（与右键点窗口那一支逐字对比）",
+                    L"R_d=%.2f",
                     panel ? L"还在（这一下没收走面板）" : L"已经不在了",
                     dshb::ShutdownActive() ? 1 : 0, dshb::ShutdownClicks(),
                     dshb::ShutdownFloorRatio());
@@ -1356,6 +1373,7 @@ DWORD WINAPI TrayMenuFixtureDeadline(LPVOID param) {
 void EnterShutdownState() {
     if (!dshb::ShutdownEnter()) return;   // 已经在里面：不重置、不重复计时
     g_closeEnterPending = true;
+    g_closeEnterWhy = L"右键";
     InstallShutdownMouseHook();
 }
 
@@ -1365,6 +1383,18 @@ void CancelShutdownState(const wchar_t* why) {
     g_closeCancelPending = true;
     g_closeCancelWhy = why;
     RemoveShutdownMouseHook();
+}
+
+// "该放粒子了"之后的收尾。**两条入口共用**（窗口上点满第三下、托盘菜单「关闭」）：
+// 粒子只能发一次、钩子必须摘掉、g_closeWaitParticles 必须置上 —— 分开写就会有一天两条路
+// 里有一条忘了改，而症状是"粒子播完进程不退出"（§10.3 的"任务管理器里无残留"）。
+void FireShutdownParticles(const wchar_t* what) {
+    const int n = g_renderer ? g_renderer->StartShutdownParticles() : 0;
+    g_closeWaitParticles = true;
+    RemoveShutdownMouseHook();            // 粒子期间不受理输入，"点外面取消"也不必要了
+    SelfTestLog(L"[close] %ls：已发粒子信号 StartShutdownParticles() -> %d 颗；"
+                L"此后不受理任何输入，粒子播完即退出进程",
+                what, n);
 }
 
 // 关闭态内的一次点击。**左键与右键走同一条**（所有者定：右键也算一次）。
@@ -1379,12 +1409,7 @@ void HandleShutdownClick(int which) {
     g_closeClickPending = dshb::ShutdownClicks();
     g_closeWhichPending = which;
     if (!fired) return;
-    const int n = g_renderer ? g_renderer->StartShutdownParticles() : 0;
-    g_closeWaitParticles = true;
-    RemoveShutdownMouseHook();            // 粒子期间不受理输入，"点外面取消"也不必要了
-    SelfTestLog(L"[close] 第 3 击（%ls）：已发粒子信号 StartShutdownParticles() -> %d 颗；"
-                L"此后不受理任何输入，粒子播完即退出进程",
-                which ? L"右键" : L"左键", n);
+    FireShutdownParticles(which ? L"第 3 击（右键）" : L"第 3 击（左键）");
 }
 
 // Esc 的**唯一**判定口：关闭态里只取消；非关闭态维持原样（直接关窗口，所有者一直在用）。
@@ -1409,9 +1434,13 @@ void FlushCloseLogs() {
     const double d = g_display.ambienceDepthShown();
     if (g_closeEnterPending) {
         g_closeEnterPending = false;
-        SelfTestLog(L"[close] 右键 -> 进入关闭态：clicks=0 R_d=%.2f R_new=%.6f R=%.6f color=%ls "
+        // clicks 是**读出来的**而不是写死的：托盘菜单那一条进来时状态机已经补齐到 3（直接进
+        // 第三击），写死 0 会让那一行的日志与真实状态对不上。右键进入那一支此刻 clicks = 0，
+        // 所以它的这一行逐字不变。
+        SelfTestLog(L"[close] %ls -> 进入关闭态：clicks=%d R_d=%.2f R_new=%.6f R=%.6f color=%ls "
                     L"jitter=%.4fpx frame=%d 鼠标钩子=%ls",
-                    dshb::ShutdownFloorRatio(), g_display.ambienceRatioTarget(), r, hex.c_str(),
+                    g_closeEnterWhy, dshb::ShutdownClicks(), dshb::ShutdownFloorRatio(),
+                    g_display.ambienceRatioTarget(), r, hex.c_str(),
                     dshb::ShutdownJitterDip(), dshb::ShutdownFrame(),
                     g_mouseHook ? L"已装" : L"未装");
     }
