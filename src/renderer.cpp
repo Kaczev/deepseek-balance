@@ -188,7 +188,7 @@ struct LayoutProbeData {
     float centerX = 0, symbolW = 0, digitsW = 0, left = 0;
     float boxLeft = 0, boxTop = 0, numberTop = 0, boxRight = 0;
     float lineH = 0;   // 相邻两个数字的垂直间距 h（排版引擎给的 line advance）
-    // "今日已 X.XX¥" 那一行在标题那一行上的实测几何（DIP，只在开启探针时填）。
+    // "今日已X.XX¥" 那一行在标题那一行上的实测几何（DIP，只在开启探针时填）。
     // 为什么留这几个数：这一行的取位完全由"标题墨迹到哪结束 + 右边还剩多少"决定，而那两个
     // 数只有排版引擎知道；导出图里的字要 OCR 才读得回来，所以把量到的事实从同一个出口写出来
     // —— "同一行、不重叠、不越内缘"才有可复查的数字。
@@ -940,7 +940,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
     IDWriteTextFormat* estFmt = TextFormatFor(FontRole::Estimate);
 
     // 标题兼状态行：左上角。状态变了文字就换，不只靠颜色编码。
-    // "今日已 X.XX¥" 的墨迹左端（DIP）：由标题那一段量出来，倒计时那一段会把它往左收。
+    // "今日已X.XX¥" 的墨迹左端（DIP）：由标题那一段量出来，倒计时那一段会把它往左收。
     float todayInkLeftDip = 0.0f;
     bool todayMeasured = false;
     float countdownInkLeftDip = 0.0f;   // 0 = 这一行上没有倒计时
@@ -988,7 +988,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
         countdownInkLeftDip = kMarginDip + kEntityWidthDip - kTitleInsetXDip -
                               TextInkRightEdgeDip(f.countdownText, titleFmt);
     }
-    // 标题那一行后面的灰色小字「今日已 X.XX¥」（所有者 2026-09-19）。
+    // 标题那一行后面的灰色小字「今日已X.XX¥」（所有者 2026-09-19）。
     //  · Same row as the title: same y as the title and the countdown, then lifted by the
     //    difference between the two ink tops, so the three runs share ONE BASELINE rather
     //    than one line-box top (the ascent scales with the size, so at the same origin the

@@ -390,7 +390,7 @@ int main(int argc, char** argv) {
     }
 
     // -----------------------------------------------------------------------
-    // (5) "今日已 X.XX¥" -- today's spend, on the title row.
+    // (5) "今日已X.XX¥" -- today's spend, on the title row.
     //
     //     The rule is the owner's: a CALENDAR DAY in local time, and only the DECREASES
     //     count (a top-up must not shrink the number and it must never go negative).
@@ -430,7 +430,9 @@ int main(int argc, char** argv) {
             FeedPoint(&store, "23.30", midnight + 1800);
             FeedPoint(&store, "23.00", midnight + 2400);
             const std::string got = TodayLineAt(store, "today-drops", kNow);
-            const std::string want = "\xE4\xBB\x8A\xE6\x97\xA5\xE5\xB7\xB2 2.00\xC2\xA5";
+            // No space between 已 and the number (owner, 2026-09-19: "今日已15.32¥"): the
+            // string is built by concatenation because "\xB22" would lex as ONE hex escape.
+            const std::string want = "\xE4\xBB\x8A\xE6\x97\xA5\xE5\xB7\xB2" "2.00\xC2\xA5";
             std::printf("    today fixture (local day %s, midnight=%lld): 20.00@-3min, 19.50@+5min, "
                         "18.50@+15min, 23.50@+20min (top-up), 23.30@+30min, 23.00@+40min\n",
                         localDay.c_str(), static_cast<long long>(midnight));
@@ -447,7 +449,7 @@ int main(int argc, char** argv) {
             FeedPoint(&store, "12.00", midnight + 600);
             FeedPoint(&store, "15.00", midnight + 1200);
             const std::string got = TodayLineAt(store, "today-up", kNow);
-            const std::string want = "\xE4\xBB\x8A\xE6\x97\xA5\xE5\xB7\xB2 0.00\xC2\xA5";
+            const std::string want = "\xE4\xBB\x8A\xE6\x97\xA5\xE5\xB7\xB2" "0.00\xC2\xA5";
             h.Req("case5b", "a day with no drops shows 0.00, not the --.-- placeholder",
                    "one baseline + two top-ups (no drop) -> \"" + got + "\"", got == want);
         }
@@ -459,7 +461,7 @@ int main(int argc, char** argv) {
             FeedPoint(&store, "20.00", midnight - 7200);
             FeedPoint(&store, "19.00", midnight - 3600);
             const std::string got = TodayLineAt(store, "today-none", kNow);
-            const std::string want = "\xE4\xBB\x8A\xE6\x97\xA5\xE5\xB7\xB2 --.--\xC2\xA5";
+            const std::string want = "\xE4\xBB\x8A\xE6\x97\xA5\xE5\xB7\xB2--.--\xC2\xA5";
             h.Req("case5c", "a store with no dated point for today shows --.--",
                    "both points are yesterday -> \"" + got + "\"", got == want);
         }
@@ -473,7 +475,7 @@ int main(int argc, char** argv) {
             FeedPoint(&store, "19.00", midnight - 60);    // yesterday's drop: NOT today
             FeedPoint(&store, "17.00", midnight + 600);   // today's drop from 19.00: 2.00
             const std::string got = TodayLineAt(store, "today-midnight", kNow);
-            const std::string want = "\xE4\xBB\x8A\xE6\x97\xA5\xE5\xB7\xB2 2.00\xC2\xA5";
+            const std::string want = "\xE4\xBB\x8A\xE6\x97\xA5\xE5\xB7\xB2" "2.00\xC2\xA5";
             h.Req("case5d", "the day boundary is local midnight: a drop before it is not counted, "
                             "and the balance it left is today's baseline",
                    "20.00@-30min, 19.00@-1min, 17.00@+10min; only 19.00->17.00 is today -> \"" +
