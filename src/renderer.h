@@ -15,6 +15,7 @@
 
 #include "widget_display.h"
 #include "tuning.h"
+#include "particles.h"
 
 // 探针出口的签名里用到（renderer.h 故意不引 d2d1.h：它对外只是一组包装）。
 struct ID2D1RenderTarget;
@@ -70,6 +71,40 @@ public:
     //   都要靠它量。它渲染的是同一套画面，所以屏幕上的错在 PNG 里也会错。
     bool ExportFrame(const wchar_t* path, double elapsedSeconds);
 
+    // -----------------------------------------------------------------------
+    // 关闭粒子（设计 §11.6）—— 与"关闭流程"那一步的**唯一**接缝
+    // -----------------------------------------------------------------------
+    // ★ 谁在什么时候调 StartShutdownParticles：
+    //   第三次关闭点击**已确认**、进程即将退出之前（widget_display/renderer 的宿主
+    //   在那一刻调一次）。调用方不传颜色、不传时间、不管数量：
+    //     · 颜色取**本帧** WidgetFrame 里的 ambientColor —— 那正是"那一刻的 R"，
+    //       而且是屏幕上真的在用的那个颜色（不是这里另算一遍 R/D 公式：重算就会分叉）；
+    //     · 时间由帧循环累计（见 .cpp 的 AdvanceShutdownParticles）；
+    //     · 数量与物理在 src/particles.cpp。
+    //   ★ 它同时还做两件**同一时刻**发生的事：
+    //     1. **面板本体整层不再画**（renderer.cpp 的 g_panelGone）。这是所有者 2026-09-19
+    //        要的"窗口先消失、再爆开"：第 3 击那一帧面板就没了，没有淡出、没有收缩，
+    //        粒子是**取代**它而不是叠在它上面；
+    //     2. 窗口区域扩到整个画布（ApplyInputRegion(true)），粒子才能飞进外扩余量。
+    //   ★ "粒子播完之后回到什么画面"：真实关闭路径上**没有下一幅画面** —— main.cpp 的
+    //     g_closeWaitParticles 等粒子一停就 WM_CLOSE，窗口与进程一起消失。所以面板不回到
+    //     屏幕上（g_panelGone 只置位不清零）。自检/探针那条真帧循环会跑满 500 ms 再退出，
+    //     它看到的最后一帧也是"只有粒子、没有面板"。
+    //   返回值 = 这一轮撒出来的粒子数；已经在放的时候返回 0（空操作）——
+    //   "再次触发销毁不产生第二个实例"（G5）是这一层的性质，调用方不必先判断。
+    int StartShutdownParticles();
+
+    // 推进到某个年龄（秒）并停住。**只给导帧用**：`--shutdown-particles=R,D` +
+    // `--export-frame=k` 靠它把粒子推到第 k 帧再量像素，不需要真的等 500 ms。
+    // 它走的是与逐帧播放完全相同的仿真路径，所以导出的第 k 帧就是屏幕上的第 k 帧。
+    void SetShutdownParticlesAge(double seconds);
+
+    // 这一轮粒子的数量/拖尾/种子/当前年龄（UTF-8，一行）。生产与探针打同一行。
+    std::string ShutdownParticlesLog() const;
+
+    // 粒子在放就返回 true。宿主可以用它拒绝在粒子期间受理新的手势（G5 的第二道闸）。
+    bool shutdownParticlesActive() const { return particles_.active(); }
+
     // ★ 预乘自检（A8c）：渲一张"50% 透明纯红块"到位图，并回读像素。
     //   预期 (128,0,0,128) 而不是 (255,0,0,128)——后者说明没预乘。
     bool PremulProbe(uint8_t* outBgra, int* outX, int* outY);
@@ -96,6 +131,12 @@ public:
     bool ready() const { return ready_; }
 
 private:
+    // 粒子激活/结束时各跑一次：把窗口区域在"整个画布"与"实体区"之间切一次。
+    // ★ 不每帧调：SetWindowRgn 是系统调用（会触发重绘），500 ms 里调 30 次是白付的代价。
+    void ApplyParticleInputRegion(bool particlesSpillout);
+    // 按帧循环的时间推进粒子；粒子的唯一驱动者（RenderFrame 调它）。
+    void AdvanceShutdownParticles(double elapsedSeconds);
+
     HWND hwnd_ = nullptr;
     CanvasSize size_{};
     bool ready_ = false;
@@ -103,6 +144,13 @@ private:
     double flashStart_ = -1000.0;   // 负值表示"没在闪"
     std::wstring debugText_;
     WidgetFrame widget_{};
+    // 关闭粒子：状态在渲染器里（不在 WidgetFrame 里），因为它的驱动者是**帧循环**，
+    // 而 WidgetFrame 是显示层每帧组装的"要显示什么"——粒子不改变显示内容。
+    ShutdownParticles particles_{};
+    // 上一帧给粒子的 elapsed（秒）。-1 = 还没定起点，此时 dt 取 0：
+    // ★ 不能用 elapsedSeconds 自己当年龄 —— 它是进程启动以来的秒数（可能已经几千秒），
+    //   直接当年龄的话粒子一帧之内就死了（这个坑一定会踩，所以在这里写清楚）。
+    double particleLastSeconds_ = -1.0;
     struct Impl;
     Impl* impl_ = nullptr;
 };
@@ -165,8 +213,7 @@ const std::vector<unsigned char>& InnerGlowMaskPixelsForProbe(const CanvasSize& 
 // 实现读的是和 Pick 同一个计数器，所以它不会说谎。
 bool GlowTintBakedOnLastPick();
 
-// 探针用的 GlowCache 出口（.dsh/scratch/amb/glowbake.cpp）。
-// ★ 为什么必须 export：重烘代价只能在"逐帧重放一次真实滑行"里量出来，而挂件一次
+// 探针用的 GlowCache 出口（.dsh/scratch/amb/glowbake.cpp）。// ★ 为什么必须 export：重烘代价只能在"逐帧重放一次真实滑行"里量出来，而挂件一次
 //   导帧只画一帧 —— 用它自己量不出重烘次数。这个类只是把内部的 GlowCache
 //   **原样**转出来（成员函数直接转发），所以探针量到的就是生产那条代码。
 //   生产路径不碰它（没有任何调用点）。
@@ -191,5 +238,23 @@ private:
 // 氛围颜色/强度的纯函数出口（滑行探针要按状态取色，不能自己抄一份颜色表）。
 AmbienceColor AmbienceTargetColorForProbe(double ratio, double depth);
 float GlowIntensityForProbe(double ratio, double depth);
+
+// 量粒子颜色用的**导帧夹具**：只画粒子那一层，跳过面板、蒙光、边框、曲线、正文。
+// ★ 为什么需要它：粒子叠在不透明的面板上（面板像素 alpha 已约 244），粒子只把 alpha
+//   抬高 6..10，于是"反解粒子的直通颜色"带着 ±50 的量化噪声（实测同一公式给 92..320）。
+//   背景整层跳过之后，PNG 里就是粒子自己的 alpha 与颜色，逐字量得出来。
+// 生产路径不调它（只有导帧夹具 --particles-only 会调）。
+void SetParticlesOnlyModeForProbe();
+
+// --no-present：RenderFrame 画完**不**调用 Present。
+// ★ 为什么需要：Present(1,0) 会等垂直空白，于是"一帧 24 ms"里有多少是光栅、多少是在
+//   等显示，从外面看不出来。设计 §11.3 的 p99 < 8 ms 说的是**帧内计算**，
+//   所以量预算时要把等待那一段摘掉，否则量到的是显示器的节奏，不是我们的代价。
+void SetNoPresentForProbe(bool on);
+
+// --no-particles：让 StartShutdownParticles 一颗粒子都不撒（面板照样消失）。
+// ★ 它是"面板先没了"这一条的 **A/B 尺子**：同一条绘制路径、同一帧号，去掉粒子之后
+//   画布上还剩下的任何不透明像素都只可能来自面板。生产路径不调它。
+void SetParticlesDisabledForProbe(bool on);
 
 }  // namespace dshb

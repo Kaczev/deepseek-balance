@@ -1,4 +1,4 @@
-// curve_store.h -- the curve data layer: 12-point ring, "only record changes",
+// curve_store.h -- the curve data layer: 120-point ring, "only record changes",
 //                  curve.json persistence, and the stale-data invalidation rule.
 //
 // SOURCE OF TRUTH: `不入库文件\曲线规格.md` (§2), the owner's own spec rewritten
@@ -34,11 +34,27 @@
 //   codes CNY, because the account can be switched.
 //
 // ---------------------------------------------------------------------------
-// §2.2 Ring of 12 points
+// §2.2 Ring of points
 // ---------------------------------------------------------------------------
-//   Capacity 12: the 11 being displayed plus one incoming. Fewer than 12 points
-//   is legal (the display layer flattens the left side; that is not this file's
-//   job).
+//   Capacity 120 (owner, 2026-09-19; was 12). WHAT CHANGED IS ONLY THE NUMBER --
+//   every rule above (§2.1 "only a change becomes a point", §2.3 the invalidation
+//   rule, §2.4 one file) is untouched, and so is the file format: `curve.json` is
+//   the same JSON, it simply may carry up to 120 points now. A file written by the
+//   12-point build loads fine and keeps its newest points.
+//
+//   ★ WHY 120, and why it is NOT an invitation to start recording every poll:
+//     the ring has to hold enough CHANGES to cover the estimator's window
+//     (kRateWindowSeconds = 1800 s, tuning.h). Twelve points was the display's
+//     need (11 drawn + 1 incoming) and nothing more, so a quiet account ran out of
+//     points long before it ran out of window.
+//   ★ AND THE DISPLAY IS STILL 12: the panel draws the newest 12 of whatever the
+//     ring holds -- that slice is the display layer's own constant
+//     (widget_display.cpp's kCurveDisplayPoints), deliberately NOT kCapacity. Before
+//     2026-09-19 the display happened to use the store's whole contents, which was
+//     only correct because the two numbers happened to be equal; raising the
+//     capacity to 120 without slicing would have fed 120 points to a 12-slot layout.
+//   Fewer than 12 points is legal (the display layer flattens the left side; that
+//   is not this file's job).
 //
 // ---------------------------------------------------------------------------
 // §2.3 Timestamps and the invalidation rule
@@ -215,8 +231,9 @@ struct CurveLoadResult {
 // ---------------------------------------------------------------------------
 class CurveStore {
 public:
-    // §2.2: 11 displayed + 1 incoming.
-    static constexpr std::size_t kCapacity = 12;
+    // §2.2: the owner's ring size (2026-09-19: 12 -> 120). NOT the display width --
+    // the panel slices the newest 12 out of this, see the §2.2 note above.
+    static constexpr std::size_t kCapacity = 120;
     // §2.3: the owner's chosen threshold, in seconds. Not tunable on purpose.
     static constexpr int64_t kExpirySeconds = 86400;
 

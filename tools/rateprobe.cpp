@@ -17,8 +17,8 @@
 //   (1) 稳定消耗 -> 估计速率对上已知的元/分钟，且底部文案就是那一条外推
 //   (2) 一次大额充值 -> 速率不为负、**仍然为正**、且接近真实消耗（充值自己不进分子）
 //   (3) ★ 回归（这一轮的起点）：既有上升又有下降的序列 -> 一个真实的显著正速率，
-//       而不是「暂无法预测」。旧口径在这个序列上会丢掉回升之后的每一个点，
-//       剩下的下降段跨度 240 s < 300 s -> 「暂无法预测」；case 里把这两组数字都印出来
+//       而不是「暂时无法预测何时归零」。旧口径在这个序列上会丢掉回升之后的每一个点，
+//       剩下的下降段跨度 240 s < 300 s -> 「暂时无法预测何时归零」；case 里把这两组数字都印出来
 //   (4) 一个下降台阶都没有 -> 速率 0、status = NotConsuming、文案是破折号 U+2014
 //   (5) 跨度不到 5 分钟、或下降台阶不到 3 个 -> 不显著（bar 就是 3：2 个不显著、3 个显著）
 //   (6) 带"没有时间"的点的序列 -> 不显著，绝不假设点距
@@ -27,6 +27,9 @@
 //   (9) 旧夹具那种形状（跳上去、随后掉回原来的水平）现在读数是**真的**一笔 50 元消费：
 //       冻结这条期望，免得下一次有人照着旧探针"修回去"
 //   (10) 平滑的边界：0 -> 正速率这一段**不做平滑**（否则屏幕上会先闪一下「超过 7 天」）
+//   (11) ★ 新公式（Theil–Sen 中位斜率）：停机空档不再稀释速率，且归零预测用的是它
+//   (12) ★ 新公式的两条退化答案：窗口内 <2 个点 -> 不能预测；>=2 个点但中位数不下降
+//        -> 不消耗（两句话一样、kind 不同）
 #include "../src/rate_estimator.h"
 
 #include "amount.h"
@@ -41,6 +44,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -134,6 +138,12 @@ std::string F4(double value) {
 std::string F6(double value) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%.6f", value);
+    return buf;
+}
+
+std::string F12(double value) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.12f", value);
     return buf;
 }
 
@@ -293,9 +303,37 @@ double AbsoluteChangeRate(const std::vector<RateInputPoint>& points) {
            static_cast<double>(times.back() - times.front());
 }
 
+// ★ An INDEPENDENT brute-force Theil–Sen median slope, in 元/秒 with the RAW sign
+//   (negative = the balance is falling). Written here from the definition -- "the median
+//   of the slopes of every pair of points" -- and deliberately NOT by calling
+//   EstimateRateTheilSen: an expectation computed by the code under test would agree with
+//   it by construction. Points that carry no amount or no time of their own are skipped,
+//   the same input rule the estimator documents. Pairs with dt <= 0 are skipped.
+double BruteMedianPairSlope(const std::vector<RateInputPoint>& points) {
+    std::vector<int64_t> amounts;
+    std::vector<int64_t> times;
+    for (const RateInputPoint& point : points) {
+        if (!point.amountValid || !point.atValid) continue;
+        amounts.push_back(point.amountRaw);
+        times.push_back(point.at);
+    }
+    std::vector<double> slopes;
+    for (std::size_t i = 1; i < amounts.size(); ++i) {
+        for (std::size_t j = 0; j < i; ++j) {
+            const int64_t dt = times[i] - times[j];
+            if (dt <= 0) continue;
+            slopes.push_back(static_cast<double>(amounts[i] - amounts[j]) /
+                             static_cast<double>(dshb::kUnitsPerYuan) / static_cast<double>(dt));
+        }
+    }
+    if (slopes.empty()) return 0.0;
+    std::sort(slopes.begin(), slopes.end());
+    const std::size_t n = slopes.size();
+    return (n % 2 == 1) ? slopes[n / 2] : 0.5 * (slopes[n / 2 - 1] + slopes[n / 2]);
+}
+
 // A series summary for the evidence line: "10.0000@+0s, 9.9800@+60s, ...".
-std::string SeriesSummary(const std::vector<RateInputPoint>& points) {
-    if (points.empty()) return "no points";
+std::string SeriesSummary(const std::vector<RateInputPoint>& points) {    if (points.empty()) return "no points";
     std::string out;
     for (std::size_t i = 0; i < points.size(); ++i) {
         if (i != 0) out += ", ";
@@ -332,6 +370,9 @@ void RunChecks(Harness* h, bool verbose) {
     // -----------------------------------------------------------------------
     // (1) A steady drain at a KNOWN rate: the estimate must match it, and be Significant.
     //     The wording of §7.4's extrapolating branch is checked on the same fixture.
+    //     ★ 10.00 元 / 0.02 元每分钟 = 500 分钟 = 8.333 小时 -> 一位小数**就低不就高**
+    //       = 8.3 小时（> 6 小时，所以 §7.4 不补绝对时刻）。500/60 = 8.3333，
+    //       floor(83.333) = 83 -> 8.3。舍入会是 8.3 也一样，所以这一条不区分两种写法。
     // -----------------------------------------------------------------------
     {
         const double trueDrain = 0.02;                       // 元/分钟
@@ -340,7 +381,6 @@ void RunChecks(Harness* h, bool verbose) {
         const DropWalk walk = WalkDrops(series);
         const double expectedRate = WalkRate(walk);
         const double error = std::fabs(e.rateYuanPerMinute - expectedRate);
-        // 10.00 元 / 0.02 元每分钟 = 500 分钟 = 8.3 小时（> 6 小时，所以 §7.4 不补绝对时刻）
         const ZeroTimeText text = dshb::ZeroTimeFor(e, 10 * dshb::kUnitsPerYuan, kTextNow);
         const std::wstring wantText = L"按当前速度，约 8.3 小时后归零";
         const bool ok = e.status == RateStatus::Significant && error <= 1e-9 &&
@@ -405,8 +445,8 @@ void RunChecks(Harness* h, bool verbose) {
     //     Four falling steps (3 drops over 240 s), then a +50.00 top-up, then a balance
     //     that keeps RISING. Under the old rule (drop every rise, then fit) the only
     //     surviving points are the 4 falling ones -- span 240 s < the 5-minute bar --
-    //     so the old code answered 「暂无法预测」. Under the owner's rule the window keeps
-    //     every point, the three drops are real spending, and the rate is 0.075 yuan/min.
+    //     so the old code answered 「暂时无法预测何时归零」. Under the owner's rule the window
+    //     keeps every point, the three drops are real spending, and the rate is 0.075 yuan/min.
     // -----------------------------------------------------------------------
     {
         std::vector<RateInputPoint> series;
@@ -422,42 +462,44 @@ void RunChecks(Harness* h, bool verbose) {
         const DropWalk walk = WalkDrops(series);
         const double expectedRate = WalkRate(walk);          // 0.90 yuan over 720 s = 0.075
         const double error = std::fabs(e.rateYuanPerMinute - expectedRate);
-        // 60.60 元 / 0.075 元每分钟 = 808 分钟 = 13.5 小时（> 6 小时，所以不补绝对时刻）
+        // 60.60 元 / 0.075 元每分钟 = 808.0 分钟 = 13.4666… 小时 -> 一位小数就低不就高
+        // = **13.4 小时**（不是 13.5）。★★ 这是 2026-09-19 文案定案的直接后果：旧写法
+        //    把 13.4666 四舍五入成 13.5，新写法 floor 到 13.4。同一个余额、同一个速率，
+        //    两种写法差一位 —— 所以这一条**改了期望值**，不是代码错了（报告里列了这一条）。
         const ZeroTimeText text = dshb::ZeroTimeFor(e, 6060 * (dshb::kUnitsPerYuan / 100), kTextNow);
-        const std::wstring wantText = L"按当前速度，约 13.5 小时后归零";
-        const std::wstring noPrediction = L"暂无法预测";
+        const std::wstring wantText = L"按当前速度，约 13.4 小时后归零";
         const bool ok = e.status == RateStatus::Significant && e.rateYuanPerMinute > 0.0 &&
                         error <= 1e-9 && e.decreasingSteps == 3 && e.risingSteps == 4 &&
                         e.usablePoints == 8 && e.spanSeconds == 720 &&
-                        text.kind == ZeroTimeKind::Extrapolated && text.text == wantText &&
-                        text.text != noPrediction;
+                        text.kind == ZeroTimeKind::Extrapolated && text.text == wantText;
         h->Req("case3", "★ REGRESSION: a series that rises AND falls gives a real significant "
-                        "positive rate, not 「暂无法预测」",
+                        "positive rate, not 「暂时无法预测何时归零」",
                "8 points, 3 drops (0.90 yuan) and 4 rises over 720 s -> " + EstimateSummary(e) +
                    " (independent walk: " + F6(expectedRate) + " yuan/min, |error|=" + F6(error) +
                    "); nothing was discarded (usable=" + Num(e.usablePoints) + "/" +
                    Num(e.pointsSeen) + "), so the span is the whole 720 s instead of the 240 s "
                    "the old rule was left with (240 s < " +
                    Num(static_cast<long long>(dshb::kRateMinSpanSeconds)) +
-                   " s -> that is where 「暂无法预测」 came from); balance 60.60 -> " +
+                   " s -> that is where 「暂时无法预测何时归零」 came from); balance 60.60 -> " +
                    Show(text.text),
                ok);
         if (verbose) std::printf("  mixed rise/fall: %s\n", SeriesSummary(series).c_str());
     }
 
     // -----------------------------------------------------------------------
-    // (4) NO DROPS AT ALL -> rate exactly zero, status NotConsuming, the wording is the
-    //     dash. 设计 §7.4「速率 == 0 ->「—」」。
-    //     ★ The dash is written as an ESCAPE (U+2014, em dash) on purpose: U+2014 and
-    //     U+2015 look identical on screen, and comparing against the wrong one is a
-    //     failure that reads like a pass. Written as a codepoint there is nothing to
-    //     mistake.
+    // (4) NO DROPS AT ALL -> rate exactly zero, status NotConsuming, and the wording is
+    //     the SAME sentence as "we cannot predict" (owner, 2026-09-19).
+    //     ★ 这一条 2026-09-19 **改过期望值**：原来这里是 em dash U+2014（设计文档 §7.4
+    //       的「速率 == 0 ->「—」」），现在与 NoPrediction 合并成一句话。所有者只合并了
+    //       这两种；「已用尽」和「超过 7 天」保持原样（它们是真结论，见 case8）。
+    //     ★ 合并之后**字一样、kind 不一样**，所以下面仍然逐个断言 kind：诊断（探针、
+    //       日志、重绘判断）必须能分开"这段没在花钱"和"这段读不出来"，只有画出来一样。
     //     ★ Three shapes, because "no drop" is not only "flat": flat, rising-only, and a
     //     one-point window (which is what the store really holds when the balance never
     //     moved: a point exists only where the value changed).
     // -----------------------------------------------------------------------
     {
-        const std::wstring expected = L"\u2014";   // em dash, U+2014 -- see the note above
+        const std::wstring expected = L"暂时无法预测何时归零";   // Dash 与 NoPrediction 同一句
         // (a) flat: 10 points over 9 minutes at one single value.
         std::vector<RateInputPoint> flat;
         for (int i = 0; i < 10; ++i) flat.push_back(Dated(kAnchor + i * 60, "10.0000"));
@@ -500,7 +542,8 @@ void RunChecks(Harness* h, bool verbose) {
                         d.status == RateStatus::NotConsuming && d.spanSeconds == 4 &&
                         d.rateYuanPerMinute == 0.0 &&
                         std::string(dshb::RateStatusName(RateStatus::NotConsuming)) != "Rising";
-        h->Req("case4", "no decreasing step at all -> rate zero, NotConsuming, wording is the dash",
+        h->Req("case4", "no decreasing step at all -> rate zero, NotConsuming, same wording as "
+                        "「cannot predict」 (merged 2026-09-19)",
                "(a) flat, span 540 s: " + EstimateSummary(a) + ", text=" + Show(textA.text) +
                    ", minutesToZero=" + Num(textA.minutesToZero) + " (none claimed); " +
                    "(b) rising only, span 600 s: " + EstimateSummary(b) + ", text=" +
@@ -511,7 +554,8 @@ void RunChecks(Harness* h, bool verbose) {
                    dshb::RateStatusName(d.status) + ", span=" +
                    Num(static_cast<long long>(d.spanSeconds)) + "s, rate=" +
                    F6(d.rateYuanPerMinute) + "; the old status name was \"Rising\" for all of "
-                   "these, which is why it was renamed; expected=" + Show(expected),
+                   "these, which is why it was renamed; expected=" + Show(expected) +
+                   " (kind is still Dash: the two branches are told apart by kind, not by text)",
                ok);
     }
 
@@ -543,7 +587,7 @@ void RunChecks(Harness* h, bool verbose) {
         twoSteps.push_back(Dated(kAnchor + 600, "11.0000"));   // a rise: no third drop
         const RateEstimate c = dshb::EstimateRate(twoSteps);
 
-        const std::wstring wantNoPrediction = L"暂无法预测";
+        const std::wstring wantNoPrediction = L"暂时无法预测何时归零";
         const bool ok = a.status == RateStatus::Insignificant && a.rateYuanPerMinute == 0.0 &&
                         a.rawRateYuanPerMinute > 0.0 && a.decreasingSteps == 11 &&
                         a.spanSeconds == 110 && a.spanSeconds < dshb::kRateMinSpanSeconds &&
@@ -689,8 +733,10 @@ void RunChecks(Harness* h, bool verbose) {
         // 240 yuan / 2.00 per min = 120 min = 2 hours. ★ The expected line is built from
         // the two halves the design doc names, because at 2 hours the remainder is
         // UNDER the 6-hour bar, so §7.4 requires the absolute local time to be in the
-        // same line: 「按当前速度，约 2 小时后归零」+「约 22:27」.
-        const std::wstring wantRelative = L"按当前速度，约 2 小时后归零";
+        // same line: 「按当前速度，约 2.0 小时后归零」+「约 22:27」.
+        // ★ 2026-09-19 文案定案：时长**永远一位小数、`.0` 不许省**，所以这里是 "2.0"
+        //   而不是 "2"（旧写法把 2.0 小时印成"2 小时"）。这一条**改了期望值**。
+        const std::wstring wantRelative = L"按当前速度，约 2.0 小时后归零";
         const bool twoHoursOk = twoHours.kind == ZeroTimeKind::Extrapolated &&
                                 twoHours.minutesToZero == 120 &&
                                 twoHours.text == wantRelative + L" · 约 " +
@@ -727,7 +773,7 @@ void RunChecks(Harness* h, bool verbose) {
         RateEstimate none;
         none.status = RateStatus::Insignificant;
         const std::wstring branchChanged = dshb::ZeroTimeTextForFrame(none, 240 * dshb::kUnitsPerYuan, kTextNow, &state);
-        const bool branchRedraws = branchChanged == L"暂无法预测";
+        const bool branchRedraws = branchChanged == L"暂时无法预测何时归零";
 
         // A negative balance is NOT this module's line at all (欠款时说"几小时后归零"
         // 是废话)：the caller already suppresses it, this is the second guard.
@@ -834,6 +880,168 @@ void RunChecks(Harness* h, bool verbose) {
                    " (minutesToZero=" + Num(seededText.minutesToZero) + ") immediately; "
                    "between two positive rates the spring runs: one frame 0.02 -> 0.05 gives " +
                    F6(mid) + " (strictly inside, never past the target)",
+               ok);
+    }
+
+    // -----------------------------------------------------------------------
+    // (11) ★★ THE NEW FORMULA (owner, 2026-09-19): EstimateRateTheilSen -- the rate is the
+    //      MEDIAN OF ALL PAIRWISE SLOPES, and the zero prediction uses it.
+    //      Why this case exists at all: every check above judges the OLD estimator
+    //      (EstimateRate). Without this one, the function the widget actually calls would
+    //      have no probe covering it at all.
+    //
+    //      THE FIXTURE IS BUILT SO THE TWO FORMULAS DISAGREE, and the disagreement is the
+    //      point: 0.05 yuan is spent in four 2-minute steps (the recent truth is exactly
+    //      0.05/2 = 0.025 yuan/min), and then the account goes quiet for 10 minutes
+    //      (600 s with no change at all -- the user stopped working, nobody spent
+    //      anything). Total span 1080 s.
+    //        old formula: Σdrops ÷ WHOLE span = 0.05 yuan / 1080 s = 0.002778 yuan/min
+    //                     -> 3.6x too slow, and the prediction runs 3.6x too long
+    //        new formula: the 15 pairwise slopes have a median of 0.005 yuan/min
+    //                     (12 of the 15 pairs cross the quiet stretch, and the middle one
+    //                      lands on a pair that is exactly one 2-minute step: the 8th of 15
+    //                      sorted slopes is 0.05 yuan over 600 s = 0.005 yuan/min)
+    //      Both rates and BOTH WORDINGS are printed from the same balance (5.00 yuan).
+    //      ★ The expectation is computed HERE, by brute force over the pairs, and not by
+    //      calling the estimator -- an expectation borrowed from the code under test would
+    //      agree with it by construction.
+    // -----------------------------------------------------------------------
+    {
+        std::vector<RateInputPoint> series;
+        series.push_back(Dated(kAnchor + 0, "5.0500"));
+        series.push_back(Dated(kAnchor + 120, "5.0375"));    // -0.0125 over 120 s = 0.00625/min
+        series.push_back(Dated(kAnchor + 240, "5.0250"));    // -0.0125 over 120 s = 0.00625/min
+        series.push_back(Dated(kAnchor + 360, "5.0125"));    // -0.0125 over 120 s = 0.00625/min
+        series.push_back(Dated(kAnchor + 480, "5.0000"));    // -0.0125 over 120 s = 0.00625/min
+        series.push_back(Dated(kAnchor + 1080, "5.0000"));   // QUIET STRETCH: 600 s, nothing spent
+
+        const RateEstimate slow = dshb::EstimateRate(series);         // 旧口径
+        const RateEstimate fast = dshb::EstimateRateTheilSen(series);  // 新口径
+        const DropWalk walk = WalkDrops(series);
+        const double oldExpected = WalkRate(walk);   // 0.05 yuan over 1080 s -> 0.002778/min
+        // 12 of the 15 pairs cross the quiet stretch, so the median lands on one of those:
+        //   the 8th of 15 sorted slopes is 0.05 yuan / 600 s = 0.005 yuan/min.
+        // The number is taken from the independent brute force below, not typed from memory.
+        const double bruteSlope = BruteMedianPairSlope(series);   // 元/秒，未取负号
+        const double bruteRate = -bruteSlope * 60.0;
+        const double newExpected = bruteRate;
+
+        const int64_t balanceRaw = 5 * dshb::kUnitsPerYuan;
+        const ZeroTimeText oldText = dshb::ZeroTimeFor(slow, balanceRaw, kTextNow);
+        const ZeroTimeText newText = dshb::ZeroTimeFor(fast, balanceRaw, kTextNow);
+
+        // ★ 容差 1e-9 而不是 1e-12：新公式在**点对内**做两步除法（先换成元、再除以秒），
+        //   定点金额换算到 double 时最后几位会抖。实测同一条序列上"代码算的"与"这里独立
+        //   算的"差 2.2e-11（旧口径那条路差 8.7e-18）。1e-9 远小于任何真实速率（真实值在
+        //   1e-3 量级），所以它既挡住了真错，也不会被浮点噪声弄成假失败。
+        const double tolerance = 1e-9;
+        const bool ok = slow.status == RateStatus::Significant &&
+                        std::fabs(slow.rateYuanPerMinute - oldExpected) <= tolerance &&
+                        fast.status == RateStatus::Significant &&
+                        std::fabs(fast.rateYuanPerMinute - newExpected) <= tolerance &&
+                        std::fabs(bruteRate - fast.rateYuanPerMinute) <= tolerance &&
+                        fast.usablePoints == 6 && fast.pairCount == 15 &&
+                        fast.spanSeconds == 1080 &&
+                        oldText.kind == ZeroTimeKind::Extrapolated &&
+                        newText.kind == ZeroTimeKind::Extrapolated &&
+                        oldText.text != newText.text;
+        h->Req("case11", "★ the NEW formula: a quiet stretch no longer dilutes the rate, and the "
+                         "prediction uses it",
+               "same 6 points (0.05 yuan spent over four 2-minute steps, then 600 s of nothing): "
+               "OLD = " + F6(slow.rateYuanPerMinute) + " yuan/min (independent walk " +
+                   F6(oldExpected) + ", the quiet stretch is in the denominator) -> " +
+                   Show(oldText.text) + "; NEW = " + F6(fast.rateYuanPerMinute) +
+                   " yuan/min (independent brute-force median of the " + Num(fast.pairCount) +
+                   " pairwise slopes = " + F6(bruteRate) + " yuan/min; exact difference " +
+                   F12(std::fabs(bruteRate - fast.rateYuanPerMinute)) + " <= " + F12(tolerance) +
+                   ") -> " + Show(newText.text) + "; balance 5.00 for both. " +
+                   EstimateSummary(fast),
+               ok);
+        if (verbose) std::printf("  quiet stretch: %s\n", SeriesSummary(series).c_str());
+    }
+
+    // -----------------------------------------------------------------------
+    // (12) The new formula's two degenerate answers, and the boundary between them:
+    //        < 2 points in the window          -> Insignificant (「cannot predict」)
+    //        >= 2 points but median slope >= 0 -> NotConsuming, rate exactly 0
+    //      Both print the SAME sentence since 2026-09-19; the KIND is what differs, and the
+    //      kind is what ZeroTimeTextForFrame uses to decide whether to redraw.
+    //      ★ The 1800 s window is exercised for real here: the two old points are 2000 s
+    //      back, so they are outside it and must not vote.
+    // -----------------------------------------------------------------------
+    {
+        const int64_t windowBase = kAnchor + 100000;
+
+        // (a) one point inside the window, two more far outside it.
+        std::vector<RateInputPoint> oneInWindow;
+        oneInWindow.push_back(Dated(windowBase - 3000, "10.0000"));
+        oneInWindow.push_back(Dated(windowBase - 2000, "9.5000"));
+        oneInWindow.push_back(Dated(windowBase, "9.0000"));
+        const RateEstimate a = dshb::EstimateRateTheilSen(oneInWindow);
+        const ZeroTimeText textA = dshb::ZeroTimeFor(a, 9 * dshb::kUnitsPerYuan, kTextNow);
+
+        // (b) two points in the window, both falling: exactly the boundary that CHANGES
+        //     ANSWER between the two formulas. The old formula refuses here (needs 3
+        //     decreasing steps AND a 300 s span); the new one gives a real rate.
+        std::vector<RateInputPoint> twoInWindow;
+        twoInWindow.push_back(Dated(windowBase, "10.0000"));
+        twoInWindow.push_back(Dated(windowBase + 600, "9.4000"));
+        const RateEstimate b = dshb::EstimateRateTheilSen(twoInWindow);
+        const RateEstimate bOld = dshb::EstimateRate(twoInWindow);
+
+        // (c) a flat window: median slope exactly 0 -> NotConsuming, rate exactly 0.
+        std::vector<RateInputPoint> flatWindow;
+        for (int i = 0; i < 5; ++i) flatWindow.push_back(Dated(windowBase + i * 120, "9.0000"));
+        const RateEstimate c = dshb::EstimateRateTheilSen(flatWindow);
+        const ZeroTimeText textC = dshb::ZeroTimeFor(c, 9 * dshb::kUnitsPerYuan, kTextNow);
+
+        // (d) a rising-only window (a top-up that keeps going): also NotConsuming.
+        std::vector<RateInputPoint> risingWindow;
+        for (int i = 0; i < 4; ++i) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.4f", 9.0 + 0.5 * i);
+            risingWindow.push_back(Dated(windowBase + i * 120, buf));
+        }
+        const RateEstimate d = dshb::EstimateRateTheilSen(risingWindow);
+
+        // (e) an undated point alongside dated ones: never fitted (no assumed spacing).
+        std::vector<RateInputPoint> withUndated;
+        withUndated.push_back(Dated(windowBase, "10.0000"));
+        withUndated.push_back(Undated("9.5000"));
+        withUndated.push_back(Dated(windowBase + 600, "9.0000"));
+        const RateEstimate e = dshb::EstimateRateTheilSen(withUndated);
+
+        const std::wstring expected = L"暂时无法预测何时归零";
+        const bool partA = a.status == RateStatus::Insignificant && a.usablePoints == 1 &&
+                           a.rateYuanPerMinute == 0.0 &&
+                           textA.kind == ZeroTimeKind::NoPrediction && textA.text == expected;
+        const bool partB = b.status == RateStatus::Significant && b.usablePoints == 2 &&
+                           b.pairCount == 1 &&
+                           std::fabs(b.rateYuanPerMinute - 0.06) <= 1e-9 &&
+                           bOld.status == RateStatus::Insignificant &&
+                           bOld.rateYuanPerMinute == 0.0;
+        const bool partC = c.status == RateStatus::NotConsuming && c.rateYuanPerMinute == 0.0 &&
+                           c.medianSlopeYuanPerSecond == 0.0 &&
+                           textC.kind == ZeroTimeKind::Dash && textC.text == expected;
+        const bool partD = d.status == RateStatus::NotConsuming && d.rateYuanPerMinute == 0.0;
+        const bool partE = e.status == RateStatus::Significant && e.undatedPoints == 1 &&
+                           e.usablePoints == 2 && e.pairCount == 1 &&
+                           std::fabs(e.rateYuanPerMinute - 0.10) <= 1e-9;
+        const bool ok = partA && partB && partC && partD && partE;
+        h->Req("case12", "the new formula: <2 points in the window cannot predict; >=2 points "
+                         "with a non-falling median are NotConsuming (same sentence, different kind)",
+               "(a) 3 points, only 1 inside the 1800 s window: " + EstimateSummary(a) + " -> " +
+                   dshb::ZeroTimeKindName(textA.kind) + " " + Show(textA.text) + "; (b) TWO falling "
+                   "points inside the window: NEW = " + F6(b.rateYuanPerMinute) + " yuan/min (" +
+                   EstimateSummary(b) + ") while OLD = " + F6(bOld.rateYuanPerMinute) +
+                   " yuan/min, status=" + dshb::RateStatusName(bOld.status) +
+                   " -- the two formulas DISAGREE here, which is the point); (c) flat window: " +
+                   EstimateSummary(c) + " -> " + dshb::ZeroTimeKindName(textC.kind) + " " +
+                   Show(textC.text) + "; (d) rising-only window: " +
+                   dshb::RateStatusName(d.status) + ", rate=" + F6(d.rateYuanPerMinute) +
+                   "; (e) one undated point among dated ones: " + EstimateSummary(e) +
+                   " (the undated point is not fitted, the two dated ones still are; 1.00 yuan "
+                   "over 600 s, so the rate is 0.10 and not case (b)'s 0.06)",
                ok);
     }
 }

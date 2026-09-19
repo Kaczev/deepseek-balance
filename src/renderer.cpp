@@ -17,7 +17,10 @@
 #include <objbase.h>      // CoCreateInstance
 #include <wincodec.h>     // 绂诲睆瀵煎抚鐢?
 
-#include <cmath>   // std::fmod
+#include <algorithm>   // std::sort（层序扫描）
+#include <cmath>   // std::fmod / std::exp / std::pow
+#include <cstdio>  // std::snprintf（粒子那条临时诊断）
+#include <cstdlib> // std::getenv（同上）
 #include <cstring> // std::strcmp
 #include <string>
 #include <vector>
@@ -48,6 +51,42 @@ namespace dshb {
 // --- 重烘计数与耗时（renderer.h 的 InnerGlowBakeStats 是它的只读出口）---
 InnerGlowBakeCounters g_glowBake;
 std::string g_curveDebug;   // 临时：DSHB_CURVE_DEBUG 诊断
+
+// 场景模式。**必须在匿名 namespace 之外**：探针出口 SetParticlesOnlyModeForProbe
+// 要写它，而那个出口是对外的（renderer.h 里声明），匿名 namespace 里的名字外部链接不到。
+enum class SceneMode { Normal, PremulProbe, ParticlesOnly };
+SceneMode g_sceneMode = SceneMode::Normal;
+
+// ★★ 面板消失（所有者 2026-09-19 的改版）：第 3 击那一刻起，面板本体整层不再画。
+//  所有者原话："窗口先消失（也可以想成窗口可见部分隐藏），然后窗口爆开，变成飞溅粒子，
+//  向四处飞溅。" 所以粒子不是叠在一块还亮着的板子上，而是**取代**它。
+//  ★ 为什么是一个进程级的开关、而不是"每帧问粒子在不在放"：
+//    要的就是"一旦消失就再也不回来"，所以它只置位、不清零（下面的"为什么不清零"）。
+//  ★ 与 g_sceneMode 的关系：两个条件各自独立地让背景与正文整层跳过
+//    （ParticlesOnly 是探针夹具 --particles-only，本开关是生产路径）。
+//    合成一个枚举会假装它们是同一件事 —— 探针量的颜色与生产画面的差别就在于
+//    "夹具里什么都不画"，而生产画面里**只剩下粒子**，两者恰好都成立但理由不同。
+bool g_panelGone = false;
+
+// ★ --no-particles 的开关（**只给 A/B 夹具**）：让 StartShutdownParticles 什么都不做。
+//   要证明"面板真的先没了"，需要一张**没有粒子**的同帧图 —— 否则量到的像素里分不清
+//   哪一块是面板、哪一块是粒子。关掉粒子之后同一份绘制代码走到底，画布上剩下的任何
+//   不透明像素就只可能来自面板（底色/边框/蒙光/曲线/正文）。生产路径永远不置它。
+bool g_particlesDisabled = false;
+
+// 只画粒子、不画背景（SceneMode::ParticlesOnly）。**只为量像素存在**。
+// ★ 为什么必须有它：粒子叠在**面板底色 + 内蒙光**之上，而面板像素的 alpha 已约 244，
+//   粒子只把它抬高 6..10。于是"反解粒子的直通颜色"带着 ±50 的量化噪声
+//   （实测同一个公式在不同像素上给 92..320）。背景整层跳过之后，画布上只剩粒子自己，
+//   它的 alpha 与颜色就是 PNG 里的原值，量出来不需要任何反解。
+// 生产路径永远不设它：只有导帧夹具（--particles-only）会调它。
+// --no-present：画完不提交。见 renderer.h 的说明（量光栅代价时要把等显示的等待摘掉）。
+// 与 g_sceneMode 同一个位置、同一个理由：探针出口要写它，而出口是对外的。
+bool g_noPresent = false;
+
+void SetParticlesOnlyModeForProbe() { g_sceneMode = SceneMode::ParticlesOnly; }
+void SetNoPresentForProbe(bool on) { g_noPresent = on; }
+void SetParticlesDisabledForProbe(bool on) { g_particlesDisabled = on; }
 
 void PaintInnerGlow(ID2D1RenderTarget* rt, const WidgetFrame& f, ID2D1Bitmap* tinted);
 float InnerGlowAlphaAt(float xDip, float yDip);
@@ -224,8 +263,10 @@ struct Rgba {
 // 棰勪箻鑷鐢ㄧ殑鐢婚潰锛圓8c锛夛細涓€涓?50% 涓嶉€忔槑鐨勭函绾㈡柟鍧椼€?
 // 瀹冧笌姝ｅ父鐢婚潰璧板悓涓€鏉?PaintScene锛屾墍浠?瀵煎嚭鐨?PNG"鍜?灞忓箷"楠岀殑鏄悓涓€涓笢瑗裤€?
 // ---------------------------------------------------------------------------
-enum class SceneMode { Normal, PremulProbe };
-SceneMode g_sceneMode = SceneMode::Normal;
+// （SceneMode / g_sceneMode 定义在文件顶部：探针出口要写它，而那个出口是对外的。）
+}  // namespace
+
+namespace {
 
 // 褰撳墠瑕佺敾鐨勬鏂囥€傜敱 Renderer::SetWidgetFrame 濉紝缁樺埗鍑芥暟鍙銆?
 WidgetFrame g_widgetFrame{};
@@ -942,9 +983,102 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
 // 内蒙光与 GlowCache 都已经在文件开头声明（那里定义，因为它要用本 namespace 里的
 // 烘焙函数）。这里直接定义 PaintScene。
 
+// ---------------------------------------------------------------------------
+// 关闭粒子（设计 §11.6）的绘制
+// ---------------------------------------------------------------------------
+//  运动学在 src/particles.cpp；这里只管"怎么画"。三条约束写在代码里：
+//   · **同一条光栅路径**：它就是 PaintScene 里的一次调用，没有第二个窗口、没有第二个
+//     交换链、没有分层。所以窗口一没，粒子不可能还在（那是选外扩画布的理由）。
+//   · **不建几何对象**：一条拖尾画成 9 段线、头部画成一个圆，都用同一个实心画笔。
+//     §11.3 禁的是"逐帧建渐变/模糊/大面积阴影"，线段与圆不在其中，但每帧 CreateGeometry
+//     也不该做 —— 一笔画完就 Release。
+//   · **颜色只做一次变换**：氛围色 -> 提亮（kShutdownParticleLift），保持通道比例。
+//     所以 PNG 里量的比例仍然等于 AmbienceTargetColor(R,D) 的比例（见 tuning.h §7）。
+namespace {
+
+D2D1_COLOR_F ParticleColour(float r, float g, float b, float alpha) {
+    const float lift = kShutdownParticleLift;
+    const float cr = r + (1.0f - r) * lift;
+    const float cg = g + (1.0f - g) * lift;
+    const float cb = b + (1.0f - b) * lift;
+    return StraightRgba(cr, cg, cb, alpha);
+}
+
+void PaintShutdownParticles(ID2D1RenderTarget* rt, const CanvasSize& canvas,
+                            const ShutdownParticles& sys) {
+    if (!sys.active()) return;
+    const std::vector<ShutdownParticle>& ps = sys.particles();
+    // 临时诊断（量第一个版本时用：粒子在 PNG 里一个像素都量不到，必须先分清"没画"
+    // 与"画了但没画到那里"）。与曲线那条诊断同一个形状：绘制期间只往内存里写，
+    // 画完由外面落盘 —— 绘制路径里做文件 I/O 会把进程弄崩（本项目踩过两次）。
+    // 画笔按透明度分档（每档一个 ID2D1SolidColorBrush）。
+    // ★ 为什么分档而不是"每段改一次画笔颜色"或"每段新建画笔"：
+    //   画笔是设备的对象，一帧建几百个再释放，代价落在 D2D 的资源管理上；
+    //   而拖尾只有"新旧"一个维度，12 档在视觉上已经连续。
+    constexpr int kBands = 12;
+    ID2D1SolidColorBrush* trailBrush[kBands]{};
+    // 颜色是**出生那一刻**的氛围色，整群共用（见 tuning.h §7：颜色不是一个可调色号）。
+    const float cr = ps.empty() ? 0.0f : ps.front().cr;
+    const float cg = ps.empty() ? 0.0f : ps.front().cg;
+    const float cb = ps.empty() ? 0.0f : ps.front().cb;
+    const float maxAlpha = kShutdownParticleAlpha;
+    for (int i = 0; i < kBands; ++i) {
+        // i = 0 是**最旧**那一段（最淡），i = kBands-1 是最新（最实）。
+        const float f = static_cast<float>(i) / static_cast<float>(kBands - 1);
+        const float a = maxAlpha * (kShutdownTrailTailAlpha +
+                                    (1.0f - kShutdownTrailTailAlpha) * f);
+        rt->CreateSolidColorBrush(ParticleColour(cr, cg, cb, a), &trailBrush[i]);
+    }
+
+    const float s = canvas.scale;
+    int idx[kShutdownTrailPoints]{};
+    for (std::size_t pi = 0; pi < ps.size(); ++pi) {
+        const ShutdownParticle& p = ps[pi];
+        const double age = sys.ageSeconds() - p.bornSeconds;
+        if (age < 0.0) continue;   // 还没起爆
+        const float vis = ShutdownParticleAlpha(age, p.lifeSeconds);
+        if (vis <= 0.0f) continue;
+
+        const int n = p.TrailIndicesOldestFirst(idx, kShutdownTrailPoints);
+        // 拖尾：从旧到新，一段一段画。段宽跟着半径走，看起来是一根收细的尾。
+        // 最旧那一点与"出生点"之间的第一段也要画 —— 否则起爆那一瞬间粒子是"凭空
+        // 出现一个点再长尾巴"，而规格要的是"碎开"。
+        for (int i = 0; i + 1 < n; ++i) {
+            const float f = static_cast<float>(i) / static_cast<float>(n > 1 ? n - 1 : 1);
+            const int band = static_cast<int>(f * (kBands - 1) + 0.5f);
+            ID2D1SolidColorBrush* br = trailBrush[band < 0 ? 0 : (band >= kBands ? kBands - 1 : band)];
+            if (!br) continue;
+            const float wx = static_cast<float>(p.trailX[idx[i]]) * s;
+            const float wy = static_cast<float>(p.trailY[idx[i]]) * s;
+            const float nx = static_cast<float>(p.trailX[idx[i + 1]]) * s;
+            const float ny = static_cast<float>(p.trailY[idx[i + 1]]) * s;
+            const float width = static_cast<float>(p.rDip) * s * (0.35f + 0.65f * f);
+            rt->DrawLine(D2D1::Point2F(wx, wy), D2D1::Point2F(nx, ny), br, width);
+        }
+
+        // 头：一个实心圆。半径随粒子大小，透明度随淡出曲线。
+        const float alpha = maxAlpha * vis;
+        ID2D1SolidColorBrush* head = nullptr;
+        if (SUCCEEDED(rt->CreateSolidColorBrush(ParticleColour(p.cr, p.cg, p.cb, alpha), &head)) &&
+            head) {
+            const float rr = static_cast<float>(p.rDip) * s;
+            rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(static_cast<float>(p.x) * s,
+                                                        static_cast<float>(p.y) * s), rr, rr),
+                            head);
+            head->Release();
+        }
+    }
+
+    for (int i = 0; i < kBands; ++i) {
+        if (trailBrush[i]) trailBrush[i]->Release();
+    }
+}
+
+}  // namespace
+
 void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedSeconds,
                 double flashAmount, const std::wstring& debugText, GlowCache* glow,
-                bool isExport) {
+                bool isExport, const ShutdownParticles* particles) {
     // 心跳位移：平移**整个面板内容**（底色、蒙光、文字、曲线、边框一起动）。
     //  ★ 窗口真实位置一帧都不改 -> "移动窗口触发系统贴边吸附"结构上不可能发生，
     //    设计 §9.4 的 E9 因此不需要实现，也不需要任何守卫。
@@ -958,7 +1092,14 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
         rt->SetTransform(D2D1::Matrix3x2F::Identity());   // 探针路径不参与心跳位移
         PaintPremulProbe(rt);
         return;
-    }    rt->Clear(D2D1::ColorF(0, 0.0f));   // 鐢诲竷鏁翠綋閫忔槑锛屽鎵╀綑閲忓繀椤诲畬鍏ㄩ€?
+    }
+    // 面板本体整层跳过的两个理由（互相独立，见文件顶部 g_panelGone 的注释）：
+    //   · SceneMode::ParticlesOnly —— 量粒子颜色的夹具（--particles-only）；
+    //   · g_panelGone —— 生产路径：第 3 击之后"窗口先消失、再爆开"。
+    // 两处条件都由此处统一判定；下面每一层都问同一个 bool，所以"面板不见了"这句话
+    // 只有一处真相：底色、蒙光、边框、激活环、曲线、正文全都在同一个开关之下。
+    const bool bgLayers = (g_sceneMode != SceneMode::ParticlesOnly) && !g_panelGone;
+    rt->Clear(D2D1::ColorF(0, 0.0f));   // 鐢诲竷鏁翠綋閫忔槑锛屽鎵╀綑閲忓繀椤诲畬鍏ㄩ€?
 
     const float s = canvas.scale;
     const float cx = kMarginDip * s;
@@ -969,8 +1110,10 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
 
     const D2D1_COLOR_F base = StraightRgba(kPanelColorR, kPanelColorG, kPanelColorB, kPanelOpacity);
 
+    // 背景这一整层（底色、蒙光、边框）在量粒子颜色的夹具里整层跳过 —— 理由见
+    // g_sceneMode 旁边的注释：粒子叠在不透明面板上时，它的颜色量不准（±50 的噪声）。
     ID2D1SolidColorBrush* brush = nullptr;
-    if (SUCCEEDED(rt->CreateSolidColorBrush(base, &brush)) && brush) {
+    if (bgLayers && SUCCEEDED(rt->CreateSolidColorBrush(base, &brush)) && brush) {
         const D2D1_ROUNDED_RECT rr =
             D2D1::RoundedRect(D2D1::RectF(cx, cy, cx + ew, cy + eh), radius, radius);
         rt->FillRoundedRectangle(rr, brush);
@@ -979,12 +1122,14 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
 
     // 内蒙光：必须在**面板底色之后、边框之前** —— 它是背景的一部分，不是罩在边框上的
     // 一层雾。原来画在边框之后，边框会被强烈的光晕染（所有者实测："边缘没有贴合"）。
-    PaintInnerGlow(rt, g_widgetFrame, glow->Pick(rt, canvas, g_widgetFrame, isExport));
+    if (bgLayers) {
+        PaintInnerGlow(rt, g_widgetFrame, glow->Pick(rt, canvas, g_widgetFrame, isExport));
+    }
 
     // 面板边框：颜色 #afb2b7、线宽 2 DIP（常量在 tuning.h）
     {
         ID2D1SolidColorBrush* bb = nullptr;
-        if (SUCCEEDED(rt->CreateSolidColorBrush(
+        if (bgLayers && SUCCEEDED(rt->CreateSolidColorBrush(
                 StraightRgba(kBorderColorR, kBorderColorG, kBorderColorB, 1.0f), &bb)) && bb) {
             const D2D1_ROUNDED_RECT rb =
                 D2D1::RoundedRect(D2D1::RectF(cx, cy, cx + ew, cy + eh), radius, radius);
@@ -1020,9 +1165,19 @@ void PaintScene(ID2D1RenderTarget* rt, const CanvasSize& canvas, double elapsedS
     // （内蒙光已上移到面板边框**之前**绘制 —— 顺序见下面 FillRoundedRectangle 之后那一处。
     //   原来它在边框之后，导致边框被光罩住：所有者实测发现，2026-09-17。）
 
-    PaintAmbientCurve(rt, canvas, g_widgetFrame);
+    if (bgLayers) PaintAmbientCurve(rt, canvas, g_widgetFrame);
 
-    PaintWidgetText(rt, canvas, g_widgetFrame);
+    if (bgLayers) PaintWidgetText(rt, canvas, g_widgetFrame);
+
+    // 关闭粒子：**最后一层**（正文之后）。它在实体区之外的那些像素正是选外扩画布的理由
+    // （§11.6），所以它必须在所有内容之上，否则会被面板底色/边框盖掉一半。
+    // ★ 心跳位移不作用于它：粒子是"世界坐标"里的碎屑，不跟着面板呼吸（设计只说面板内容动）。
+    if (particles && particles->active()) {
+        const D2D1_MATRIX_3X2_F beat = D2D1::Matrix3x2F::Translation(0.0f, g_lastBeatDyPx);
+        rt->SetTransform(D2D1::Matrix3x2F::Identity());
+        PaintShutdownParticles(rt, canvas, *particles);
+        rt->SetTransform(beat);   // 后面的调试浮层仍然按心跳位移画（它属于面板内容）
+    }
 
     // 璋冭瘯娴眰锛圔6锛夛細鍙湪甯﹁皟璇曞紑鍏虫椂鏈夊唴瀹广€傜敾鍦ㄧ敾甯冨乏涓婅锛?
     // 瑕嗙洊鍦ㄤ綑閲忓尯涓娾€斺€斿畠鏄溂鐫涳紝涓嶆槸浜у搧鐣岄潰銆?
@@ -1659,21 +1814,86 @@ bool Renderer::ApplyInputRegion(bool particlesSpillout) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// 关闭粒子（设计 §11.6）：触发、推进、输入区域
+// ---------------------------------------------------------------------------
+// ★ 时间从哪来：**帧循环的 elapsedSeconds**，与心跳、激活反馈同一根时钟。
+//   离屏导帧把虚拟时间直接给进来（第 k 帧 = k/60 秒），所以"导出的第 k 帧"
+//   就是"播放的第 k 帧"—— 这条同一性正是"导帧量像素"能当证据的前提。
+void Renderer::ApplyParticleInputRegion(bool particlesSpillout) {
+    if (ready_) ApplyInputRegion(particlesSpillout);
+}
+
+int Renderer::StartShutdownParticles() {
+    if (particles_.active()) return 0;   // G5：已经在放就不再产生第二份
+
+    // ★★ 面板从**这一帧**起消失（所有者 2026-09-19）。
+    //   置位之后不清零，理由有两条，缺一条都不能省：
+    //     · "先消失、再爆开"要的是**消失**，不是淡出/收缩 —— 一个会被复原的开关，
+    //       迟早会被某个"粒子播完了"的分支复原成一次淡出，那就退回旧形状了；
+    //     · 本进程在粒子播完之后就退出（main.cpp 的 g_closeWaitParticles：粒子一停
+    //       立刻 WM_CLOSE），所以"回到面板"这件事在真实关闭路径上**不存在**。
+    //   ★ 而导帧夹具（--shutdown-particles --export-frame=k）正是要量"面板确实没了"，
+    //     它读的也是这个开关 —— 夹具与生产因此是同一条代码路径。
+    g_panelGone = true;
+
+    // ★ 颜色取**本帧** WidgetFrame 里的那个颜色（= 屏幕上这一刻真实用的氛围色）。
+    //   不在这里重算 R/D 公式：重算就是第二条颜色路径，早晚会和蒙光分叉。
+    const AmbienceColor c = widget_.ambientColor;
+    // --no-particles 夹具：面板照样消失（上面那句已经生效），但一颗粒子都不撒。
+    //   它量的是"消失"这一半，与"爆开"那一半分开量 —— 两件事混在一张图里就都说不清。
+    const int n = g_particlesDisabled ? 0 : particles_.Start(c, kCanvasWidthDip, kCanvasHeightDip);
+    particleLastSeconds_ = -1.0;   // 下一次推进时，把那一帧的 elapsed 当作起点
+
+    // 粒子要飞进实体区之外的透明余量，而那片区域默认整窗吃鼠标（A4b 实测）。
+    // 在**触发时**扩一次，不在播放期间每帧扩：SetWindowRgn 是系统调用（会触发重绘），
+    // 500 ms 里调 30 次是白付的代价，而这一下不在粒子的帧耗时里。
+    ApplyParticleInputRegion(true);
+    return n;
+}
+
+void Renderer::AdvanceShutdownParticles(double elapsedSeconds) {
+    if (!particles_.active()) return;
+    const double dt = (particleLastSeconds_ < 0.0) ? 0.0 : (elapsedSeconds - particleLastSeconds_);
+    particleLastSeconds_ = elapsedSeconds;
+    particles_.Advance(dt);   // dt <= 0 是空操作；只有第一帧会是负的（起点还没定）
+    if (!particles_.active()) {
+        // 粒子播完，把输入区域恢复成实体区。
+        // ★ 真实关闭路径上这一句够不着：main.cpp 的 g_closeWaitParticles 在粒子一停就
+        //   WM_CLOSE（窗口连同进程一起消失），所以"恢复"只是本模块自己的对称性 ——
+        //   探针/自检（--shutdown-particles 的真帧循环）会真的跑到这里。
+        //   注意它**不**把面板画回来：g_panelGone 一旦置位就不再清零（见那里）。
+        ApplyParticleInputRegion(false);
+    }
+}
+
+void Renderer::SetShutdownParticlesAge(double seconds) {
+    // 导帧用：从 0 起按最小步推到指定年龄，走的是与逐帧播放完全相同的仿真路径。
+    particles_.AdvanceToAge(seconds);
+}
+
+std::string Renderer::ShutdownParticlesLog() const {
+    return ShutdownParticlesLogLine(particles_);
+}
+
 HRESULT Renderer::RenderFrame(double elapsedSeconds) {
     if (!ready_ || !impl_) return E_FAIL;
     Impl& d = *impl_;
+
+    AdvanceShutdownParticles(elapsedSeconds);
 
     // 娉ㄦ剰锛欵ndDraw 鏄敮涓€浼氭姤閿欑殑涓€姝ワ紱BeginDraw 杩斿洖 void銆?
     // 杩欓噷鑷繁 BeginDraw/EndDraw锛岀敾鍐呭鐨勫嚱鏁颁笉瑕佸啀鍚勮皟涓€娆★紙A0 鐨勫潙锛夈€?
     d.dc->BeginDraw();
     PaintScene(d.dc, size_, elapsedSeconds, ActivationFlash(elapsedSeconds), debugText_,
-               &d.glow, /*isExport=*/false);
+               &d.glow, /*isExport=*/false, &particles_);
     const HRESULT hrEnd = d.dc->EndDraw();
     if (FAILED(hrEnd)) {
         // A0 鐨勬暀璁細杩欓噷澶辫触鏃?Present 浠嶄細杩斿洖 S_OK锛岀敾闈笂鍗翠粈涔堥兘娌℃湁锛?
         // 鎵€浠ュ繀椤诲湪 EndDraw 杩欎竴灞傚氨鑳界湅瑙佸け璐ャ€?
         return hrEnd;
     }
+    if (g_noPresent) return S_OK;   // 量光栅代价：不提交，也就没有等垂直空白那一段
     return d.swapchain->Present(1, 0);
 }
 
@@ -1720,7 +1940,8 @@ bool Renderer::ExportFrame(const wchar_t* path, double elapsedSeconds) {
         rt->BeginDraw();
         // ★ 同一个 GlowCache，但 isExport = true：彩色层必须用**这个**软件渲染目标
         //   自己的位图（位图归属创建它的目标），覆盖率数值则复用同一份。
-        PaintScene(rt, size_, elapsedSeconds, 0.0, debugText_, &d.glow, /*isExport=*/true);
+        PaintScene(rt, size_, elapsedSeconds, 0.0, debugText_, &d.glow, /*isExport=*/true,
+                   &particles_);
         if (FAILED(rt->EndDraw())) break;
 
         IWICBitmapEncoder* encoder = nullptr;

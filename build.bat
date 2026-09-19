@@ -49,12 +49,18 @@ rem Done with PowerShell because forfiles only accepts a DATE, not a
 rem time-of-day -- "forfiles /D +09/15/2026" counts every file from today
 rem as newer, and comparing against a date derived from the exe's own date
 rem says "not newer" for changes made later the same day. Measured.
+rem
+rem *.rc and *.png are tracked too, and NOT for completeness: ninja's
+rem generated build rules do see the .rc, but the icon PNG is pulled in by
+rem the .rc as a plain file reference, and a stale resource is invisible --
+rem the build says OK and the tray keeps showing the old picture. The same
+rem trap as src\tuning.h above, one layer down in the resource compiler.
 rem ------------------------------------------------------------------
 set "STALE="
 if exist "build\dshb.exe" (
   powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$exe=(Get-Item 'build\dshb.exe').LastWriteTime;" ^
-    "$new=Get-ChildItem -Path src,tools -Recurse -Include *.h,*.cpp -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $exe };" ^
+    "$new=Get-ChildItem -Path src,tools -Recurse -Include *.h,*.cpp,*.rc,*.png -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $exe };" ^
     "$cm=Get-Item 'CMakeLists.txt' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $exe };" ^
     "if($new -or $cm){ exit 1 } else { exit 0 }" >nul 2>&1
   if errorlevel 1 set "STALE=1"

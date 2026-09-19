@@ -4,6 +4,7 @@
 #include "amount.h"    // kUnitsPerYuan: the fixed-point unit this module reads and writes
 #include "tuning.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
@@ -33,6 +34,14 @@ std::string Num(long long value) { return std::to_string(value); }
 std::string Yuan(int64_t raw) {
     char buf[40];
     std::snprintf(buf, sizeof(buf), "%.4f", static_cast<double>(raw) / kUnitsPerYuanD);
+    return buf;
+}
+
+// 速率 -> 文本（只用在诊断里）。速率的单位是元/分钟，取四位小数：真实速率在
+// 0.001~0.05 元/分钟这个量级，四位足够看出两条口径的差别。
+std::string RateText(double yuanPerMinute) {
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "%.4f", yuanPerMinute);
     return buf;
 }
 
@@ -238,6 +247,163 @@ RateEstimate EstimateRate(const std::vector<RateInputPoint>& pointsOldestFirst) 
 }
 
 // ===========================================================================
+// ★ 新口径（所有者 2026-09-19）：Theil–Sen 中位斜率
+// ===========================================================================
+// 口径与"哪个是哪个、为什么两个共存"写在 rate_estimator.h，这里只说实现上的取舍。
+RateEstimate EstimateRateTheilSen(const std::vector<RateInputPoint>& pointsOldestFirst) {
+    RateEstimate result;
+    result.pointsSeen = static_cast<int>(pointsOldestFirst.size());
+
+    // -- 1. 分类：诊断全部记上 ----------------------------------------------
+    // 与旧口径同一套习惯："没有时间"的点**不算**（绝不假设点距，见 rate_estimator.h），
+    // 没有金额的点不算。两者都只记诊断，不进窗口。
+    bool sawUndated = false;
+    bool previousUndated = false;
+    for (const RateInputPoint& point : pointsOldestFirst) {
+        if (!point.amountValid) {
+            ++result.unusablePoints;
+            previousUndated = false;
+            continue;
+        }
+        if (!point.atValid) {
+            // 连续的一段"没有时间"只算一段：10 个没有时间的点不是 10 次测量。
+            if (!previousUndated) ++result.undatedPoints;
+            previousUndated = true;
+            sawUndated = true;
+            continue;
+        }
+        previousUndated = false;
+    }
+
+    std::vector<RateInputPoint> usable;
+    usable.reserve(pointsOldestFirst.size());
+    for (const RateInputPoint& point : pointsOldestFirst) {
+        if (point.amountValid && point.atValid) usable.push_back(point);
+    }
+    if (usable.empty()) {
+        if (sawUndated) {
+            result.status = RateStatus::Insignificant;
+            result.note = "no point carries both an amount and its own time: " +
+                          Num(result.undatedPoints) + " undated run(s), " +
+                          Num(result.unusablePoints) + " without an amount";
+            return result;
+        }
+        result.status = RateStatus::Empty;
+        result.note = "no point carries a usable amount";
+        return result;
+    }
+
+    // -- 2. 窗口：最新点往前 kRateWindowSeconds ------------------------------
+    //   ★ 窗口的锚是**序列里最新那个点**，不是调用方的"现在"。理由是这段数据本来就
+    //     是最近的记录，而"现在"可能离最后一次采样很久（网络断了、界面挂着没人看），
+    //     拿"现在"当锚会把全部点判出窗口。锚在点上，窗口说的一律是"最近这段记录"。
+    //   与旧口径共用同一个常量。0 = 关闭窗口（所有点都进）。
+    const int64_t newestAt = usable.back().at;
+    std::size_t first = 0;
+    if (kRateWindowSeconds > 0) {
+        // 至少留一个点：一个都不满足时不动（不让"算不出来"凭空出现）。
+        while (first + 1 < usable.size() && newestAt - usable[first].at > kRateWindowSeconds) {
+            ++first;
+        }
+    }
+    result.usablePoints = static_cast<int>(usable.size() - first);
+    result.spanSeconds = (result.usablePoints > 1) ? (newestAt - usable[first].at) : 0;
+
+    // -- 3. 点对斜率 ---------------------------------------------------------
+    //   斜率 = (amount_i − amount_j) / (at_i − at_j)，i 比 j 新。按时间排序之后 i > j，
+    //   所以分母恒正，不存在"除以 0"或"除以负数"的编数路径。时间相同的两个点对
+    //   （同一秒内的两次采样）跳过：dt == 0 的点对没有斜率可言。
+    //   金额是定点，只在最后一步才转成 double。点对数 = C(n,2)，量级见 tuning.h 的 3d。
+    std::vector<double> slopes;   // 元/秒（先别换成分钟：中位数要在同一个尺度上取）
+    if (result.usablePoints >= 2) {
+        const long long n = result.usablePoints;
+        result.pairCount = n * (n - 1) / 2;
+        const std::size_t count = static_cast<std::size_t>(result.usablePoints);
+        slopes.reserve(static_cast<std::size_t>(result.pairCount));
+        for (std::size_t i = first + 1; i < first + count; ++i) {
+            for (std::size_t j = first; j < i; ++j) {
+                const int64_t dt = usable[i].at - usable[j].at;
+                if (dt <= 0) continue;
+                const int64_t delta = usable[i].amountRaw - usable[j].amountRaw;
+                slopes.push_back(static_cast<double>(delta) / kUnitsPerYuanD /
+                                 static_cast<double>(dt));
+            }
+        }
+        // 相邻台阶只作诊断：新口径**不用**它们做判定（中位数里每个点对都是一票）。
+        for (std::size_t i = first + 1; i < first + count; ++i) {
+            const int64_t dt = usable[i].at - usable[i - 1].at;
+            const int64_t drop = usable[i - 1].amountRaw - usable[i].amountRaw;
+            if (dt <= 0) continue;
+            if (drop > 0) {
+                ++result.decreasingSteps;
+                result.dropSumRaw += drop;
+            } else if (drop < 0) {
+                ++result.risingSteps;
+            }
+        }
+    }
+
+    const std::string note = "window=" + Num(static_cast<long long>(kRateWindowSeconds)) +
+                             " s, points in window=" + Num(result.usablePoints) + "/" +
+                             Num(result.pointsSeen) + ", span=" +
+                             Num(static_cast<long long>(result.spanSeconds)) + " s, pairs=" +
+                             Num(result.pairCount) + ", decreasing steps=" +
+                             Num(result.decreasingSteps) + ", rising steps=" +
+                             Num(result.risingSteps) + ", drops=" + Yuan(result.dropSumRaw) +
+                             " yuan, undated=" + Num(result.undatedPoints) + ", no amount=" +
+                             Num(result.unusablePoints);
+
+    // -- 4. 判定（顺序就是规格，别调换）--------------------------------------
+    //   (a) 窗口里不到 2 个点 -> 不能预测。这是唯一一条"读不出来"。
+    if (result.usablePoints < 2 || slopes.empty()) {
+        result.status = RateStatus::Insignificant;
+        result.note = "fewer than 2 usable points in the window (" +
+                      Num(static_cast<int>(slopes.size())) + " pair(s)); " + note;
+        return result;
+    }
+
+    //   (b) 中位数。偶数个取中间两个的平均（这是"中位数"的定义，不是新口径）。
+    std::sort(slopes.begin(), slopes.end());
+    const std::size_t n = slopes.size();
+    const double medianYuanPerSecond =
+        (n % 2 == 1) ? slopes[n / 2] : 0.5 * (slopes[n / 2 - 1] + slopes[n / 2]);
+    result.medianSlopeYuanPerSecond = medianYuanPerSecond;
+
+    //   (c) ★ 消耗为正：中位数斜率**取负号**就是 RateEstimate::rateYuanPerMinute 的方向
+    //       （余额在掉 = 正速率）。中位数 >= 0 表示"这段里余额整体没往下走"——
+    //       平的，或者只在回升（充值）。那是一个**结论**：不消耗，速率恰好 0。
+    //       ★ 故意不做旧口径那套"取整到 N 位、取整后为 0 就当不显著"：这里的中位数是
+    //         一个真实测量到的斜率，而定点金额 + 整秒时间戳能表达的最小非零斜率是
+    //         1e-4 元/秒（= 0.006 元/分钟），远在任何浮点噪声之上。把"确实量到了一点
+    //         消耗"取整成"读不出来"，正是旧口径那条纪律要防的反面。
+    const double rateYuanPerMinute = -medianYuanPerSecond * 60.0;
+    if (!(rateYuanPerMinute > 0.0)) {
+        // 0 或负（回升）：不消耗。`!(x > 0)` 顺手挡住 NaN——不能把"读不出来"说成
+        // "不消耗"，所以 NaN 走下面那条不显著。
+        if (MostlyFinite(rateYuanPerMinute)) {
+            result.rateYuanPerMinute = 0.0;
+            result.rawRateYuanPerMinute = 0.0;
+            result.status = RateStatus::NotConsuming;
+            result.note = "the median pairwise slope is zero or rising (" +
+                          RateText(medianYuanPerSecond) + " yuan/s) -> not consuming; " + note;
+            return result;
+        }
+        result.status = RateStatus::Insignificant;
+        result.note = "the median pairwise slope is not a finite number; " + note;
+        return result;
+    }
+
+    result.status = RateStatus::Significant;
+    result.rateYuanPerMinute = rateYuanPerMinute;
+    result.rawRateYuanPerMinute = rateYuanPerMinute;
+    result.note = "rate is the Theil-Sen median of all " + Num(result.pairCount) +
+                  " pairwise slopes, negated (consumption is positive); median slope=" +
+                  RateText(medianYuanPerSecond) + " yuan/s -> " + RateText(rateYuanPerMinute) +
+                  " yuan/min; " + note;
+    return result;
+}
+
+// ===========================================================================
 // 弹簧（rate -> rate_display）
 // ===========================================================================
 double RateSpringStep(double rateDisplay, double rateTarget, double dtSeconds) {
@@ -268,23 +434,30 @@ double RateSpringStep(double rateDisplay, double rateTarget, double dtSeconds) {
 // ===========================================================================
 namespace {
 
-// 相对时长用哪种单位说。文档原文是「约 2 小时后归零」；到不了 1 小时的时候，
-// "约 0.4 小时后归零"读起来很别扭，所以一分钟到一小时之间改用分钟。
+// 相对时长怎么说（所有者 2026-09-19 定案）。
+//  ★ 单位：不到 60 分钟说分钟，到 60 分钟及以上说小时。这是原来的口径，没改。
+//  ★ 小数位：**永远一位小数，`.0` 不许省**（这次的定案）。原来写的是整数分钟
+//    （`int whole = minutes + 0.5`），于是 2.5 分钟被说成"3 分钟"、2.0 小时被说成
+//    "2 小时"。所有者要的是"一位小数始终在"，因为这一位就是这条预测的分辨率——
+//    省掉它，用户分不出"2 分钟"和"2.4 分钟"。
+//  ★★ 这一条**推翻**了 `不入库文件\t.md:118` 的"去掉末尾的 .0"（那份文档是那条旧
+//     口径的出处）。以所有者 2026-09-19 的定案为准：`2.0 分钟`、`2.5 分钟`、
+//     `2.0 小时`都要写出那一位。下一个读到这里的人不该以为这行写错了。
+//  ★ 就低不就高（floor 到 0.1）：预测归零时刻**宁早不宁晚**。说"2.4 分钟"而实际是
+//    2.49，用户不会因此误事；说"2.5 分钟"而实际是 2.41，就是把他说晚了。
+//  ★ 仍有一个下限：不足 0.1 分钟（6 秒）时说"0.1 分钟"而不是"0.0 分钟"——
+//    "约 0.0 分钟后归零"读起来像已经归零了。归零前一刻这句话必须还是"还没到"。
 std::wstring DurationPhrase(double minutes) {
     wchar_t buf[64];
     if (minutes < 60.0) {
-        int whole = static_cast<int>(minutes + 0.5);
-        if (whole < 1) whole = 1;   // 归零前一刻：说"约 1 分钟"比"约 0 分钟"诚实
-        std::swprintf(buf, 64, L"%d 分钟", whole);
+        // floor 到一位小数：先变成"十分之一分钟"，取整后再除以 10 打出来。
+        double tenths = std::floor(minutes * 10.0);
+        if (!(tenths >= 1.0)) tenths = 1.0;   // 也挡住了 NaN
+        std::swprintf(buf, 64, L"%.1f 分钟", tenths / 10.0);
     } else {
-        double hours = minutes / 60.0;
-        // 取一位小数，去掉末尾的 .0：2 小时 / 2.5 小时都自然。
-        double rounded = std::floor(hours * 10.0 + 0.5) / 10.0;
-        if (std::fabs(rounded - std::floor(rounded + 0.5)) < 1e-9) {
-            std::swprintf(buf, 64, L"%d 小时", static_cast<int>(rounded + 0.5));
-        } else {
-            std::swprintf(buf, 64, L"%.1f 小时", rounded);
-        }
+        double tenths = std::floor(minutes / 60.0 * 10.0);
+        if (!(tenths >= 1.0)) tenths = 1.0;
+        std::swprintf(buf, 64, L"%.1f 小时", tenths / 10.0);
     }
     return buf;
 }
@@ -318,41 +491,32 @@ ZeroTimeText ZeroTimeFor(const RateEstimate& estimate, int64_t balancedRaw, int6
     }
     // ★ 判定顺序就是规格，别调换：
     //   1) 余额为 0 ->「已用尽」。余额真用尽了和"算不出速率"是两件事，
-    //      先判它，否则一个刚好读不到速率的 0 余额会被说成"暂无法预测"。
+    //      先判它，否则一个刚好读不到速率的 0 余额会被说成"暂时无法预测何时归零"。
     if (balancedRaw == 0) {
         out.kind = ZeroTimeKind::UsedUp;
         out.text = L"已用尽";
         return out;
     }
-    // ★ 这两条的**顺序**是规格的一部分，而且很容易写反：
-    //   「速率不显著」和「速率 == 0」互相不含对方，但一个平的序列同时满足"算不出
-    //   消耗"和"速率恰好是 0"。文档给它的是破折号（"不消耗"），不是"暂无法预测"。
-    //   所以先判"我们手上有没有一个真正算出来的、等于 0 的速率"：有就破折号。
-    //   Insignificant / Empty 都**没有**可用速率（rate 被清成 0 只是"没数字"，
-    //   不是"数字是 0"），所以它们必须走在后面，否则平的序列会说错话。
-    //   （这个顺序也真的写错过一次，探针的 case4 就是为它留的。）
-    //   3) 速率 == 0（不消耗）->「—」
-    //      ★ 这个破折号是 U+2014（em dash），与设计文档 §7.4 表格里那个字符逐字节
-    //        相同——不是 U+2015（horizontal bar），两者在屏幕上几乎一样，
-    //        拿前者去比后者会一直"看起来一样但断言失败"。探针按字节比，就是为了
-    //        让这种错当场暴露（这个错真的发生过）。
+    // ★ 两种"给不出时刻"合成同一句话（所有者 2026-09-19 定案）：
+    //   · NotConsuming（速率恰好 0 = 这段没在花钱）
+    //   · Insignificant / Empty（没算出来）
+    //   原来两种字不一样（「—」和「暂无法预测」）。合并的理由：对用户它们是**同一个
+    //   事实**——这一行给不出一个时刻；而一条光秃秃的破折号不解释为什么，用户只会
+    //   以为界面坏了。`ZeroTimeKind` 两个值都留着：诊断（探针、日志）仍然要能分开
+    //   "没在消耗"和"读不出来"，只是画出来一样。
+    //   ★ 顺序仍然是规格：先判"我们手上有没有一个真正算出来的、等于 0 的速率"，
+    //     再判"没算出来"。两者今天字一样，但 kind 不同，而 kind 决定
+    //     ZeroTimeTextForFrame 的重绘判断（分支变了必须重画）。
     const bool rateReported = estimate.status == RateStatus::Significant ||
                               estimate.status == RateStatus::NotConsuming;
-    // ★ 破折号到底给谁：**给"没在消耗"的那一种**，也就是 NotConsuming（平的，或只在
-    //   回升）。按**新口径**，速率是"下降量之和 / 跨度"，**永远不为负**，所以
-    //   "速率恰好为 0"就完整地描述了它；写成 `<= 0.0` 现在与 `== 0.0` 等价，
-    //   但那是**旧口径**的遗留写法（那时消耗的速率是负数，`<= 0` 对每个正常消耗都成立，
-    //   于是每个正常消耗都拿到破折号、永远走不到外推——case8 抓出来的那个错）。
-    //   按新口径写清楚，下一个读的人就不会再踩。
     if (rateReported && estimate.rateYuanPerMinute == 0.0) {
         out.kind = ZeroTimeKind::Dash;
-        out.text = L"\u2014";
+        out.text = L"暂时无法预测何时归零";
         return out;
     }
-    //   2) 速率不显著 ->「暂无法预测」。Empty 也走这条：没有点，同样无法预测。
     if (estimate.status == RateStatus::Insignificant || estimate.status == RateStatus::Empty) {
         out.kind = ZeroTimeKind::NoPrediction;
-        out.text = L"暂无法预测";
+        out.text = L"暂时无法预测何时归零";
         return out;
     }
 
@@ -368,7 +532,7 @@ ZeroTimeText ZeroTimeFor(const RateEstimate& estimate, int64_t balancedRaw, int6
     if (!MostlyFinite(minutes) || speedYuanPerMinute <= 0.0) {
         // 没有可用的速率大小 -> 宁可说"无法预测"，也不编一个数。
         out.kind = ZeroTimeKind::NoPrediction;
-        out.text = L"暂无法预测";
+        out.text = L"暂时无法预测何时归零";
         return out;
     }
     out.minutesToZero = static_cast<int>(minutes + 0.5);

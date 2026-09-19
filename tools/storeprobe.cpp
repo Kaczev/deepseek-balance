@@ -354,19 +354,28 @@ void RunChecks(Harness* h, const ProbeDir& probe, bool verbose) {
     }
 
     // -----------------------------------------------------------------------
-    // (2) fifteen different values: exactly 12 points, and they are the NEWEST 12.
-    //     Spec §2.2, acceptance 2. Compared by contents, not by count.
+    // (2) FIFTEEN MORE THAN THE RING HOLDS: exactly kCapacity points, and they are the
+    //     NEWEST kCapacity. Spec §2.2, acceptance 2. Compared by contents, not by count.
+    //     ★ The fixture is derived from kCapacity (was hardcoded as 15 vs a 12-point
+    //     ring, 2026-09-19: the owner raised the capacity to 120). A hardcoded fixture
+    //     would silently stop overflowing the ring the next time the capacity changes,
+    //     and this check would keep passing while proving nothing.
     // -----------------------------------------------------------------------
     {
         CurveStore store;
-        Feed(&store, CountUp(1, 15), kAnchor - 2000, 10);   // 1.00 .. 15.00, distinct every time
+        const int total = static_cast<int>(CurveStore::kCapacity) + 3;   // kCapacity + 3 distinct
+        Feed(&store, CountUp(1, total), kAnchor - 2000, 10);
+
         store.Save(file);
 
         CurveLoadResult reloaded;
         const std::vector<CurveStorePoint> disk = Reload(file, &reloaded);
 
+        // 只有最新 kCapacity 个留下：值 1..total 里最后那 kCapacity 个。
         std::vector<std::string> expected;
-        for (int v = 4; v <= 15; ++v) expected.push_back(std::to_string(v) + ".00");
+        for (int v = total - static_cast<int>(CurveStore::kCapacity) + 1; v <= total; ++v) {
+            expected.push_back(std::to_string(v) + ".00");
+        }
 
         std::vector<CurveStorePoint> mem = store.Points();
         bool contentsMatch = mem.size() == CurveStore::kCapacity;
@@ -375,24 +384,34 @@ void RunChecks(Harness* h, const ProbeDir& probe, bool verbose) {
             contentsMatch = entry && !entry->missing && entry->text == expected[i];
         }
 
-        const bool newest = store.Newest(3).size() == 3 &&
-                            AmountText(store.Newest(3).front(), "CNY") == "CNY=\"13.00\"" &&
-                            AmountText(store.Newest(3).back(), "CNY") == "CNY=\"15.00\"";
-        const bool ok = mem.size() == CurveStore::kCapacity && contentsMatch && newest &&
+        // Newest(3) is the three newest points, oldest first: (total-2, total-1, total).
+        const std::string threeBack = std::to_string(total - 2) + ".00";
+        const std::string secondNewest = std::to_string(total - 1) + ".00";
+        const std::string newest = std::to_string(total) + ".00";
+        const std::vector<CurveStorePoint> newest3 = store.Newest(3);
+        const std::string wantFront = "CNY=\"" + threeBack + "\"";
+        const std::string wantBack = "CNY=\"" + newest + "\"";
+        const bool newestThree = newest3.size() == 3 &&
+                                 AmountText(newest3.front(), "CNY") == wantFront &&
+                                 AmountText(newest3.back(), "CNY") == wantBack &&
+                                 AmountText(newest3[1], "CNY") == "CNY=\"" + secondNewest + "\"";
+        const bool ok = mem.size() == CurveStore::kCapacity && contentsMatch && newestThree &&
                         disk.size() == CurveStore::kCapacity &&
-                        AllTexts(disk, "CNY") == AllTexts(mem, "CNY") && reloaded.pointsLoaded == 12;
-        h->Req("case2", "ring holds exactly the newest 12 of 15 distinct values",
-               "memory=" + Num(static_cast<long long>(mem.size())) + " points " +
-                   AllTexts(mem, "CNY") + ", expected newest 12 [" +
-                   [&expected] {
-                       std::string joined;
-                       for (std::size_t i = 0; i < expected.size(); ++i) {
-                           if (i != 0) joined += ",";
-                           joined += expected[i];
-                       }
-                       return joined;
-                   }() +
-                   "], file=" + AllTexts(disk, "CNY"),
+                        AllTexts(disk, "CNY") == AllTexts(mem, "CNY") &&
+                        reloaded.pointsLoaded == static_cast<int>(CurveStore::kCapacity);
+        h->Req("case2", "ring holds exactly the newest kCapacity of kCapacity+3 distinct values",
+               "fed " + Num(total) + " distinct values, ring capacity=" +
+                   Num(static_cast<long long>(CurveStore::kCapacity)) + "; memory=" +
+                   Num(static_cast<long long>(mem.size())) + " points " + AllTexts(mem, "CNY") +
+                   " [contentsMatch=" + (contentsMatch ? "y" : "N") + " newestThree=" +
+                   (newestThree ? "y" : "N") + " newest(3)=" +
+                   (newest3.empty() ? std::string("<none>") : AmountText(newest3.front(), "CNY")) +
+                   ".." +
+                   (newest3.empty() ? std::string("<none>") : AmountText(newest3.back(), "CNY")) +
+                   " want " + wantFront + ".." + wantBack + " diskEqMem=" +
+                   (AllTexts(disk, "CNY") == AllTexts(mem, "CNY") ? "y" : "N") + " pointsLoaded=" +
+                   Num(reloaded.pointsLoaded) + "] file=" +
+                   Num(static_cast<long long>(disk.size())) + " points",
                ok);
     }
 

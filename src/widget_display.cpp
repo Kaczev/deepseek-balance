@@ -240,7 +240,8 @@ double g_curveOldHi = 0.0;
 bool g_curveOldValid = false;
 
 // §3：显示最新 11 个点、恰好 10 段。
-constexpr std::size_t kCurveDisplayPoints = 11;
+// ★ kCurveDisplayPoints 现在在头文件里（widget_display.h）：验收探针要对着同一个数
+//   断言"面板画几个点"。这里只剩"段数 = 点数 - 1"这一条内部关系。
 constexpr std::size_t kCurveSegments = kCurveDisplayPoints - 1;
 
 // 一个点对曲线的取值 = 这个点的**第一个可用条目**。
@@ -330,23 +331,123 @@ bool CurveValueOfEntry(const CurveStorePoint& point, Amount* out) {
     return false;
 }
 
-// 存储里最近一步有多陡（元/分钟）：**只看最后两个可用点**。
-//   ★ 这是"这一步有多陡"的**唯一实现**（口径 = 曲线上真正画出来的那一对点）。
-//     三处使用者都在这里收口：曲线点的颜色（FeedCurve）、氛围的 R_new（AdvanceAmbience），
-//     以及给外面看的 LastStepPerMinute()（它只转发）。审计员 2026-09-18 实测过：这里
-//     曾经有两份逐字相同的 store 扫描加一份口径不同的样本间隔扫描，三者会各说各话。
-//   ★ 从最新往回找第一对"两个点都有时间、at 严格递增"的相邻点；金额取每个点的
-//     **第一个有值条目**（CurveValueOfEntry），与会话里选中的币种无关。
-//   ★ 存储里不足两个可用点（启动最初的第一个点）时返回 0 —— 那是"无从判断"。
-double StoreStepPerMinute() {
+// "现在"：最近一次交付给显示层的样本（余额 + 它的整秒时间戳）。
+//   ★ 存在的唯一理由就是 `StoreStepPerMinuteAt()` 那句"最新点 → 现在"——存储里没有
+//     "现在"这个概念，它只记得变化发生的那一刻。**颜色不读它**（见下面那一段）。
+bool g_currentStepFromValid = false;
+int64_t g_currentStepFromAt = 0;
+double g_currentStepFromBalance = 0.0;
+
+// ===========================================================================
+// **两个"这一步有多陡"，故意是两份实现**（所有者 2026-09-19 的拆分）
+// ===========================================================================
+//  同一个"元/分钟"在这里要回答两个**互相冲突**的问题，所以它们不能共用一个函数：
+//
+//   · 颜色要的是「**进入某个点**的那一步」——两个**相邻的存储点**之间、用它们
+//     自己的时间戳。它回答的是"这一点相对上一点跌得有多陡"，与"现在几点"无关。
+//     → `StepIntoNewestPointPerMinute()`
+//
+//   · R 的衰减要的是「最新那个点 **→ 现在**」——同一个下降量，余额不动时被越摊越薄，
+//     于是平静期 R 会自己凉下来。它回答的是"刚刚有多陡"，必须读"现在"。
+//     → `StoreStepPerMinute()`
+//
+//  ★ 为什么必须分开（实测，不是洁癖）：`FeedCurve` 是**先 Append 再量这一步**的，
+//    而"现在"就是刚 Append 进去的那个样本 —— 两者时间戳逐位相同。走"最新点 → 现在"
+//    的那条路来量颜色，Δt 恒被夹成 1、两个量又相等，于是**每个点的颜色都算成 0**
+//    （= 基准蓝 #6c89f6）。所有者的原话是"后面线的颜色没有了"，像素证据是 11 个点
+//    只导出 121 种颜色、且全挤在 (59..63, 71..77, 115..126) 这一个蓝上 —— 渐变没了。
+//    这就是上一轮为了修 R 的衰减而把"现在"提前到量之前造成的逆带伤害。
+//  ★ 分开之后两边各自单纯：颜色不看"现在"，衰减不看存储里两个点的间隔。
+
+// 一个点**自己那一刻**的"进入它的那一步"（元/分钟）。口径 = 这个点与它前一个点。
+// dt <= 0（同一秒内的两个点、或时间戳缺失）-> 返回 0：算不出来就是算不出来，
+// 绝不拿 1 秒、也绝不拿"现在"来凑一个数。
+// ★ 间隔不用 `kStepGapAwayThresholdSeconds` 那套上限：那一套是给**平静期摊薄**用的
+//   （"最新点 → 现在"可以拉到几小时）。这里是两个**真实测量点**之间的间隔，它就是
+//   那一段的真实时长，把它夹掉等于凭空说这一段更陡。
+double StepIntoPointPerMinute(const CurveStorePoint& previous, const CurveStorePoint& current) {
+    if (!previous.atValid || !current.atValid) return 0.0;
+    const double dt = static_cast<double>(current.at - previous.at);
+    if (!(dt > 0.0)) return 0.0;
+    Amount prevAmount;
+    Amount curAmount;
+    if (!CurveValueOfEntry(previous, &prevAmount)) return 0.0;
+    if (!CurveValueOfEntry(current, &curAmount)) return 0.0;
+    // 参数顺序 = (上一个量, 这一个量, Δt)：`StepPerMinute` 算的是 (cur - prev)。
+    // 写成 (cur, prev) 会把方向倒过来 —— 余额上涨会被算成剧烈下降，颜色恒红。
+    return StepPerMinute(prevAmount.ToDouble(), curAmount.ToDouble(), dt);
+}
+
+// **进入存储里最新那个点**的那一步（元/分钟）。颜色通道的唯一取值口。
+// 没有两个可用点（首次运行、只有一个点、时间戳缺失）-> 返回 0：
+// 那时"这一步"根本不存在，颜色就是基准色（R = 0），不编造。
+double StepIntoNewestPointPerMinute() {
     const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
     if (points.size() < 2) return 0.0;
+    return StepIntoPointPerMinute(points[points.size() - 2], points.back());
+}
+
+// 这一步有多陡（元/分钟）：**从最后一次变化，量到这一拍**。
+//   ★ 口径（所有者 2026-09-18 / 2026-09-19）：`R_new` = 最后一次变化造成的下降量，
+//     除以**从那次变化到这一拍的全部时间**。
+//   ★★ 为什么必须摊到"现在"，不能只看存储里最后两个点：
+//     存储**只在余额变化时记点**，所以余额一旦不动，最后两个点就是**几分钟/几小时前的
+//     一对**。拿那一对的陡度当"现在的陡度"每一帧去抬 R（抬升规则：target > 当前值就抬），
+//     R 就被**永久钉死**在那一刻的高度上，再也掉不下来。
+//     所有者 2026-09-19 报的症状是"取消关闭态之后 R 好像不下降了"——实际与取消无关，
+//     是这一条：余额不动之后 R 无论如何都不会掉。
+//   ★ 余额不动得越久，**同样的下降量**被摊得越薄，R_new 自然趋近 0 —— 这正是
+//     "平静下来 R 会自己凉"的物理来源，也是原始设计（按样本间隔算）里天然存在、
+//     而"只看最后两个点"那次改动把它弄丢的那一条。
+//   ★ Δt 仍然夹 `kStepGapCapSeconds`：那是所有者 2026-09-18 为"仪表关着两小时"定的上限
+//     （否则停机期间的花费被摊成 0.0092 元/分、永远不红）。两件事共用同一个上限：
+//     一次陡降之后约 100 秒内 R 平滑退下去，之后不再继续摊薄。
+//   ★ "现在"还没有（进程刚起、一个样本都没交付）时，退回"存储里最后两个点"——那种时刻
+//     两者本来就同值。
+//   ★ 金额取每个点的**第一个有值条目**（CurveValueOfEntry），与会话里选中的币种无关。
+//   ★ **颜色不要用这个函数**（见上面那段）：它量的是"现在"，而颜色要的是"进入这个点"。
+//     两者在 FeedCurve 那一刻必然给出不同的答案。
+//
+// ★★ 派生的那一份实测（这一段让这个函数多了个参数，理由值得留着）：
+//   `nowSeconds` **不是**原样用"这一个样本的时间戳"。样本按固定节奏到达（采样间隔 = Δ），
+//   而"这一拍"该量的端点比它**早一个 Δ**：`FeedCurve` 是先把样本 Append 进去、再量这一步的
+//   （回填颜色必须那个次序），所以这一拍测量时"最后一次变化"已经过去了**两个** Δ ——
+//   一个是"变化 → 上一个样本"，一个是"上一个样本 → 这一个样本"。少减这一个 Δ 会让整条
+//   R 的衰减曲线整体晚一个采样间隔（实测：陡降后平静 60 秒，R 量成 0.6227 而不是 0.4995，
+//   因为 Δt 只算了 50 秒）。Δ 由调用方按"上一个样本的时间"传进来。
+double StoreStepPerMinuteAt(int64_t nowSeconds) {
+    const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
+    if (points.empty()) return 0.0;
+
+    // ---- 首选：从"最后一次变化"量到"现在" ----
+    //  ★ 无论这一拍**有没有落点**，量的都是同一段：最新那个点（= 最后一次变化）
+    //    → 现在。落了点时"最新那个点"就是这一次变化本身，没落点时它还是上一次变化 ——
+    //    两种情形下它都是"最后一次变化"，端点相同，所以不需要分两条路。
+    //    ★ 这一点我一开始分成了两条分支，分别量"最后两个点之间"和"最新点 → 现在"，
+    //      于是同一个 60 秒被量成 50 秒或 60 秒，取决于那一拍落没落点 —— 两条路必须
+    //      给出同一个答案，而"同一个答案"只有把端点定死才能保证。
+    if (points.size() >= 2 && nowSeconds > points.back().at) {
+        Amount newestAmount;
+        if (CurveValueOfEntry(points.back(), &newestAmount)) {
+            double dt = static_cast<double>(nowSeconds - points.back().at);
+            if (dt < 1.0) dt = 1.0;            // 同一秒、或时间戳没变：至少按 1 秒算
+            if (dt >= kStepGapAwayThresholdSeconds) dt = kStepGapCapSeconds;
+            // ★ 参数顺序 = (上一个量, 这一个量, Δt)：`StepPerMinute` 算的是 (cur - prev)。
+            //   写成 (newest, prev) 会把方向倒过来 —— 余额**上涨**会被算成剧烈下降、
+            //   R_new 恒 1、R 永久钉死（实测就是这么错了一版，closeprobe case6 抓出来的）。
+            return StepPerMinute(newestAmount.ToDouble(), g_currentStepFromBalance, dt);
+        }
+    }
+    if (points.size() < 2) return 0.0;             // 只有一个点且没有"现在"：无从判断
+
+    // ---- 退回：存储里最后两个可用点（时间戳缺失的那几个点在这里被跳过）----
     for (std::size_t i = points.size(); i-- > 1;) {
         const CurveStorePoint& cur = points[i];
         const CurveStorePoint& prev = points[i - 1];
         if (!cur.atValid || !prev.atValid) continue;
-        const double dt = static_cast<double>(cur.at - prev.at);
+        double dt = static_cast<double>(cur.at - prev.at);
         if (!(dt > 0.0)) continue;
+        if (dt > kStepGapCapSeconds) dt = kStepGapCapSeconds;
         Amount curAmount;
         Amount prevAmount;
         if (!CurveValueOfEntry(cur, &curAmount)) continue;
@@ -378,6 +479,7 @@ StepMemory g_stepMemory;
 //     `DisplayedAmount::LastStepPerMinute()`（那时两者本来就同值，见那里的说明）。
 bool AmbientStepKnown() { return g_stepMemory.valid; }
 double AmbientStepPerMinute() { return g_stepMemory.current; }
+
 
 // 纵向缓动：P = L + (N − L) × (1 − rate^k)^c（规格 §3 第 6 条，k = 帧号）。
 // ★ 走到终点（第 600 帧，整 10 秒）时直接取 N：公式在 k=600 处还剩 0.975^600 ≈ 2.5e-7
@@ -426,6 +528,15 @@ void FeedCurve(const Sample& s) {
             obs.primaryCurrency, s.total.ToString2(), true});
     }
     // 样本的**墙钟秒**就是数据层的时间戳（规格 §2.3）。
+    // ★ "现在"**只服务 R 的衰减**（`StoreStepPerMinuteAt()`），颜色走另一条路
+    //   （`StepIntoNewestPointPerMinute()`，见下面那一大段）。
+    //   ★ 它在 `Append()` **之前**更新，所以量 R 那一步时它就是"这一个样本"。
+    //   ★ 顶部那两处 `return`（没有币种信息）在这个更新之前：那种样本连"现在"都不该占 ——
+    //     它没有可读的余额，会把"现在"推到一个不存在的时间点上。
+    g_currentStepFromValid = true;
+    g_currentStepFromAt = s.wallMs / 1000;
+    g_currentStepFromBalance = s.total.ToDouble();
+
     // ★ 氛围颜色的口径（所有者 2026-09-18）：**段 P_N→P_(N+1) 的颜色 = 终止于 P_(N+1)
     //   那一步的 R_new**，也就是"进入 P_(N+1) 的那一步"。
     //   ★ 于是它只能**回填**：写 P_N 的时候"到 P_(N+1) 那一步"还不存在（要等 P_(N+1) 到达
@@ -436,9 +547,26 @@ void FeedCurve(const Sample& s) {
     //       3. 用这一步的颜色覆盖**上一个点**的颜色 —— 它右边那一段就是这一步
     //   ★ 用"样本间隔"代替"存储里两点间隔"会错：余额没变的采样不成点，两者会越差越多
     //     （审计员实测 10 s 采样、20 s 变化一次时差 2 倍）。
+    // ★ 氛围颜色的口径（所有者 2026-09-18）：**段 P_N→P_(N+1) 的颜色 = 终止于 P_(N+1)
+    //   那一步的 R_new**，也就是"进入 P_(N+1) 的那一步"。
+    //   ★ 于是它只能**回填**：写 P_N 的时候"到 P_(N+1) 那一步"还不存在（要等 P_(N+1) 到达
+    //     才知道）。顺序是：
+    //       1. 这一拍先把新点追加进去（暂时不带颜色）
+    //       2. 量出"上一个点 → 这个新点"这一步（`StepIntoNewestPointPerMinute()`，此刻
+    //          存储的最后两个点正好是它们）
+    //       3. 用这一步的颜色覆盖**上一个点**的颜色 —— 它右边那一段就是这一步
+    //   ★ 用"样本间隔"代替"存储里两点间隔"会错：余额没变的采样不成点，两者会越差越多
+    //     （审计员实测 10 s 采样、20 s 变化一次时差 2 倍）。
+    //   ★★ 这里的量法**不能**换成 `StoreStepPerMinute()`（"最新点 → 现在"）：那一刻
+    //     "现在"就是刚追加进去的这个点，Δt 恒被夹成 1、两个量又相等 —— 每个点都算成
+    //     0、每个点都被涂成同一个基准蓝。所有者说的"后面线的颜色没有了"就是这一条，
+    //     像素证据见文件上方"两个『这一步有多陡』"那一段。颜色走这一条，衰减走那一条。
     g_curveStore.Append(obs, s.wallMs / 1000, std::string());
-    const double step = StoreStepPerMinute();
-    const double ratio = SeverityRatio(step);
+    // ★ 判定"追加了一个点"看的是**存储自己的状态**，不是 Append() 返回值的含义：
+    //   点数变了，或者环里的内容变了（容量到顶时 size() 不动，但最老的点会被挤掉）。
+    const std::vector<CurveStorePoint> after = g_curveStore.Points();
+    const bool appended = !SamePoints(before, after);
+    const double stepIntoNewest = StepIntoNewestPointPerMinute();
     // 回填：把"终止于最新那个点的那一步"的颜色写到**它的前一个点**上 —— 那一段就是这一步。
     // 颜色里的余额用前一个点自己的值（D 要按它自己的余额算，不能用最新那个点的）。
     {
@@ -446,21 +574,21 @@ void FeedCurve(const Sample& s) {
         if (pts.size() >= 2) {
             Amount prevAmount;
             if (CurveValueOfEntry(pts[pts.size() - 2], &prevAmount)) {
-                g_curveStore.SetColorOfPrevNewest(
-                    HexOf(BalanceColorAt(prevAmount.ToDouble(), ratio)));
+                g_curveStore.SetColorOfPrevNewest(HexOf(
+                    BalanceColorAt(prevAmount.ToDouble(), SeverityRatio(stepIntoNewest))));
             }
         }
     }
-    // ★ 这一步刚测出来，留给**下一次**用：主循环滞后一拍，所以下一次刷新时屏幕上
+    // ★ R 的衰减要的是**另一件事**：从最后一次变化，摊到"现在"。它必须在这里再量一次
+    //   （见上面那一段）—— 余额没变的采样不成点，只有时间在往前走，平静期才摊得薄。
+    //   这一步刚测出来，留给**下一次**用：主循环滞后一拍，所以下一次刷新时屏幕上
     //   正在显示的就是这一步，氛围要用它（见 StepMemory 的说明）。
-    g_stepMemory.current = step;   // 原始量（元/分钟），不是夹过的 R
+    g_stepMemory.current = StoreStepPerMinuteAt(g_currentStepFromAt);   // 原始量（元/分钟）
     g_stepMemory.valid = true;
 
     // ★ 判定"追加了一个点"看的是**存储自己的状态**，不是 Append() 返回值的含义：
-    //   点数变了，或者环里的内容变了（容量 12 到顶时 size() 不动，但最老的点会被挤掉）。
+    //   点数变了，或者环里的内容变了（容量到顶时 size() 不动，但最老的点会被挤掉）。
     //   只比 size() 会在环满之后永远看不到新点（那时曲线会在生产里停住不滚）。
-    const std::vector<CurveStorePoint> after = g_curveStore.Points();
-    const bool appended = !SamePoints(before, after);
     if (!appended) return;
 
     // 落盘：只在"真的追加了一个点"之后写（12 个点，代价极小；崩溃最多丢最后一次）
@@ -496,7 +624,20 @@ void BuildFrameCurve(WidgetFrame* f) {
     f->curve.clear();
     f->curveHasData = false;
 
-    const std::vector<CurveStorePoint> points = g_curveStore.Points();
+    // ★ 面板的显示集与存储容量**解耦**（所有者 2026-09-19：容量 12 -> 120）。
+    //   这一层要的永远是"最新 12 个点"（11 个在看 + 1 个进场），那是一个**显示**常量
+    //   （kCurveDisplayPoints），不是存储的容量。存储从 12 涨到 120 之后，直接拿全部
+    //   存储点往下算会让滚动那一瞬间（first = 0）把 120 个点全塞进 11 个槽位——
+    //   间距变成 1/119，曲线被压成一条细丝再滑过去，面板就坏了。
+    //   所以入口先切片，后面对 n 的一切（槽位基准、span、裁剪）都基于切片自己的 size；
+    //   容量是 12 还是 120，画出来的东西逐像素相同。
+    //   代价：每次多一次 vector 拷贝（最多 12 个点，一帧一次，可以忽略）。
+    const std::vector<CurveStorePoint> allPoints = g_curveStore.Points();
+    const std::size_t keep = (allPoints.size() > kCurveDisplayPoints + 1)
+                                 ? (kCurveDisplayPoints + 1)
+                                 : allPoints.size();
+    const std::vector<CurveStorePoint> points(allPoints.end() - static_cast<std::ptrdiff_t>(keep),
+                                              allPoints.end());
     const std::size_t n = points.size();
     if (n == 0) return;                         // 没有数据：渲染层画带子正中的平线
 
@@ -517,7 +658,8 @@ void BuildFrameCurve(WidgetFrame* f) {
 
     // 画哪些点、各自在哪个槽位：
     //   静止：最新 11 个，槽位 0..10（最老在左、最新在右边缘）。
-    //   滚动：环里全部点（最多 12 个），槽位再右移 0.1×(1−进度)——于是"第 12 个"
+    //   滚动：切片里全部点（最多 12 个 —— 切片在上面的入口就做完了，所以存储里
+    //         有 120 个点也一样），槽位再右移 0.1×(1−进度)——于是"第 12 个"
     //         从 x=1.1 进来、整条以**线性**进度左移一格，走完时正好落在"最新 11 个"。
     const double slotBase = static_cast<double>(n) - 1.0 - static_cast<double>(kCurveSegments);
     const std::size_t first = scrolling ? 0 : shownBegin;
@@ -663,6 +805,24 @@ void DiffSpan(const std::string& a, const std::string& b, int* from, int* to) {
 }
 
 }  // namespace
+
+// 曲线存储里最新那个点的余额（元）。
+// ★ 给启动过渡用（main.cpp 的 CommitDelayed）：起点就取它 —— "上次关掉前显示的余额"
+//   就是存储里最新那个点，不必在别处再存一份。取不到（存储为空）时返回 false。
+// ★ 不判它多老：超过 86400 秒的存储在加载时已被整份丢弃（curve_store 的 §2.3 规则），
+//   所以这里拿到的一定在一天之内。
+bool CurveStartBalance(double* outYuan) {
+    if (outYuan == nullptr) return false;
+    const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
+    for (std::size_t i = points.size(); i-- > 0;) {
+        Amount amount;
+        if (CurveValueOfEntry(points[i], &amount)) {
+            *outYuan = amount.ToDouble();
+            return true;
+        }
+    }
+    return false;
+}
 
 // 连续取不到值：回到"没有值"的状态（界面显示 --.--），但**历史不丢**：
 // 下一次成功样本会重新落位。所有者：先当作没变，连续 5 次才显示 --.--。
@@ -1004,6 +1164,7 @@ AmbienceOverrideState& AmbienceOverride() {
 // 这样"值"和"轮子"永远在同一帧里一起走，调用方不需要记得多调一次。
 // 曲线的滚动计时器也在这里推进（规格 §3：由帧 dt 推进，追加时归零）。
 double DisplayedAmount::Update(double dtSeconds) {
+    ShutdownAdvanceFrame();       // 帧号先走：它下面每一步（R 的下限、抖动）都要读它
     AdvanceCurve(dtSeconds);
     AdvanceRate(dtSeconds);       // 消耗速率（§7.3）：每帧重算 + 走一步弹簧
     const double shown = UpdateValue(dtSeconds);
@@ -1022,6 +1183,8 @@ double DisplayedAmount::Update(double dtSeconds) {
 //                  若 R_new > R(t)  ->  t = ln(R_new) / ln(a)
 //   画到屏幕上     C = DesaturateTowards( AmbienceBase(R_display), D )     ← 没有缓动
 //                  D = clamp( (G − 余额) / G, 0, 1 )                        ← 瞬时量
+//   t 的起点        进程刚起、一步都还没量到时 **R = 0**（不是 a^0 = 1）：
+//                  t 只在第一次真的量出一步（R_new > 0）时才开始走。
 //
 //  三个后果，都是这个模型故意的：
 //   1. R 只会被**抬高**：数据说"这次不那么陡"时，R 交给时间自己凉，不许被硬拉下去。
@@ -1037,9 +1200,10 @@ double DisplayedAmount::Update(double dtSeconds) {
 //    比它与墙钟的严格一致更重要。
 //
 //  ★ 只有"抬升"会改写 t（R_new > R(t) 才抬），所以 t 是单调不减的，不存在负时间。
-//  ★ 这个成员函数现在**只是转发** StoreStepPerMinute()（文件上方那个自由函数）：
+//  ★ 这个成员函数现在**只是转发** StoreStepPerMinuteAt()（文件上方那个自由函数）：
 //    同一件事只允许一份实现，否则迟早出现"两个地方各算一次、结果不一样"。
-double DisplayedAmount::LastStepPerMinute() const { return StoreStepPerMinute(); }
+//    ★ 注意它量的是"最新那个点 → 现在"，**颜色不走这一条**（见文件上方那一段）。
+double DisplayedAmount::LastStepPerMinute() const { return StoreStepPerMinuteAt(g_currentStepFromAt); }
 
 void DisplayedAmount::AdvanceAmbience(double dtSeconds) {
     // ---- 0) 暂停 = 冻结 ----
@@ -1061,15 +1225,30 @@ void DisplayedAmount::AdvanceAmbience(double dtSeconds) {
     // ---- 2) R(t) = a^t：先让时间走这一步，再让刷新去抬高它 ----
     const double dt = (dtSeconds < 0.0) ? 0.0
                      : ((dtSeconds > kAmbienceDtMaxSeconds) ? kAmbienceDtMaxSeconds : dtSeconds);
-    if (!frozen) ambienceSeconds_ += dt / 60.0;   // t 的单位是分钟
-    //  ★ 抬高规则（第一帧、或长时间没有刷新之后）：只要当前高度**低于**数据给的高度，
-    //    就把时间退回去，使 R(t) 恰好等于 R_new。R_new 为 0 时"退回"没有意义（R 恒为 0），
-    //    所以只在 R_new > 0 时才动 t；于是"数据说这次不那么陡"永远不会把 R 拉下去。
-    const double currentRatio = std::pow(kAmbienceDecayA, ambienceSeconds_);
-    if (ambienceRatioTarget_ > 0.0 && ambienceRatioTarget_ > currentRatio) {
-        ambienceSeconds_ = std::log(ambienceRatioTarget_) / std::log(kAmbienceDecayA);
+    if (!frozen && ambienceClockValid_) ambienceSeconds_ += dt / 60.0;   // t 的单位是分钟
+    //  ★ 抬高规则（第一帧、或长时间没有刷新之后）：只要当前高度**低于**要抬到的高度，
+    //    就把时间退回去，使 R(t) 恰好等于那个高度。R_new 为 0 时"退回"没有意义（R 恒为 0），
+    //    所以只在 > 0 时才动 t；于是"数据说这次不那么陡"永远不会把 R 拉下去。
+    //  ★ 关闭态的两个下限（规格 §10.2）**就走这一条**：把要抬到的高度从 R_new 换成
+    //    `max(R_new, R_d)`。一次 max、一次抬升 —— 与"数据刷新"是同一个式子（所有者要求的
+    //    "同口径运算"因此不是另写一遍，而是同一个 max 换了个右操作数）。
+    //    两次点击之后 R_d 停在那一档上，于是每一帧的 max 都把它重新抬回 R_d：
+    //    下限把 R **钉住**，衰减穿不过去。
+    //    （这也是"光晕与心跳同时拿到下限"的全部实现：心跳按 R 取律，而 R 只有这一个来源。）
+    //  ★★ 计时器"还没开始走"时当前高度是 **0**，不是 1：t = 0 代表"刚刚剧烈消耗过"，
+    //    而冷进程一次测量都还没有。少了这一条，第一个样本一到屏幕就血红（实测：R_new = 0
+    //    而 R = 0.9749），所有者报的"每次点开都是红的"就是它。计时器由**第一次真的量出
+    //    一步**启动 —— 那一刻它才开始代表"距离那次消耗过了多久"。
+    const double currentRatio = ambienceClockValid_ ? std::pow(kAmbienceDecayA, ambienceSeconds_) : 0.0;
+    const double raiseTo = std::max(ambienceRatioTarget_, ShutdownFloorRatio());
+    if (raiseTo > 0.0 && raiseTo > currentRatio) {
+        ambienceSeconds_ = std::log(raiseTo) / std::log(kAmbienceDecayA);
+        ambienceClockValid_ = true;
     }
-    ambienceRatio_ = std::pow(kAmbienceDecayA, ambienceSeconds_);
+    // ★ 这里**没有**再写一句 `if (R < R_d) R = R_d`：上面那条条件已经保证了它 ——
+    //   没抬升就说明 currentRatio >= raiseTo >= R_d。写下来就是一句永远不执行的代码，
+    //   而"下限没生效"会被它掩盖成一个看起来正确的数（本项目删掉过两次这种补丁）。
+    ambienceRatio_ = ambienceClockValid_ ? std::pow(kAmbienceDecayA, ambienceSeconds_) : 0.0;
 
     // ---- 3) D：余额的纯函数，**不加时间平滑** ----
     //  ★ 用**本帧屏幕上那个数字**（value_ 由本帧的 UpdateValue/AdvancePlaces 刚推完）：
@@ -1104,6 +1283,8 @@ void DisplayedAmount::AdvanceAmbience(double dtSeconds) {
     AdvanceBeat(dtSeconds);
 
     // ---- 6) 蒙光强度倍率 k(R,D)：与颜色分开缓动（连续解，与帧率无关）----
+    //  ★ 关闭态的**亮度倍率不在这里乘**：它乘在 BuildWidgetFrame 那个两条路共用的落点上
+    //    （导帧路径从不跑 Update，在这里乘的话导出来的帧亮度不变、量不到）。理由写在那边。
     const float kTarget = static_cast<float>((kGlowInK0 + kGlowInK1 * ratioShown_) *
                                              (1.0 - kGlowInD * depthShown_));
     if (!glowSeeded_ || frozen) {
@@ -1132,7 +1313,14 @@ void DisplayedAmount::SetAmbienceGiven(double ratio, double depth) {
 // dt 是调用方给的帧 dt（休眠唤醒后的巨型 dt 已被 Clock::Tick 钳到 50 ms；
 // RateSpringStep 自己还会再钳一次，见 rate_estimator.cpp）。
 void DisplayedAmount::AdvanceRate(double dtSeconds) {
-    rateEstimate_ = EstimateRate(RateInputForCurrency(currencyShown_));
+    // ★ 口径：**Theil–Sen 中位斜率**（EstimateRateTheilSen），不是旧的"下降量之和 ÷ 跨度"。
+    //   为什么换：旧公式把停机空档算进了分母（余额没变的那段时间没有点、没有下降量，
+    //   却只把分母拉长），所有者实测 12 个点跨 137.9 分钟 -> 预测 42.4 小时。
+    //   输入还是曲线存储的点，只是**换了公式**：这一轮没有新增采样文件，也没有改
+    //   "只在余额变化时记点"那条规则（曲线规格 §2.1）。见 rate_estimator.h 的"哪个是哪个"。
+    //   仍然是每帧重算：输入（存储的点）只在采样到达时变，但窗口滑动是**时间**的函数，
+    //   所以"每帧算一次"正是让窗口跟着墙钟走的那一步（一次 7140 个点对是微秒级）。
+    rateEstimate_ = EstimateRateTheilSen(RateInputForCurrency(currencyShown_));
 
     // 目标：只有显著（余额在掉）时才是正数；不显著 / 空 / 不消耗都以 0 为目标。
     const double target = (rateEstimate_.status == RateStatus::Significant)
@@ -1206,7 +1394,11 @@ void PrimeHistoryForDemo(int points) {
                                      20.15, 20.14, 20.13, 19.90, 20.10, 20.12};
     const int want = points;
     const int table = (want < 12) ? want : 12;   // <12 时取表尾那几个
-    const int prefix = want - table;             // >12 时多喂的填充点，会被环挤掉
+    // ★ >12 时多喂的那些点是**填充**，它们的值不重要；2026-09-19（kCapacity 12 -> 120）
+    //   之后它们**留在环里**（以前会被 12 格的环挤掉），所以 --history-demo=20 现在
+    //   画出来的是"最新 12 个"这些话里的第 8..12 个 + 填充点 —— 面板照旧只取最新 12 个
+    //   （BuildFrameCurve 入口切片），所以画面仍然只受最后 12 个点影响。
+    const int prefix = want - table;
     // ★ 固定基准时刻 + 固定步长（所有者 2026-09-17 的要求）。
     //   原来是 `std::time(nullptr)`：同一个 --history-demo=N 在不同时刻产生**不同的
     //   时间戳串**，于是同一个导出命令两次跑出来的帧不逐位相同 —— 而"导帧可复现"
@@ -1243,6 +1435,16 @@ void PrimeHistoryForDemo(int points) {
 void DisplayedAmount::ApplyShownState() {
     ratioShown_ = ambientUnreadable_ ? 0.0 : ambienceRatio_;
     depthShown_ = ambientUnreadable_ ? 1.0 : ambienceDepth_;
+    // ★ 关闭态的下限加在**状态规则之后、夹具之前**，两个理由都是硬的：
+    //   1. 读不到余额时（§7.1 规定 R = 0）也要紧张起来 —— 关闭态是人手动进入的，
+    //      与"余额读不读得到"无关；而"读不到 → R = 0"那条规则的含义是"没有剧烈消耗"，
+    //      不是"没有情绪"。常态下它是 0，这里把关闭态的下限叠上去。
+    //   2. 放在夹具**之前**：`--ambience=R,D` 是量光晕用的夹具，它必须仍然能把 R
+    //      钉在任意值（包括 0）—— 排在它后面就会把夹具推翻，整个光晕验收作废。
+    //   可读余额时这一句是**空操作**（AdvanceAmbience 的抬升已经保证 R >= R_d），
+    //   所以它不是"多一道保险"，而是专门管读不到那一条路径。
+    const double floor = ShutdownFloorRatio();
+    if (ratioShown_ < floor) ratioShown_ = floor;
     if (ambienceGiven_) {            // 程序内夹具（DisplayedAmount::SetAmbienceGiven）
         ratioShown_ = ambienceGivenRatio_;
         depthShown_ = ambienceGivenDepth_;
@@ -1251,6 +1453,183 @@ void DisplayedAmount::ApplyShownState() {
         ratioShown_ = AmbienceOverride().ratio;
         depthShown_ = AmbienceOverride().depth;
     }
+}
+
+// ---------------------------------------------------------------------------
+// 关闭态（设计 §10.2）：状态机 + 抖动 + 进入段
+// ---------------------------------------------------------------------------
+//  模型一句话：**右键进入 → 三次点击即关 → 只有 `Esc`（或点到面板之外）能取消**。
+//
+//  为什么状态机这么小却值得单独写一段注释（三条都是踩过或将要踩的）：
+//   1. **没有时间窗**。第 2 击之后停 10 秒还是 10 分钟，第 3 击照样关。所以这里
+//      一个时间戳都不存：存了就会有人顺手加一个"太久就清零"的判定。
+//   2. **右键在关闭态里是"点击"，不是"再次进入"**。两件事都必须由**当前相位**分派，
+//      写成一个就会让"右键进入 → 右键"变成"重置进度"而不是"第 1 击"。
+//   3. **点满三次是单向的**：Fired 之后不再计数、不再受理输入（粒子期间）。
+//      "再次触发销毁不产生第二个实例"因此不需要调用方记得先判断。
+//
+//  抖动与进入段是**帧号的纯函数**（下面两个自由函数），所以：
+//    · 生产路径每帧给一个帧号；
+//    · 导帧路径可以把帧号直接钉在第 k 帧（--shutdown-frame=k），不必连跑 k 帧；
+//    · 探针能离线把同一串 k 复算一遍，与屏幕上的位移对得上。
+//  这三条正是本项目唯一的验证方式。
+namespace {
+
+// 帧号的确定性噪声，落在 [-1, 1)。整数混合（splitmix64 的前三步），
+//  **不引随机数、不引状态**：抖动必须是帧号的纯函数，否则同一个 k 导出两次会得到
+//  两个不同的位移，"量出来的抖动幅度"里就混着随机数（那就不是证据了）。
+double FrameNoise(int frame) {
+    uint32_t h = static_cast<uint32_t>(frame) * 2654435761u;
+    h ^= h >> 15;
+    h *= 2246822519u;
+    h ^= h >> 13;
+    h *= 3266489917u;
+    h ^= h >> 16;
+    return static_cast<double>(h) / 2147483647.5 - 1.0;
+}
+
+constexpr double kTwoPi = 6.283185307179586;
+
+}  // namespace
+
+// 进入段进度：0 = 刚进入那一刻，1 = 进入段走完（之后恒为 1）。
+double ShutdownEntryProgress(int frame) {
+    if (frame <= 0) return 0.0;
+    if (frame >= kShutdownEntryFrames) return 1.0;
+    return static_cast<double>(frame) / static_cast<double>(kShutdownEntryFrames);
+}
+
+// 抖动位移（DIP）。档位 = 已计数到第几击。
+//  ★ 为什么是两个不同频率的正弦 + 逐帧噪声（所有者点名的"不要单一正弦"）：
+//    单一正弦是**周期运动**，看起来像机械摆动，不像发抖。7.0 Hz 与 11.7 Hz 不可通约，
+//    合成波形的重复周期很长，再叠一点逐帧噪声就是"抖"而不是"摇"。
+//  ★ 为什么进入段是"从猛收到常态"（settle > 1）：这是"砸进来"在位移上的落点 ——
+//    右键那一刻最猛，0.117 s 之内收到这一档的常态值。
+double ShutdownJitterAt(int frame, int clicks) {
+    const int tier = (clicks < 1) ? 0 : ((clicks > 3) ? 2 : clicks - 1);
+    const double amp = kShutdownJitterDip[tier];
+    const double freqMul = kShutdownJitterFreqMul[tier];
+    // 帧 -> 秒用**心跳那根 60 Hz 标尺**（kBeatFrameHz）：位移与心跳是同一个通道，
+    // 两套标尺只会让"这一帧该抖多少"在别处对不上。
+    const double seconds = static_cast<double>(frame) / kBeatFrameHz * freqMul;
+    const double wave = 0.62 * std::sin(kTwoPi * 7.0 * seconds) +
+                        0.26 * std::sin(kTwoPi * 11.7 * seconds + 1.7);
+    const double jitter = wave + 0.34 * FrameNoise(frame);
+    const double u = ShutdownEntryProgress(frame);
+    const double settle = 1.0 + kShutdownJitterSlam * (1.0 - u) * (1.0 - u);
+    return amp * settle * jitter;
+}
+
+// 关闭态的状态：**整个挂件只有一份**，所以放模块级（不是显示层实例的成员）。
+//  ★ 为什么不放 DisplayedAmount 里：R 的下限要在 AdvanceAmbience（成员函数）里读，
+//    但夹具与探针要从**没有窗口、也没有实例**的地方驱动它（--shutdown-frame 是命令行
+//    夹具）。模块级 + 自由函数是这一层既有的写法（AmbienceOverrideState、
+//    CountdownStorage、AmbienceFrozenFlag 全都是这个形状）。
+struct ShutdownState {
+    ShutdownPhase phase = ShutdownPhase::Off;
+    int clicks = 0;         // 已计数的点击（0..3）
+    int frame = -1;         // 进入那一帧 = 0（ShutdownAdvanceFrame 每帧 +1）
+    bool fixture = false;   // 导帧夹具：帧号是给进来的，不推进
+};
+
+ShutdownState& Shutdown() {
+    static ShutdownState state;
+    return state;
+}
+
+bool ShutdownActive() { return Shutdown().phase != ShutdownPhase::Off; }
+bool ShutdownFired() { return Shutdown().phase == ShutdownPhase::Fired; }
+int ShutdownClicks() { return Shutdown().clicks; }
+int ShutdownFrame() { return Shutdown().frame; }
+
+bool ShutdownEnter() {
+    ShutdownState& s = Shutdown();
+    if (s.phase != ShutdownPhase::Off) return false;   // 已在关闭态：不重置、不重复计时
+    s.phase = ShutdownPhase::Armed;
+    s.clicks = 0;
+    s.frame = -1;      // 下一次 ShutdownAdvanceFrame 立刻把它推到 0（= 进入那一帧）
+    s.fixture = false;
+    return true;
+}
+
+bool ShutdownClick() {
+    ShutdownState& s = Shutdown();
+    if (s.phase == ShutdownPhase::Off) return false;     // 非关闭态：调用方走错了
+    if (s.phase == ShutdownPhase::Fired) return false;   // 粒子期间不重复触发
+    ++s.clicks;
+    if (s.clicks >= 3) {
+        s.phase = ShutdownPhase::Fired;
+        return true;                                    // 调用方据此去发"该放粒子了"的信号
+    }
+    return false;
+}
+
+bool ShutdownCancel() {
+    ShutdownState& s = Shutdown();
+    if (s.phase == ShutdownPhase::Off) return false;   // 日志要能分辨"取消了"与"关窗口"
+    // ★ 点满三下之后**不受理取消**：粒子已经在画，规格要的是"粒子期间不响应任何输入"。
+    //   少了这一句，一次 Esc（或点到别处）就能把正在播的关闭流程撤销掉 —— 而窗口已经
+    //   该关了，撤销等于让一个"关到一半"的挂件留在屏幕上。closeprobe 的 case5 就是这条。
+    if (s.phase == ShutdownPhase::Fired) return false;
+    s.phase = ShutdownPhase::Off;
+    s.clicks = 0;
+    s.frame = -1;      // 进度归零：再进来是全新的一轮
+    s.fixture = false;
+    return true;
+}
+
+// 本帧的 R 下限：第 1 击 -> kShutdownRd1，第 2 击（含已经点满的粒子期间）-> kShutdownRd2。
+// 刚进入还没点、以及非关闭态一律 0（下限还没抬起来，R 照旧交给时间自己衰减）。
+double ShutdownFloorRatio() {
+    const ShutdownState& s = Shutdown();
+    if (s.phase == ShutdownPhase::Off) return 0.0;
+    if (s.clicks >= 2) return kShutdownRd2;
+    if (s.clicks == 1) return kShutdownRd1;
+    return 0.0;
+}
+
+double ShutdownJitterDip() {
+    const ShutdownState& s = Shutdown();
+    if (s.phase == ShutdownPhase::Off) return 0.0;
+    return ShutdownJitterAt(s.frame < 0 ? 0 : s.frame, s.clicks);
+}
+
+// 内蒙光的亮度倍率（乘在 k(R,D) 上）。
+//  ★ 所有者 2026-09-19 要的：关闭态**只有变红**时反馈不够 —— 余额已经红着的时候，
+//    右键之后除了抖动几乎看不出发生了什么。亮度是**与色相正交**的通道：不管当时面板是
+//    蓝还是红，一暗就看得见。所以关闭态不是换个颜色，而是**把光压下去**。
+//  ★ 两档的亮度是**各自相对原始亮度**的比例（不是逐档相乘）：
+//      第 1 击 -> ×kShutdownGlowLevel1（0.4）   第 2 击及以后 -> ×kShutdownGlowLevel2（0.8）
+//    于是两次点击各带来一次可见的亮度变化（1.0 → 0.4 → 0.8，先是猛地暗下去、再回一点）。
+//  ★ 倍率乘在**目标值**上：上面那段 glowIntensity_ 的缓动照旧生效，所以亮度是滑过去的，
+//    不是一帧跳变（与项目"不许突变"的纪律一致）。
+double ShutdownGlowLevel() {
+    const ShutdownState& s = Shutdown();
+    if (s.phase == ShutdownPhase::Off) return 1.0;
+    if (s.clicks >= 2) return kShutdownGlowLevel2;
+    if (s.clicks == 1) return kShutdownGlowLevel1;
+    return 1.0;   // 刚进入还没点：亮度不动，反馈只在点击之后出现
+}
+
+bool ShutdownCurveLayerVisible() {
+    return !ShutdownActive() || ShutdownFrame() < kShutdownEntryFrames;
+}
+
+void ShutdownAdvanceFrame() {
+    ShutdownState& s = Shutdown();
+    if (s.phase == ShutdownPhase::Off) return;
+    if (s.fixture) return;   // 导帧夹具：帧号是给进来的，推进就把它推跑了
+    ++s.frame;
+}
+
+// 导帧夹具：把关闭态直接钉在"已点 N 下、进入以来第 k 帧"。见头文件里的说明。
+void SetShutdownFixture(int clicks, int frame) {
+    ShutdownState& s = Shutdown();
+    const int c = (clicks < 1) ? 1 : ((clicks > 3) ? 3 : clicks);
+    s.clicks = c;
+    s.phase = (c >= 3) ? ShutdownPhase::Fired : ShutdownPhase::Armed;
+    s.frame = (frame < 0) ? 0 : frame;
+    s.fixture = true;
 }
 
 // --beat-frame=k：把心跳的仿真时刻放到 k/60 秒，并按计时器重新走一遍（导出夹具）。
@@ -1405,7 +1784,13 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     //   ★ 读不到余额时 R/D 的取值、以及"取甲不取乙"，都已经在 AdvanceAmbience 里
     //     按状态规则算完，这里只是把它搬进帧。
     f.ambientColor = amount.ambienceColor();
-    f.ambientIntensity = amount.ambienceIntensity();
+    // ★ 关闭态的**亮度倍率在这里乘，且只在这里乘一次**（这是导帧与实时两条路共用的落点）。
+    //   为什么不在 AdvanceAmbience 里乘：导帧路径**从不跑 Update()**（它只跑
+    //   BuildWidgetFrame 然后画一帧），在那边乘的话导出来的帧亮度不会变，等于量不到；
+    //   而两处都乘会变成平方。所以唯一的落点就是这里。
+    //   ★ 代价（如实记着）：实时的亮度**没有缓动**了 —— 它随档位一帧到位。若以后要让它
+    //     滑过去，得把倍率挪回 AdvanceAmbience 并给导帧路径单独补一次，那时要小心别乘两遍。
+    f.ambientIntensity = amount.ambienceIntensity() * static_cast<float>(ShutdownGlowLevel());
     f.beatOffsetDip = static_cast<float>(amount.beatOffsetDip());
 
     // ★ 符号与数字**分开决定**（所有者）：只要币种是确定的，即使没有数字也要显示符号，
@@ -1446,6 +1831,40 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     //   唯一路径（滚动结束不再切到另一条静止路径，那正是"结束时跳一行"的来源）。
     //   所以未滚动时也必须给值，否则轮子按 0 算、画面上会变成 00.00。
     //   轮子自然停在整行上，与静止状态逐像素一致。
+    //
+    // ---- 关闭态（设计 §10.2）：只留"关闭"二字 ----
+    //  ★ 为什么收口放在**最后一行**而不是开头：上面那些字段是一个一个赋上去的
+    //    （币种符号、places、清零预估都在 BuildFrameCurve 之后才写），在开头清会被后面
+    //    重新填回来。那种 bug 在屏幕上就是"关闭态里还留着某某东西"，而每一处单独看都对。
+    //  ★ 两个字放 `amountText`：金额那条绘制路径本来就**按墨迹居中**（数字与"关闭"走
+    //    同一段代码），所以渲染层一行都不用改 —— 它看到的仍然只是"这一帧要显示的文字"。
+    if (ShutdownActive()) {
+        f.statusText = L"";
+        f.countdownText = L"";
+        f.showAmount = false;
+        f.currencySymbol = L"";
+        f.zeroTimeText.clear();
+        f.places.clear();
+        f.amountText = "关闭";
+        const double entry = ShutdownEntryProgress(ShutdownFrame());
+        if (entry < 1.0) {
+            // 进入段：曲线**绕实体区中心向内收缩**（规格：旧内容不是淡出，是被抽走）。
+            //  它是唯一可收缩的元素：点列的横纵坐标都是显示层的归一化值。文字的坐标、
+            //  字号、alpha 都是渲染层的常量（那正是"变大到位/呼吸/边缘散"做不了的地方，
+            //  理由与需要的接缝写在 widget_display.h 的关闭态那一段）。
+            const double shrink = 1.0 - entry;
+            for (CurvePoint& p : f.curve) {
+                p.x = static_cast<float>(0.5 + (static_cast<double>(p.x) - 0.5) * shrink);
+                p.y = static_cast<float>(0.5 + (static_cast<double>(p.y) - 0.5) * shrink);
+            }
+        } else {
+            f.curve.clear();
+            f.curveHasData = false;
+        }
+    }
+    // 抖动与心跳**相加**送进同一个位移通道（§9.4：关闭态里心跳不停）。
+    // 非关闭态这一项恰好是 0（ShutdownJitterDip 在 Off 相位返回 0.0）。
+    f.beatOffsetDip += static_cast<float>(ShutdownJitterDip());
     return f;
 }
 
