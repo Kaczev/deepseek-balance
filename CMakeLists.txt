@@ -55,10 +55,15 @@ set_property(TARGET dshb PROPERTY VS_DPI_AWARE "PerMonitor")
 # ---------------------------------------------------------------------------
 # 鐙珛鎺㈤拡锛氬彧鎵撳嵃杩愬姩鏇茬嚎锛屼笉纰板叡浜姸鎬併€?# 鑷鍧楅噷鐘舵€佹搷浣滃お澶氾紝瑙傚療涓棿閲忓鏄撹嚜宸辩畻閿欙紱鍗曠嫭鐨勬帰閽堟病鏈夎繖绉嶄綑鍦般€?
 # ---------------------------------------------------------------------------
-add_executable(tauprobe tools/tauprobe.cpp src/widget_display.cpp src/heartbeat.cpp src/state_machine.cpp src/amount.cpp src/curve_store.cpp src/json_min.cpp src/rate_estimator.cpp)
+add_executable(tauprobe tools/tauprobe.cpp src/widget_display.cpp src/heartbeat.cpp src/state_machine.cpp src/amount.cpp src/curve_store.cpp src/json_min.cpp src/rate_estimator.cpp src/fx_rate.cpp src/http_get.cpp)
 add_executable(coordprobe tools/coordprobe.cpp src/amount.cpp)
 target_compile_definitions(tauprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(tauprobe PRIVATE src)
+# 显示层现在会读汇率：危险度 D 必须按"钱"算（把主币种金额折成元 -> 比 10 元阈值，
+# 见 src/widget_display.cpp 的 AmountInYuan），所以**凡链接 widget_display.cpp 的目标**
+# 都要一并链接 fx_rate.cpp 与它用的传输层。这些探针一个请求都不发（winhttp 只是符号
+# 依赖）：裸跑仍然零 socket，与 apiprobe/fxprobe 的 --live 那一套区分一致。
+target_link_libraries(tauprobe PRIVATE winhttp)
 
 # api probe: balance endpoint transport + parsing + error routing, with an offline case
 # runner. Same shape as coordprobe above; winhttp is the only extra library.
@@ -111,9 +116,10 @@ target_include_directories(ratebaseline PRIVATE src)
 # the seam between the two, and neither storeprobe nor rateprobe can see across it.
 # It reaches the display layer through the real file door (Save -> SetCurveStorePath ->
 # Load), writes only to %TEMP%, and opens no socket.
-add_executable(panelprobe tools/panelprobe.cpp src/widget_display.cpp src/heartbeat.cpp src/state_machine.cpp src/amount.cpp src/curve_store.cpp src/json_min.cpp src/rate_estimator.cpp)
+add_executable(panelprobe tools/panelprobe.cpp src/widget_display.cpp src/heartbeat.cpp src/state_machine.cpp src/amount.cpp src/curve_store.cpp src/json_min.cpp src/rate_estimator.cpp src/fx_rate.cpp src/http_get.cpp)
 target_compile_definitions(panelprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(panelprobe PRIVATE src)
+target_link_libraries(panelprobe PRIVATE winhttp)
 
 # close probe: the shutdown flow's state machine (src/widget_display.cpp -- ShutdownEnter /
 # ShutdownClick / ShutdownCancel / ShutdownFloorRatio / ShutdownJitterAt).
@@ -124,9 +130,10 @@ target_include_directories(panelprobe PRIVATE src)
 #   (--shutdown-test=1 --shutdown-enter-at=75) stays the end-to-end counterpart.
 # ★ It links the display layer (like panelprobe) and renders nothing: the numbers it checks are
 #   exactly what the renderer is handed (R, colour, beat amplitude/period, jitter, curve layer).
-add_executable(closeprobe tools/closeprobe.cpp src/widget_display.cpp src/heartbeat.cpp src/state_machine.cpp src/amount.cpp src/curve_store.cpp src/json_min.cpp src/rate_estimator.cpp)
+add_executable(closeprobe tools/closeprobe.cpp src/widget_display.cpp src/heartbeat.cpp src/state_machine.cpp src/amount.cpp src/curve_store.cpp src/json_min.cpp src/rate_estimator.cpp src/fx_rate.cpp src/http_get.cpp)
 target_compile_definitions(closeprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(closeprobe PRIVATE src)
+target_link_libraries(closeprobe PRIVATE winhttp)
 
 # beat probe: the heartbeat displacement waveform (src/heartbeat.h/.cpp) -- envelope shape,
 # per-frame jump, the amplitude and period laws, and the timer's trigger behaviour.
@@ -172,7 +179,22 @@ target_link_libraries(dragprobe PRIVATE shell32 ole32)
 #   menu's single item DOES -- one cmd reaches Fired in one shot (T20). That claim belongs to
 #   the menu contract, and a fresh process is the only place where the shutdown state is
 #   naturally Off, i.e. the state the user is in when they click 关闭.
-add_executable(trayprobe tools/trayprobe.cpp src/tray.cpp src/tray.rc src/widget_display.cpp src/heartbeat.cpp src/state_machine.cpp src/amount.cpp src/curve_store.cpp src/json_min.cpp src/rate_estimator.cpp)
+add_executable(trayprobe tools/trayprobe.cpp src/tray.cpp src/tray.rc src/widget_display.cpp src/heartbeat.cpp src/state_machine.cpp src/amount.cpp src/curve_store.cpp src/json_min.cpp src/rate_estimator.cpp src/fx_rate.cpp src/http_get.cpp)
 target_compile_definitions(trayprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(trayprobe PRIVATE src)
-target_link_libraries(trayprobe PRIVATE shell32 ole32 windowscodecs gdi32 user32)
+target_link_libraries(trayprobe PRIVATE shell32 ole32 windowscodecs gdi32 user32 winhttp)
+
+# money probe: "危险度 D 与曲线颜色必须按钱算" -- both inputs are the *primary* currency's
+# amount converted to yuan, compared against one 10-yuan threshold. It links the display
+# layer AND the rate module, because the bug it guards lives exactly on the seam between
+# them: the panel shows one currency while the danger reading has to be about 钱. It drives
+# the real path (Sample -> OnSample -> FeedCurve -> curve.json) and reads the colours back
+# off the file, because a curve point's colour only exists once it has been persisted.
+# ★ It writes only into %TEMP%\dshb-moneyprobe-<pid>-*.json: the owner's curve.json,
+#   config.json and fx.json are never touched.
+add_executable(moneyprobe tools/moneyprobe.cpp src/widget_display.cpp src/heartbeat.cpp
+    src/state_machine.cpp src/amount.cpp src/curve_store.cpp src/json_min.cpp
+    src/rate_estimator.cpp src/fx_rate.cpp src/http_get.cpp)
+target_compile_definitions(moneyprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_include_directories(moneyprobe PRIVATE src)
+target_link_libraries(moneyprobe PRIVATE winhttp)

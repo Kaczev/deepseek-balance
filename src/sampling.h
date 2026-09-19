@@ -46,6 +46,18 @@ struct Sample {
     std::string currency;        // "CNY" / "USD" / "" 未知
     // 响应里的全部币种条目（切换币种用）。空 = 只有 currency/total 这一条。
     std::vector<CurrencyAmount> entries;
+
+    // ---- 汇率：把**主币种金额折成元**用（危险度 D 与曲线颜色唯一的那个换算口）----
+    // ★ 为什么放在样本里：汇率是后台线程**启动时取一次**的东西（fx_rate.h），而显示层
+    //   没有网络、也不该有；"这一笔钱值多少元"是每条样本自己的属性。
+    // ★ 方向是**单向**的：这里带的是 1 USD = 多少 CNY（把美元折成元，D 要的就是这个方向）。
+    //   反方向（元 -> 美元）只有显示换算用，走 fx::Rate::ConvertAmountText，不在这里。
+    // ★ 大陆账号（主币种 CNY）**永远不看它**：元折元是恒等。于是切到 USD 显示时
+    //   危险度 / 颜色 / 心跳一点不变 —— 所有者 2026-09-19 定的口径。
+    // ★ 海外账号（主币种 USD）要的正是它；ok = false = 本会话没有汇率 =
+    //   美元折不成元（D 在那种情况下取什么值，见 widget_display.cpp 的 AdvanceAmbience）。
+    bool usdToCnyOk = false;
+    std::string usdToCnyText;    // 逐字来自响应，例如 "6.6976"
     bool isAvailable = false;
     int httpStatus = 0;          // 0 = 还没发出去（本地错误）
     bool transportOk = false;    // 请求本身是否成功到达并拿到响应

@@ -110,6 +110,22 @@ struct Rate {
 // 一律 ok=false 并把原因写进 error —— **绝不**回落到一个猜出来的汇率。
 Rate ParseRateBody(const std::string& body);
 
+// 美元金额 -> 元。**危险度那条链要的唯一方向**（tuning.h 的 kLowBalanceThresholdYuan
+// 是"10 元"，所以屏幕上显示哪个币种都得先折成这样一笔钱才谈得上低不低）。
+//
+//   ★ 与 Rate::ConvertAmountText（元 -> 美元）是相反方向，精度也**故意不同**：
+//     那个产出的是**给人看的显示量**，所以截断到分；这个是**拿去比阈值**的中间量，
+//     所以留到 1/10000 元（Amount 自己的标度）—— 先截到分会让"刚好 10 元"附近多出
+//     一分钱的误差，而那里正是 D 从 0 变成非 0 的地方。
+//   ★ 定点整数运算，不走二进制浮点（理由同 ConvertAmountText）；美元一侧直接收
+//     `Amount`（1/10000 元标度），**不经过任何十进制文本**，所以不会像 ToString2
+//     那样先截到分再乘。
+//   ★ 汇率的方向就是响应本身给的那一个（base=USD&symbols=CNY 读出来的是"1 美元 =
+//     多少元"），所以这个方向**不需要**再发一次请求，也没有改"一个会话只取这一次"的时机。
+//   ★ 返回 false = 算不出来：汇率文本读不出来、汇率不是正数、乘出来会溢出。
+//     调用方必须把它当成"折不成元"，**绝不**回落到一个猜出来的值。
+bool UsdAmountToYuan(Amount usd, const std::string& usdToCnyText, Amount* outYuan);
+
 // 取一次汇率。**同步、会阻塞调用线程**：它必须从 BalanceSource 的后台线程里调，
 // 绝不能在 UI 线程上调（一次 400 ms 的请求就是几十帧）。
 Rate FetchRate(const RateEndpoint& endpoint);

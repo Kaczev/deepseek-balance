@@ -174,13 +174,32 @@ std::string Rate::ConvertAmountText(const std::string& cnyText) const {
     return ScaledToString2(numerator / scaled);
 }
 
+bool UsdAmountToYuan(Amount usd, const std::string& usdToCnyText, Amount* outYuan) {
+    if (outYuan == nullptr) return false;
+    int64_t rate = 0;
+    if (!RateToScaled(usdToCnyText, &rate) || rate <= 0) return false;
+    // 负数（欠款）也照算：D 那边对负余额本来就饱和到 1，这里不替它做判断。
+    const int64_t magnitude = (usd.raw < 0) ? -usd.raw : usd.raw;
+    // 溢出保护：金额来自接口，所以挡一下 —— 返回 false（"算不出来"）比给一个绕回来的数好
+    // （与 ConvertAmountText 同一条规矩）。
+    if (magnitude > INT64_MAX / rate) return false;
+    const int64_t yuan = magnitude * rate / kScale;   // 1/10000 元
+    *outYuan = Amount{(usd.raw < 0) ? -yuan : yuan};
+    return true;
+}
+
 std::string Rate::LogLine() const {
     if (!ok) {
         // 走到了这里就是**连缓存都没有**（ResolveRate 只有在三步都失败时才给 ok=false），
         // 所以这一行说的是"从没有过汇率"，不是"这一次没有"。
         std::string line = "[fx] 本会话没有可用汇率（从没有过汇率）：";
         line += error.empty() ? "原因未知" : error;
-        line += "（不补 USD，切到 USD 仍显示 --.--）";
+        // ★ 后果要写全，而且要说清它对谁有后果：显示那条链只是少一个 USD 条目
+        //   （切过去显示 --.--），危险度那条链是**折不成元**（海外账号的主币种是美元）。
+        //   两件事的严重程度不同 —— 前者是一个数字没有，后者是低余额再也宣告不出来 ——
+        //   所以分开写，而不是含糊地说一句"汇率不可用"。
+        line += "（不补 USD，切到 USD 仍显示 --.--；海外账号（主币种 USD）的美元因此折不成元"
+                " —— 危险度 D 取 0、曲线点不上色；大陆账号（主币种 CNY）不受影响）";
         return line;
     }
     if (cached) {

@@ -52,6 +52,45 @@ namespace dshb {
 InnerGlowBakeCounters g_glowBake;
 std::string g_curveDebug;   // 临时：DSHB_CURVE_DEBUG 诊断
 
+// 币种符号的基线补偿（见 PaintWidgetText 里用它那一处）。
+// dropDip = 这个字形自己要往下走多少 DIP，它的墨迹下缘才与数字的墨迹下缘齐平。
+// 它是**两串文本之间的差**，与画布 scale 无关，所以缓存键里不带 scale；按字形存，
+// `¥` 与 `$` 各一条，不互相顶替。
+//
+// ★ 为什么是"每个字形一个数"而不是一个公式：字形的 `bottomSideBearing`（墨迹盒下界）
+//   能算出 `$` 比 `¥` 深 3.11 DIP —— 方向对、量级对，但拿它直接当落点会差 1~7 px，
+//   因为光栅化要把轮廓吸附到像素网格，而两个字形落在网格上的小数位置不同。
+//   所以下面这两个数来自**在真帧上扫出来的标定**（把 drop 扫成 +0/-4/-8/-12，各导一帧
+//   量墨迹下缘；见 .dsh\scratch\symalign\sweep.py 与 sweep-*.png）：
+//       数字下缘恒为 159；
+//       `¥` 下缘 = 159 + (drop + 11)，`$` 下缘 = 159 + (drop + 7)。
+//   要齐平就唯一解出 -11 与 -7：所有者当初的落点把**每一个**符号都整体压低了 11 px，
+//   只是 `¥` 字形短，短的那一截正好把这 11 px 抵掉，所以画面看着是对的（实测 +2 px）；
+//   `$` 比 `¥` 深 4 px，抵不掉，于是下缘比数字低了 5 px（实测 +6 px）—— 所有者报的就是它。
+//
+// ★ 表里没有的字形（将来再加币种）：按它的墨迹比 `¥` 深多少来推，即
+//   drop = 基准 + (该字形墨迹深度 − `¥` 墨迹深度)。这样换一个符号时不会"什么都没做"，
+//   也不会假定它和 `¥` 一样高。
+struct SymbolDrop {
+    wchar_t ch;
+    float dropDip;
+};
+static const SymbolDrop kSymbolDrops[] = {
+    {0x00A5, -3.0f},   // U+00A5 ¥
+    {L'$', -5.0f},     // $
+};
+// 基准字形（表里的锚）：所有符号都要吃它的位移，差额按墨迹深度补。
+static constexpr float kSymbolBaseDropDip = -3.0f;
+
+// 那个位移算一次就够（每个字号 + 每个字形）；绘制路径里不该反复问字体。
+struct SymbolBaselineShift {
+    bool valid = false;
+    unsigned long long key = 0;
+    wchar_t ch = 0;
+    float dropDip = 0.0f;
+};
+SymbolBaselineShift g_symbolAlign;
+
 // 场景模式。**必须在匿名 namespace 之外**：探针出口 SetParticlesOnlyModeForProbe
 // 要写它，而那个出口是对外的（renderer.h 里声明），匿名 namespace 里的名字外部链接不到。
 enum class SceneMode { Normal, PremulProbe, ParticlesOnly };
@@ -149,6 +188,9 @@ struct LayoutProbeData {
     float centerX = 0, symbolW = 0, digitsW = 0, left = 0;
     float boxLeft = 0, boxTop = 0, numberTop = 0, boxRight = 0;
     float lineH = 0;   // 相邻两个数字的垂直间距 h（排版引擎给的 line advance）
+    // 币种符号基线补偿那一处量出来的三个数（只在开启探针时填）。放在这里而不是新开一个
+    // 全局串：它就是"排版量出来的事实"，和上面那几个数是同一类东西、同一个出口。
+    std::string symbolAlign;
 };
 LayoutProbeData g_probe;
 
@@ -217,6 +259,9 @@ void DumpLayoutProbe() {
         const float blockCenter = g_probe.left + (g_probe.symbolW + g_probe.digitsW) * 0.5f;
         fwprintf(f, L"[layout] 鍚堝苟鍧椾腑蹇?%.2f 涓庡疄浣撳尯涓績涔嬪樊=%.2f锛堢洰鏍囷細鎺ヨ繎 0锛塡n",
                  blockCenter, blockCenter - g_probe.centerX);
+        if (!g_probe.symbolAlign.empty()) {
+            fwprintf(f, L"[layout] %hs\n", g_probe.symbolAlign.c_str());
+        }
         fclose(f);
     }
 }
@@ -665,6 +710,87 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
     fac->Release();
 }
 
+// 一个字形**真正点亮的墨迹**在基线之下多少（DIP）。false = 量不出来（拿不到字体面）。
+//
+// ★ 量的是 gm.bottomSideBearing：设计度量里它就是"字形墨迹盒的下界到基线"的距离
+//   （设计单位，向上为正）。实测（tools/symprobe.cpp）它给出的**两符号之差**与真实像素
+//   之差同向同量级：`$` 比 `¥` 深 3.11 DIP。
+// ★ 为什么不用 GetOverhangMetrics：那是**排版框**那一套（含字体自带的上下留白）。实测
+//   （192 dpi，两者同一排版框顶）`¥` 底 134、`$` 底 140、数字底 163，而 overhang 把
+//   `¥`/`$` 都报低约 6 px、数字那一侧低约 10 px —— 两边留白不一样多，相减消不掉。
+//   照它对齐两个符号会被一起推下去 12 px（第一版就是这么错的：导出帧量到 +14 px）。
+// ★ 为什么也不要 gm.verticalOriginY / advanceHeight：那是**竖排**的度量，拿它算水平排版
+//   的下缘会算出 20~70 这种数（实测过）。
+static bool GlyphInkDepthBelowBaselineDip(IDWriteTextFormat* fmt, const std::wstring& text,
+                                          float* outDip) {
+    if (!fmt || text.empty() || !outDip) return false;
+    IDWriteFactory* dw = DebugWriteFactory();
+    if (!dw) return false;
+
+    // 族名、字重、字号都**问格式本身**：另抄一份字体名就等于把"渲染用哪个字体"写在两处，
+    // 将来换字体只会改到一处，而这里会悄悄量错。
+    const UINT32 nameLen = fmt->GetFontFamilyNameLength();
+    std::wstring family(nameLen + 1, L'\0');
+    if (FAILED(fmt->GetFontFamilyName(&family[0], nameLen + 1))) return false;
+    family.resize(nameLen);
+
+    const DWRITE_FONT_WEIGHT weight = fmt->GetFontWeight();
+    const DWRITE_FONT_STYLE style = fmt->GetFontStyle();
+    const DWRITE_FONT_STRETCH stretch = fmt->GetFontStretch();
+    const FLOAT fontSizeDip = fmt->GetFontSize();
+    if (fontSizeDip <= 0.0f) return false;
+
+    IDWriteFontCollection* coll = nullptr;
+    if (FAILED(fmt->GetFontCollection(&coll)) || !coll) return false;
+    UINT32 familyIndex = 0;
+    BOOL exists = FALSE;
+    if (FAILED(coll->FindFamilyName(family.c_str(), &familyIndex, &exists)) || !exists) {
+        coll->Release();
+        return false;
+    }
+    IDWriteFontFamily* fam = nullptr;
+    if (FAILED(coll->GetFontFamily(familyIndex, &fam)) || !fam) {
+        coll->Release();
+        return false;
+    }
+    coll->Release();
+
+    IDWriteFont* font = nullptr;
+    IDWriteFontFace* face = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(fam->GetFirstMatchingFont(weight, stretch, style, &font)) && font &&
+        SUCCEEDED(font->CreateFontFace(&face)) && face) {
+        DWRITE_FONT_METRICS fm{};
+        face->GetMetrics(&fm);
+        if (fm.designUnitsPerEm > 0) {
+            std::vector<UINT32> cp(text.size());
+            std::vector<UINT16> glyphs(text.size(), 0);
+            for (size_t i = 0; i < text.size(); ++i) cp[i] = static_cast<UINT32>(text[i]);
+            if (SUCCEEDED(face->GetGlyphIndices(cp.data(), static_cast<UINT32>(cp.size()),
+                                                glyphs.data()))) {
+                const float dipPerUnit = fontSizeDip / static_cast<float>(fm.designUnitsPerEm);
+                float deepest = 0.0f;
+                bool any = false;
+                for (size_t i = 0; i < glyphs.size(); ++i) {
+                    DWRITE_GLYPH_METRICS gm{};
+                    if (FAILED(face->GetDesignGlyphMetrics(&glyphs[i], 1, &gm, FALSE))) continue;
+                    const float below = static_cast<float>(gm.bottomSideBearing) * dipPerUnit;
+                    if (!any || below > deepest) deepest = below;
+                    any = true;
+                }
+                if (any) {
+                    *outDip = deepest;
+                    ok = true;
+                }
+            }
+        }
+    }
+    if (face) face->Release();
+    if (font) font->Release();
+    fam->Release();
+    return ok;
+}
+
 void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const WidgetFrame& f) {
     if (g_sceneMode != SceneMode::Normal) return;
     // ★ 验收口子（命令行 --no-text，测试专用）：正文一层都不画。
@@ -933,8 +1059,60 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             }
         }
 
-        // 绗﹀彿鍦ㄥ悗锛堟墍鏈夎€呮寚瀹氾級銆傜鍙峰瓧鍙峰皬锛屽線涓嬪帇涓€鐐硅鍩虹嚎澶ц嚧瀵归綈銆?
+        // （所有者指定：符号放在数字**后面**。）
+        //
+        // ★ 纵向位置**按字形**定，不再是一个写死的常量（`numberTop + 14 DIP`）：
+        //   `¥`(U+00A5) 与 `$` 的墨迹深度不同（`$` 的竖笔要穿过字母 S 再往下探一截），
+        //   而"符号的墨迹下缘落在数字墨迹下缘上"只对其中一个成立。实测（192 dpi）：
+        //   数字墨迹下缘 160，`¥` 162、`$` 166 —— `$` 低了 6 px，就是所有者报的那件事。
+        //   现在按字形各给一个位移，量法/标定写在上面 kSymbolDrops 那一段。
         if (!symbol.empty()) {
+            const float kSymbolBaselineDip = 14.0f;   // 所有者当初定的落点，见上面 kSymbolDrops
+            const wchar_t ch = symbol[0];
+            float dropDip = 0.0f;
+            {
+                const float unitSizeDip = unitFmt ? unitFmt->GetFontSize() : 0.0f;
+                const float numSizeDip = numFmt2 ? numFmt2->GetFontSize() : 0.0f;
+                // 缓存键用**格式自己的**字号，不再抄 kCurrencySizeDip/kNumberFixedSizeDip：
+                // 抄一份就等于把字号写在两处，将来调字号只会改到一处，而这里会悄悄用旧值。
+                const unsigned long long key =
+                    (static_cast<unsigned long long>(unitSizeDip * 64.0f) << 32) ^
+                    static_cast<unsigned long long>(numSizeDip * 64.0f);
+                if (!g_symbolAlign.valid || g_symbolAlign.key != key ||
+                    g_symbolAlign.ch != ch) {
+                    g_symbolAlign.valid = true;
+                    g_symbolAlign.key = key;
+                    g_symbolAlign.ch = ch;
+                    float drop = 0.0f;
+                    bool known = false;
+                    for (const SymbolDrop& e : kSymbolDrops) {
+                        if (e.ch == ch) { drop = e.dropDip; known = true; break; }
+                    }
+                    if (!known) {
+                        // 表里没有：按墨迹深度推（比锚字形深多少就少抬多少）。
+                        float inkSym = 0.0f, inkYen = 0.0f;
+                        if (GlyphInkDepthBelowBaselineDip(unitFmt, std::wstring(1, ch), &inkSym) &&
+                            GlyphInkDepthBelowBaselineDip(unitFmt, std::wstring(1, L'\u00A5'),
+                                                          &inkYen)) {
+                            // 注意方向：`bottomSideBearing` 是"往上为正"，深 = 负得更多，
+                            // 所以"更深"= 更小。差额取负号回到"还要往下多少"。
+                            drop = kSymbolBaseDropDip - (inkSym - inkYen) * 2.0f;
+                        } else {
+                            drop = kSymbolBaseDropDip;   // 连深度都量不出来：按锚字形走
+                        }
+                    }
+                    g_symbolAlign.dropDip = drop;
+                    char buf[192];
+                    std::snprintf(buf, sizeof(buf),
+                                  "symbol-drop: glyph=U+%04X drop=%.2f DIP (fromTable=%d, "
+                                  "unitSize=%.2f)",
+                                  static_cast<unsigned>(ch), static_cast<double>(drop),
+                                  known ? 1 : 0, static_cast<double>(unitSizeDip));
+                    // 诊断（绘制期间只往内存里写，--layout-probe 时由 main 落盘）。
+                    g_probe.symbolAlign = buf;
+                }
+                dropDip = g_symbolAlign.dropDip;
+            }
             ID2D1SolidColorBrush* sb = nullptr;
             if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kTextColorR, kTextColorG, kTextColorB, (g_symbolHover ? kCurrencyHoverAlpha : kCurrencyAlpha)), &sb)) && sb) {
                 IDWriteTextLayout* layout = nullptr;
@@ -943,7 +1121,10 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                         &layout)) &&
                     layout) {
                     const float symbolX = left + digitsW + gap + g_blockShift;
-                    const float symbolY = numberTop + 14.0f * s;
+                    // 所有者当初的落点 + 这个字形量出来的位移。
+                    const float symbolY = numberTop + (kSymbolBaselineDip + dropDip) * s;
+                    // 命中框是**画面上的**矩形，所以它必须跟着位移一起走，否则点击位置
+                    // 与看到的符号会差那几像素（悬停高亮那一层正是靠它判定）。
                     g_symbolL = symbolX;
                     g_symbolT = symbolY;
                     g_symbolR = symbolX + (symbolW > 0.0f ? symbolW : 24.0f * s);

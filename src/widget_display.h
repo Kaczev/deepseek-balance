@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "amount.h"           // Amount（AmountInYuan 的入参：主币种的一笔钱）
 #include "heartbeat.h"        // 心跳位移（E 段）：纯函数，状态由本层保管
 #include "rate_estimator.h"
 #include "roll_axis.h"
@@ -62,6 +63,18 @@ double StepPerMinute(double previousYuan, double currentYuan, double dtSeconds);
 //  G <= 0 -> 返回 0（不做除法，"E 蒙光.md" §3.3）。
 //  余额为 0 或负 -> 饱和到 1。
 double BalanceDepth(double balanceYuan);
+
+// 一笔**主币种**的金额值多少元。
+// ★★ 这是 D（危险度）与曲线颜色**共用的唯一换算口**：屏幕上显示哪个币种与它无关 ——
+//    "这笔钱低不低"只跟钱有关，阈值统一是 kLowBalanceThresholdYuan = 10 元。
+//      · "CNY"：恒等（1 元 = 1 元），**不看汇率**。大陆账号因此永远不需要汇率，
+//        切到 USD 显示时 D / 颜色 / 心跳逐位不变（所有者 2026-09-19 的口径）。
+//      · "USD"：× 启动时取到的那一次 USD->CNY 汇率（fx_rate.h 的 UsdAmountToYuan）。
+//      · 其他币种 / USD 而没有汇率 / 文本读不出来 -> 返回 false，*outYuan 不动。
+//        "不知道"绝不当成"安全"或"危险"中的哪一个 —— 由调用方各自决定（D 取 0，
+//        理由写在 widget_display.cpp 的 AdvanceAmbience 里）。
+bool AmountInYuan(const std::string& currency, const Amount& amount,
+                  const std::string& usdToCnyText, bool usdToCnyOk, double* outYuan);
 
 // ---- 颜色管线 ----
 // 第一步：氛围初色 C_0 —— 两段 RGB 线性插值（不动饱和度）。
@@ -176,6 +189,9 @@ public:
     //   数据里算出来的那个值（= 刷新时 R 应当跳到的高度）由 ambienceRatioTarget() 给。
     // 本帧刷新的目标高度：clamp(min{max(s, 2B), 0} / 2B, 0, 1)，s = 最近一步的元/分钟。
     double ambienceRatioTarget() const { return ambienceRatioTarget_; }
+    // 本帧的 D。★ 它的输入是**主币种余额折成元**（AmountInYuan），不是屏幕上那个币种的
+    //   数字 —— 所以点击币种符号切换显示时它逐位不变（所有者 2026-09-19 的口径）；
+    //   折不成元（海外账号 + 没有汇率）时它是 0（理由见 .cpp 的 AdvanceAmbience）。
     double ambienceDepth() const { return ambienceDepth_; }
     // 本帧**应当显示**的低余额程度（含"读不到余额按 D=1"这条状态规则）。
     double ambienceDepthShown() const { return depthShown_; }
@@ -253,6 +269,16 @@ private:
     std::string currencyShown_;                     // 当前显示的币种
     std::vector<CurrencyAmount> lastEntries_;       // 最近一次样本的条目（切换时要用金额）
     double lastSwitchTarget_ = -1.0;
+
+    // ---- D 的输入：**本帧主币种余额折成元**（见 AmountInYuan 与 .cpp 的 AdvanceAmbience）----
+    // ★ 它**不随显示币种变**：切币种改的只是屏幕上的数字与符号，同一笔钱只有一个 D。
+    //   这一条就是所有者 2026-09-19 报的那个 bug 的反面：原来 D 吃的是 `value_`
+    //   （显示币种的数），显示 USD 时 "$2.81" 被当成"¥2.81"去比 10 元阈值。
+    // ★ 只有 OnSample 会写它（换算需要样本带来的汇率）；SelectCurrency **不许**碰它。
+    // ★ primaryYuanOk_ = false 表示折不成元（海外账号 + 没有汇率，或主币种那一笔读不出来）：
+    //   AdvanceAmbience 据此取 D = 0，理由写在那个函数里。
+    double primaryYuan_ = 0.0;
+    bool primaryYuanOk_ = false;
 
     // 这一段的起点值，用于自检报告"走了多少比例"
     double rollFromValue_ = 0.0;

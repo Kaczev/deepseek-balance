@@ -2,6 +2,7 @@
 
 #include "amount.h"        // Amount / ParseAmount：纵坐标从十进制原文解析，不用二进制浮点
 #include "curve_store.h"
+#include "fx_rate.h"       // UsdAmountToYuan：把美元主币种的余额折成元（D 与曲线颜色走它）
 
 #include <windows.h>   // WideCharToMultiByte（把宽路径转成数据层要的 UTF-8）   // CurveStore：12 点环形、只记变化、curve.json（规格 §2）
 
@@ -153,6 +154,39 @@ bool AmbienceSelfTest(std::string* report) {
 }
 
 // ===========================================================================
+// **一笔钱值多少元**：D 与曲线颜色唯一的那个换算口
+// ===========================================================================
+//  ★★ 为什么必须有这一个口（所有者 2026-09-19 报的 bug 的根）：
+//     "危险度"锚在**钱**上 —— 阈值统一是 10 元（tuning.h 的 kLowBalanceThresholdYuan），
+//     而屏幕上那个数字是**显示币种**的数。两者只有在"主币种恰好就是显示币种"时才相等，
+//     于是显示 USD 时 "$2.81" 被当成"¥2.81"去比 10 元：D 从 0 变成 0.72，而且门槛实际
+//     变成了"10 美元"（余额再低一点就满值）—— 同一笔钱，两个结论。曲线点的颜色也一样，
+//     它当时也是拿"第一个可用条目"（海外账号就是美元那个数）去算的。
+//     ⇒ 一个换算口：D（AdvanceAmbience）与曲线颜色（FeedCurve 的回填）都只经过这里。
+//
+//  ★ 汇率从样本里来（Sample::usdToCnyOk / usdToCnyText），因为它是后台线程**启动时取
+//     一次**的东西（fx_rate.h）：显示层没有网络、也不该有。
+//  ★ 大陆账号（主币种 CNY）走恒等那一条，**根本不看汇率** —— 所以没有汇率的会话里，
+//     大陆账号的 D / 颜色 / 心跳一切照旧，切到 USD 显示也逐位不变。
+//  ★ 折不成元时返回 false 而**不猜**：调用方各自决定"不知道"怎么表示（这里取 D = 0）。
+bool AmountInYuan(const std::string& currency, const Amount& amount,
+                  const std::string& usdToCnyText, bool usdToCnyOk, double* outYuan) {
+    if (outYuan == nullptr) return false;
+    if (currency == "CNY") {              // 元折元：恒等，与汇率无关
+        *outYuan = amount.ToDouble();
+        return true;
+    }
+    if (currency == "USD") {
+        if (!usdToCnyOk) return false;    // 海外账号 + 没有汇率 -> 折不成元
+        Amount yuan{};
+        if (!fx::UsdAmountToYuan(amount, usdToCnyText, &yuan)) return false;
+        *outYuan = yuan.ToDouble();
+        return true;
+    }
+    return false;                         // 不认识的币种：不猜它值多少元
+}
+
+// ===========================================================================
 // 氛围曲线的显示状态（规格 §3）
 // ===========================================================================
 // 数据层（curve_store.h）已经定死了"记什么"：只有值变了才追加一个点、容量 12、
@@ -169,13 +203,15 @@ CurveStore g_curveStore;
 // 余额 + 剧烈程度 -> 氛围颜色（"E 蒙光.md" §3）：两个输入都用**那一刻**的值
 // ---------------------------------------------------------------------------
 //  ★ 存进曲线点的颜色 = V(R_new, D)，其中：
-//      D     = 那个点的余额算出来的死态程度（余额的纯函数，可精确复原）；
+//      D     = 那个点的**主币种余额折成元**算出来的死态程度（纯函数，可精确复原）；
 //      R_new = **追加这个点的那一刻新算出来的剧烈程度**（所有者 2026-09-18 的口径：
 //              "R_new。只不过如果它没有原本的 R 大，就会被盖掉而已"）。
 //    ★ 注意它**不是** R(t)：R(t) 是每帧衰减的实时量（内蒙光用那个），曲线点存的是
 //      "那一刻有多陡"这个事件量。两者在刷新那一刻数值相同，之后 R(t) 会自己凉下去。
 //  ★ 为什么调用方要把 R_new 传进来、而不是在这里自己算：它得读曲线存储（"这个点与
 //    上一个点"），而这里只拿得到余额。调用方（FeedCurve）拿得到存储，所以由它算。
+//  ★ `balanceYuan` 必须是**折成元之后**的数（AmountInYuan），不是屏幕上的币种数字：
+//    同一个函数喂美元数进去，就是"$2.81 当成 ¥2.81"那个 bug（详见 AmountInYuan）。
 AmbienceColor BalanceColorAt(double balanceYuan, double ratio) {
     const double depth = BalanceDepth((balanceYuan < 0.0) ? 0.0 : balanceYuan);
     return AmbienceTargetColor(ratio, depth);
@@ -569,13 +605,28 @@ void FeedCurve(const Sample& s) {
     const double stepIntoNewest = StepIntoNewestPointPerMinute();
     // 回填：把"终止于最新那个点的那一步"的颜色写到**它的前一个点**上 —— 那一段就是这一步。
     // 颜色里的余额用前一个点自己的值（D 要按它自己的余额算，不能用最新那个点的）。
+    // ★★ 余额取**主币种那一笔**，并且与 D 走**同一个换算口**（AmountInYuan）：
+    //    以前这里取的是"第一个可用条目"，主币种恰好写在第一条时它碰巧是对的 ——
+    //    而海外账号的第一条是 USD，那个美元数字会被当成元去比 10 元阈值，
+    //    于是曲线的颜色与"危险度"讲的是两件事（同一笔钱两个结论）。
+    //    现在按**名字**取（名字取自本帧样本的主币种，与数据层判定"变没变"用的是同一个），
+    //    取不到就**不上色**（点保持"没有颜色"，渲染层用它右边那个点的颜色画），绝不编造。
+    //    ★ 为什么用本帧样本的主币种而不是"那个点自己的主币种"：存储点里**没有**记这个
+    //      名字（curve.json 只存条目），而一个会话里所有点的主币种都是同一个 ——
+    //      接口换主币种时，上一个点与这一个点之间本来就没有可比性。
     {
         const std::vector<CurveStorePoint> pts = g_curveStore.Points();
         if (pts.size() >= 2) {
-            Amount prevAmount;
-            if (CurveValueOfEntry(pts[pts.size() - 2], &prevAmount)) {
-                g_curveStore.SetColorOfPrevNewest(HexOf(
-                    BalanceColorAt(prevAmount.ToDouble(), SeverityRatio(stepIntoNewest))));
+            const CurveStorePoint& prevPoint = pts[pts.size() - 2];
+            const CurveStorePoint::Entry* primary = prevPoint.Find(obs.primaryCurrency);
+            Amount prevAmount{};
+            double prevYuan = 0.0;
+            if (primary != nullptr && !primary->missing && !primary->text.empty() &&
+                ParseAmount(primary->text, &prevAmount) &&
+                AmountInYuan(obs.primaryCurrency, prevAmount, s.usdToCnyText, s.usdToCnyOk,
+                             &prevYuan)) {
+                g_curveStore.SetColorOfPrevNewest(
+                    HexOf(BalanceColorAt(prevYuan, SeverityRatio(stepIntoNewest))));
             }
         }
     }
@@ -951,6 +1002,28 @@ void DisplayedAmount::OnSample(const Sample& s) {
         zeroConfirmed_ = false;
     }
 
+    // ---- D 的输入：**主币种余额折成元**（见 AmountInYuan 与 AdvanceAmbience 第 3 步）----
+    // ★ 主币种 = 接口的**第一个条目**（数据层判定"变没变"用的就是它，见 curve_store.h）；
+    //   没有条目时退回 Sample::currency/total（模拟数据源就是这种形状，币种是 CNY）。
+    //   ★ 它**不一定**等于屏幕上显示的那个币种：切币种只改显示，不该改危险度 ——
+    //     所以这一段算完就放着，SelectCurrency 一个字节都不碰它。
+    // ★ 换算在这里做一次（汇率只在样本里出现），AdvanceAmbience 每帧只读结果。
+    // ★ 主币种那一笔读不出来时不回落到别的条目：那是另一个数字（这里要的是"这一笔钱
+    //   多少元"，不是"随便找得到的某个数"）—— 换算失败就是 primaryYuanOk_ = false，D 取 0。
+    {
+        Amount primaryAmount = s.total;
+        bool haveAmount = s.amountsOk;
+        const std::string primaryCurrency =
+            !s.entries.empty() ? s.entries.front().currency : s.currency;
+        if (!s.entries.empty()) {
+            haveAmount = s.entries.front().ok;
+            primaryAmount = s.entries.front().total;
+        }
+        primaryYuanOk_ = haveAmount && AmountInYuan(primaryCurrency, primaryAmount, s.usdToCnyText,
+                                                    s.usdToCnyOk, &primaryYuan_);
+        if (!primaryYuanOk_) primaryYuan_ = 0.0;
+    }
+
     // ★ 目标值直接改写（可以突变），显示值照旧慢慢追——这就是设计里那句
     //   "变量可以突变，但要套一个显示变量，那个显示变量是逐渐变化、跟着那个突变变量的"。
     //   起点值只记来给自检报告"走了多少比例"，不参与计算。
@@ -1169,8 +1242,11 @@ double DisplayedAmount::Update(double dtSeconds) {
     AdvanceRate(dtSeconds);       // 消耗速率（§7.3）：每帧重算 + 走一步弹簧
     const double shown = UpdateValue(dtSeconds);
     AdvancePlaces(dtSeconds, TextToShow());
-    // 氛围放在**显示值之后**：D 用的是"这一刻屏幕上那个数字"，而文字/轮子
-    // 刚刚在本帧落位；先算氛围会用上一帧的余额，D 就慢半拍。
+    // 氛围放在**显示值之后**：R 那一半要读本帧刚推完的状态（心跳、蒙光都接在它后面），
+    // 而且"这一帧的 R/D/颜色"必须是在文字与轮子都落位之后才定下来 —— 先算会用上一帧的
+    // 状态，屏幕上就会出现"数字已经变了、颜色还差一拍"。
+    // ★ D 自己**不**读屏幕上的数字（它读主币种折元后的余额，见 AdvanceAmbience 第 3 步）：
+    //   所以它在切币种时不跟着符号走 —— 那正是所有者 2026-09-19 报的那个 bug。
     AdvanceAmbience(dtSeconds);
     return shown;
 }
@@ -1182,7 +1258,9 @@ double DisplayedAmount::Update(double dtSeconds) {
 //   数据刷新时     R_new = clamp( min{ max(s, 2B), 0 } / (2B), 0, 1 )
 //                  若 R_new > R(t)  ->  t = ln(R_new) / ln(a)
 //   画到屏幕上     C = DesaturateTowards( AmbienceBase(R_display), D )     ← 没有缓动
-//                  D = clamp( (G − 余额) / G, 0, 1 )                        ← 瞬时量
+//                  D = clamp( (G − 主币种余额折元的数) / G, 0, 1 )          ← 瞬时量
+//                  ★ 阈值 G 统一是 10 元：切显示币种不改 D（见 AmountInYuan）。
+//                    折不成元（海外账号 + 没有汇率）时 D = 0，理由见下面第 3 步。
 //   t 的起点        进程刚起、一步都还没量到时 **R = 0**（不是 a^0 = 1）：
 //                  t 只在第一次真的量出一步（R_new > 0）时才开始走。
 //
@@ -1250,11 +1328,25 @@ void DisplayedAmount::AdvanceAmbience(double dtSeconds) {
     //   而"下限没生效"会被它掩盖成一个看起来正确的数（本项目删掉过两次这种补丁）。
     ambienceRatio_ = ambienceClockValid_ ? std::pow(kAmbienceDecayA, ambienceSeconds_) : 0.0;
 
-    // ---- 3) D：余额的纯函数，**不加时间平滑** ----
-    //  ★ 用**本帧屏幕上那个数字**（value_ 由本帧的 UpdateValue/AdvancePlaces 刚推完）：
-    //    D 说的是"现在还看得见的那个数有多低"。目标值只在清零预估那一行用。
-    const double shownYuan = (value_ < 0.0) ? 0.0 : value_;
-    ambienceDepth_ = BalanceDepth(shownYuan);
+    // ---- 3) D：**主币种余额折成元**的纯函数，与屏幕上显示哪个币种无关 ----
+    // ★★ 这是所有者 2026-09-19 报的那个 bug 的根：这一行原来喂的是 `value_`
+    //    （屏幕上那个币种的数），于是显示 USD 时危险度被按"10 美元"这条线重算：
+    //    $2.81 给出 0.72（同一天、同一笔钱在 CNY 下是 0），再低一点就满值 ——
+    //    颜色、内蒙光、心跳跟着一起变。D 锚在"钱"上：同一笔钱只有一个 D，
+    //    切币种只换数字与符号，阈值统一 10 元。
+    // ★ 数的来源是 OnSample 存下的 `primaryYuan_`（主币种金额折成元，见 AmountInYuan），
+    //    **不是** value_：value_ 是显示币种的数，还跟着轮子滚。
+    // ★ 折不成元（海外账号 + 没有汇率，或主币种那一笔读不出来）时取 **D = 0**：
+    //    这是一个"不知道"，而不知道不该被假装成"安全"或"危险"中的哪一个。选 0 而不是 1：
+    //    D 唯一的作用是**宣告低余额**（降饱和 + D = 1 的冷白光 + 让心跳变慢），
+    //    而我们没有任何依据说这个账户余额低 —— 凭"我们没有汇率"去点亮一个危险信号，
+    //    会让真正的危险信号贬值。这一条与"余额读不到"（那条仍是 D = 1，见 ApplyShownState
+    //    与 §7.1）不同：这里余额看得见，只是折不成元。
+    //    ★ 这件事本身在启动日志里有一行（fx_rate.cpp 的 LogLine：没有汇率时写明
+    //      "海外账号的美元折不成元 -> 危险度 D 取 0"）—— 显示层自己不写日志，
+    //      而"这个数没有来源"必须能被人看出来。
+    // ★ 与"低余额有多低"的连续性无关：D 本来就是瞬时量（余额一刷新就到位）。
+    ambienceDepth_ = primaryYuanOk_ ? BalanceDepth(primaryYuan_) : 0.0;
 
     // ---- 4) 状态规则 ----
     //  读不到余额（数字显示 --.--）：R 与 D 都喂极端值，而不是"保留上一帧"。

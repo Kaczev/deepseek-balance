@@ -71,6 +71,17 @@ Sample MakeSample(const api::BalanceResult& r, const fx::Rate& rate) {
         }
         s.entries.push_back(ca);
     }
+    // ---- 汇率原样带上（**折成元那个方向**：危险度 D 与曲线颜色唯一的换算口）----
+    // ★ 这是 `rate` 的第二个用处，而且方向相反：InjectUsdCounterpart 用它把元折成美元
+    //   （显示用，截断到分）；这里把"1 美元 = 多少元"逐字带给样本，供 fx::UsdAmountToYuan
+    //   把美元折回元。
+    // ★ 两者是**同一个响应**里的同一个数（base=USD&symbols=CNY 读出来就是美元->元），
+    //   所以不需要第二次请求；时机也没变 —— 仍然是启动时那一次（Run 的最前面）。
+    // ★ ok 逐字跟着 rate.ok：没有汇率 = "美元折不成元"，下游据此决定
+    //   （D 取什么值见 widget_display.cpp 的 AdvanceAmbience）。
+    s.usdToCnyOk = rate.ok;
+    s.usdToCnyText = rate.ok ? rate.rateText : std::string();
+
     // 只有 CNY 的账号（大陆账号）在这里多出一个 USD 条目，形状和接口给的一模一样。
     // 海外账号（已经有 USD）这条调用什么都不做，逐字段不变。
     fx::InjectUsdCounterpart(&s, rate);
