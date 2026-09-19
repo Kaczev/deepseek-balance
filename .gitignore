@@ -24,3 +24,6 @@ cmake_install.cmake
 
 # 规划与草稿
 /不入库文件/
+# 分发包里的二进制（zip/exe 会永久留在 git 历史里，不入库）
+/dist/*.exe
+/dist/*.zip
