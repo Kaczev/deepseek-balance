@@ -96,7 +96,7 @@ int g_apiTimeoutMs = 5000;
 int g_apiIntervalMs = static_cast<int>(dshb::kApiIntervalMs);   // 唯一来源：常量（曾在这里硬编码 10000，改常量无效）
 dshb::BalanceSource g_apiSource;
 
-// ---- 币种点击（只认单击；拖动与长按都不算）----
+// ---- 左键抬起的分类锚点（拖动与长按都不算点击；分类在 FinishLeftGesture）----
 int g_pressX = 0, g_pressY = 0;
 unsigned long long g_pressTick = 0;
 bool g_pressValid = false;
@@ -142,9 +142,6 @@ bool g_closeCancelPending = false;     // 点到别处 -> 取消
 const wchar_t* g_closeCancelWhy = L""; // "点到别处"
 bool g_closeRefusedPending = false;    // 粒子期间不受理输入：这一下被拒了
 bool g_closeWaitParticles = false;     // 第 3 击之后：粒子播完就退出进程
-int64_t g_lastSymClickMs = 0;      // 上次点击符号的墙钟毫秒（双击判定用）
-bool g_symbolHoverOn = false;       // 当前鼠标是否悬停在符号上
-bool g_symbolHoverTest = false;     // --symbol-hover：强制悬停（导出对比用）
 bool g_pauseTest = false;
 bool g_noCurve = false;           // --no-curve：关掉氛围曲线（A/B 对比用）
 int  g_historyDemo = 0;           // --history-demo=N：合成 N 个曲线点（导帧验证用）
@@ -358,13 +355,15 @@ const char* ConnStateNameUtf8(dshb::ConnState s) {
     }
 }
 
-// 左键"抬起"时的判定。**只认单击**：
-//   移动超过 4px  -> 算拖动，不切换
-//   按住超过 600ms -> 算长按，不切换
-// 命中测试用渲染层每帧发布的符号矩形（像素坐标）。
+// 左键"抬起"时的分类。**只有干净的单击才算点击**：
+//   移动超过 4px  -> 算拖动
+//   按住超过 600ms -> 算长按
+// ★ 现在没有任何动作挂在"干净的单击"上（"双击币种符号切换币种"那个入口已删），所以这个
+//   函数只剩分类 + 三种结果各写一行日志。它留着是因为那几行是既有的判据：--click-test
+//   的手势 1~3 与 dragprobe 的 live-drag-not-a-click 都以"真拖动一行 [click] 都不写"为据。
 
 void FinishLeftGesture(int x, int y) {
-    // 关闭态里左键的语义是"一次计数"（在 WM_LBUTTONDOWN 里已经记过），不是切换币种。
+    // 关闭态里左键的语义是"一次计数"（在 WM_LBUTTONDOWN 里已经记过），不是点击。
     // 这一句同时挡住 --click-test 那条直接调用它的路径 —— 一处判断管两条调用路径。
     if (dshb::ShutdownActive()) return;
     if (!g_pressValid) return;
@@ -374,49 +373,16 @@ void FinishLeftGesture(int x, int y) {
     const int dist2 = dx * dx + dy * dy;
     const int held = static_cast<int>(GetTickCount64() - g_pressTick);
     if (dist2 > 16) {
-        SelfTestLog(L"[click] 移动 %dpx：算拖动，不切换", static_cast<int>(std::sqrt(static_cast<double>(dist2))));
+        SelfTestLog(L"[click] 移动 %dpx：算拖动，不算点击", static_cast<int>(std::sqrt(static_cast<double>(dist2))));
         return;
     }
     if (held > 600) {
-        SelfTestLog(L"[click] 按住 %dms：算长按，不切换", held);
+        SelfTestLog(L"[click] 按住 %dms：算长按，不算点击", held);
         return;
     }
-    const dshb::SymbolRect sr = dshb::CurrencySymbolRect();
-    if (!sr.valid) return;
-    const float pad = 6.0f;
-    const bool inside = (x >= sr.l - pad && x <= sr.r + pad && y >= sr.t - pad && y <= sr.b + pad);
-    SelfTestLog(L"[click] 点(%d,%d) 符号矩形[%d,%d..%d,%d] 命中=%ls", x, y, static_cast<int>(sr.l),
-                static_cast<int>(sr.t), static_cast<int>(sr.r), static_cast<int>(sr.b),
-                inside ? L"是" : L"否");
-    if (!inside) return;
-    // ★ 双击才切换（所有者：单击太容易误触）。两次干净点击（非拖动、非长按）都要落在符号上，
-    //   且间隔不超过系统双击时间。
-    {
-        const int64_t nowMs = NowWallMs();
-        const int64_t dbl = static_cast<int64_t>(GetDoubleClickTime());
-        if (g_lastSymClickMs == 0 || (nowMs - g_lastSymClickMs) > dbl) {
-            g_lastSymClickMs = nowMs;
-            SelfTestLog(L"[click] 第一次点击符号：%.0fms 内再点一次才切换", static_cast<double>(dbl));
-            return;
-        }
-        g_lastSymClickMs = 0;
-        SelfTestLog(L"[click] 双击确认，切换");
-    }
-    const std::string next = g_display.NextCurrency();
-    if (next.empty()) {
-        SelfTestLog(L"[click] 当前只有一个币种：忽略");
-        return;
-    }
-    g_display.SelectCurrency(next);
-    const double switched = g_display.lastSwitchTarget();
-    const wchar_t* symNow = (g_display.shownCurrency() == "CNY") ? L"¥"
-                          : ((g_display.shownCurrency() == "USD") ? L"$" : L"(无)");
-    if (switched >= 0.0) {
-        SelfTestLog(L"[click] 切换 -> %hs：符号=%ls 数字=%.2f", next.c_str(), symNow, switched);
-    } else {
-        SelfTestLog(L"[click] 切换 -> %hs：符号=%ls 数字=--.--（该币种本次没有数据）",
-                    next.c_str(), symNow);
-    }
+    // 三种结果各写一行 —— 于是"一行 [click] 都没有"就等于"这个函数一次都没被调用"，
+    // dragprobe 的 live-drag-not-a-click 正是拿这条等式判"真拖动没被当成点击"的。
+    SelfTestLog(L"[click] 干净的单击：算点击");
 }
 
 // ---------------------------------------------------------------------------
@@ -428,7 +394,7 @@ void FinishLeftGesture(int x, int y) {
 //   **纯函数**，中间不累加任何状态，所以"跟手不漂"是恒等式而不是"调得好"。
 //
 // 三套坐标必须分清（混用会让窗口按 2 倍的步子跑 —— 这台机器缩放 200%）：
-//   g_pressX/Y    客户区像素，只给既有的"单击/双击切换币种"判定用，本步一行都没改它；
+//   g_pressX/Y    客户区像素，只给 FinishLeftGesture 的"拖动还是点击"分类用；
 //   g_dragAnchor  屏幕像素，按下那一刻的 光标 − 窗口左上角，拖动算术只用它；
 //   窗口与光标     屏幕像素，GetWindowRect / GetCursorPos / SetWindowPos 同一个空间。
 //
@@ -630,31 +596,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SelfTestLog(L"[pause] 解锁：立刻补一次取样");
         }
         return 0;
-    // 悬停高亮：光标进到币种符号的范围（含 6px 余量）就让符号变暗一档，离开复位。
-    // 用 TrackMouseEvent 申请 WM_MOUSELEAVE——不申请的话窗口收不到"离开"消息，
-    // 高亮会一直亮着（这类"少了配对消息"的坑很难看出来）。
-    case WM_MOUSEMOVE: {
-        const int mx = static_cast<int>(static_cast<short>(LOWORD(lp)));
-        const int my = static_cast<int>(static_cast<short>(HIWORD(lp)));
-        const dshb::SymbolRect sr = dshb::CurrencySymbolRect();
-        const bool hit = sr.valid && mx >= sr.l - 6.0f && mx <= sr.r + 6.0f &&
-                         my >= sr.t - 6.0f && my <= sr.b + 6.0f;
-        if (hit != g_symbolHoverOn) {
-            g_symbolHoverOn = hit;
-            dshb::SetSymbolHover(hit);
-        }
-        TRACKMOUSEEVENT tme{};
-        tme.cbSize = sizeof(tme);
-        tme.dwFlags = TME_LEAVE;
-        tme.hwndTrack = g_hwnd;
-        TrackMouseEvent(&tme);
+    case WM_MOUSEMOVE:
         // 跟手拖动（工作在主循环里：只挪窗口，不做任何动画、不进任何模态循环）
         UpdateDrag();
-        return 0;
-    }
-    case WM_MOUSELEAVE:
-        g_symbolHoverOn = false;
-        dshb::SetSymbolHover(false);
         return 0;
     case WM_CAPTURECHANGED:
         // 捕获被人抢走（例如系统弹了菜单）：这次拖动就到此为止，位置该存就存。
@@ -699,8 +643,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const int uy = static_cast<int>(static_cast<short>(HIWORD(lp)));
         // ★ 真拖动过的那一次**不交给**既有手势判定，而且既有判定一行都没改：
         //   窗口跟手之后，光标在**客户区**里的坐标几乎不动（窗口跟着它走），那条
-        //   "移动 > 4px 算拖动" 因此量不到位移 —— 一次拖动会被当成一次干净的点击，
-        //   双击就把币种切了。阈值与它同一个口径（4px），没有引入第二套阈值。
+        //   "移动 > 4px 算拖动" 因此量不到位移 —— 一次真拖动会被当成一次干净的点击
+        //   （拖得久一点的则被当成一次长按），于是凭空多出一行 [click]。阈值与它同一个
+        //   口径（4px），没有引入第二套阈值。
         const bool wasDragging = g_dragActive;
         EndDrag();
         if (!wasDragging) FinishLeftGesture(ux, uy);
@@ -1660,8 +1605,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             }
             SelfTestLog(ok ? L"[curve] RESULT: all properties hold" : L"[curve] RESULT: FAILED");
             g_runSeconds = 0.2;   // 跑完就退
-        } else if (wcscmp(argv[i], L"--symbol-hover") == 0) {
-            g_symbolHoverTest = true;
         } else if (wcscmp(argv[i], L"--no-curve") == 0) {
             g_noCurve = true;
         } else if (wcscmp(argv[i], L"--pause-test") == 0) {
@@ -2187,7 +2130,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         if (g_layoutProbe) dshb::SetLayoutProbe(true);
         // 氛围曲线默认开；--no-curve 关掉它，用于确认"关掉后文字位置逐像素不变"
         dshb::SetCurveEnabled(!g_noCurve);
-        if (g_symbolHoverTest) dshb::SetSymbolHover(true);   // --symbol-hover：导出对比用
         if (g_historyDemo > 0) dshb::PrimeHistoryForDemo(g_historyDemo);
         // ===== TEMPORARY (task 2/3): run a real ambience glide before the frame ----
         // 必须在这里（数据层已经喂好、绘制还没开始）：滑行推的就是"渲染前的那几帧"。
@@ -2913,8 +2855,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // ★ 这里原来每帧都喂一次 g_display.OnSample(g_states.lastGood())，已删除：
         //   同一条样本重复喂 -> lastReal_ 与 target_ 永远相等 -> 行程为 0 -> 没有滚动，
         //   只剩突变。（假数据源与真接口现在都在"新样本到达"处分发。）
-        // --click-test：注入三次手势，验证"只有单击才切换"这条规则。
+        // --click-test：注入三次手势，验证"拖动与长按都不算点击"这条边界。
         // 走的是和真实鼠标**同一个**判定函数，不是旁路。
+        // 手势 1（干净的单击）预期只写『干净的单击：算点击』一行 —— 单击现在没有动作可做，
+        // 所以"分类成点击、然后什么都不发生"就是它该有的结果。
         // --pause-test：注入"锁屏 -> 解锁"，走的是与真实系统通知**同一个** WndProc 分支
         if (g_pauseTest) {
             static int ps = 0;
@@ -2926,38 +2870,31 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 PostMessageW(g_hwnd, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK, 0);
             }
         }
-        if (g_clickTest) {
+        if (g_clickTest && g_panelRectValid) {
             static int ctStage = 0;
             static double ctAt = 1.0;
 
-            if (ctStage < 4 && elapsed >= ctAt) {
-                const dshb::SymbolRect sr = dshb::CurrencySymbolRect();
-                if (sr.valid) {
-                    const int cx = static_cast<int>((sr.l + sr.r) * 0.5f);
-                    const int cy = static_cast<int>((sr.t + sr.b) * 0.5f);
-                    if (ctStage == 0) {
-                        SelfTestLog(L"[click-test] 手势 1：干净的单击（现在【不应】切换——要双击）");
-                        g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
-                        FinishLeftGesture(cx, cy);
-                    } else if (ctStage == 1) {
-                        SelfTestLog(L"[click-test] 手势 2：从符号拖出 40px（不应切换）");
-                        g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
-                        FinishLeftGesture(cx + 40, cy);
-                    } else if (ctStage == 2) {
-                        SelfTestLog(L"[click-test] 手势 3：按住 900ms 再松（不应切换）");
-                        g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64() - 900; g_pressValid = true;
-                        FinishLeftGesture(cx, cy);
-                    } else {
-                        SelfTestLog(L"[click-test] 手势 4：双击符号（假数据源只有 CNY 一个币种，"
-                                    L"预期写『当前只有一个币种：忽略』）");
-                        g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
-                        FinishLeftGesture(cx, cy);   // 第一次：只记时间
-                        g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
-                        FinishLeftGesture(cx, cy);   // 第二次：双击确认 -> 切换
-                    }
-                    ++ctStage;
-                    ctAt = elapsed + 1.5;
+            if (ctStage < 3 && elapsed >= ctAt) {
+                // 落点取面板实体区中心（客户区像素）—— 那里就是数字区。手势 1 点它一下，
+                // 手势 2 从它拖出 40px。坐标仍然必须是真的：FinishLeftGesture 只用 x,y
+                // 算"移动了多少"，随便给个点会让手势 2 那条断言失去意义。
+                const int cx = (g_panelRectClient.left + g_panelRectClient.right) / 2;
+                const int cy = (g_panelRectClient.top + g_panelRectClient.bottom) / 2;
+                if (ctStage == 0) {
+                    SelfTestLog(L"[click-test] 手势 1：干净的单击（预期只写『干净的单击：算点击』）");
+                    g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
+                    FinishLeftGesture(cx, cy);
+                } else if (ctStage == 1) {
+                    SelfTestLog(L"[click-test] 手势 2：从数字区拖出 40px（预期『移动 40px：算拖动，不算点击』）");
+                    g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
+                    FinishLeftGesture(cx + 40, cy);
+                } else {
+                    SelfTestLog(L"[click-test] 手势 3：按住 900ms 再松（预期『算长按，不算点击』那一行）");
+                    g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64() - 900; g_pressValid = true;
+                    FinishLeftGesture(cx, cy);
                 }
+                ++ctStage;
+                ctAt = elapsed + 1.5;
             }
         }
         // ---- 关闭态（设计 §10.2）：钩子判定的回收、剧本、日志 ----

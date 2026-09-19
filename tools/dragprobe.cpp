@@ -1732,11 +1732,11 @@ LiveResult RunLive(Harness* h, POINT park) {
                    worstInterval <= runInterval * 2.5 && worstRender <= runAvgRender * 2.0);
         std::printf("[live] %s\n", evidence);
 
-        // ③ 真拖动不能进"单击/双击切换币种"那条判定。判据是**一条都不到**：那个函数只在
-        //    WM_LBUTTONUP 里被调用，一旦被调用就会写一行 [click]（无论命中与否）。
-        //    所以"这个进程写了 0 行 [click]"就等于"这 11 次拖动一次都没被当成点击"——
-        //    而"切换"只能从那条路发生，于是"真拖动不会误切换"是可量的，不是靠读代码相信。
-        //    （本用例没有 --click-test，所以 [click] 只可能来自真的手势。）
+        // ③ 真拖动不能进"这次提起算拖动还是算点击"那条判定。判据是**一条都不到**：那个函数
+        //    只在 WM_LBUTTONUP 里被调用，一旦被调用就必定写一行 [click]（三种结果各一行，
+        //    见 main.cpp 的 FinishLeftGesture）。所以"这个进程写了 0 行 [click]"就等于
+        //    "这 11 次拖动一次都没被交给那条判定"—— 真拖动不会在松手时被当成点击，这是可量
+        //    的，不是靠读代码相信。（本用例没有 --click-test，所以 [click] 只可能来自真手势。）
         int clickLines = 0;
         {
             const std::string wholeTail = ReadAppended(LogPath(), child.logFrom);
@@ -1747,9 +1747,9 @@ LiveResult RunLive(Harness* h, POINT park) {
             }
         }
         h->Req("live-drag-not-a-click",
-               "真拖动不进单击/双击判定（入口一次都没被调用）—— 既有手势因此不可能被拖动误触",
+               "真拖动不进单击判定（入口一次都没被调用）—— 真拖动因此不可能被当成一次点击",
                "子进程这 25 秒里写了 " + Num(clickLines) + " 行 [click]（本用例共 " +
-                   Num(releases) + " 次拖动松手）；既有手势另行用 --click-test 逐一验证",
+                   Num(releases) + " 次拖动松手）；那条判定另行用 --click-test 逐一验证",
                releases > 0 && clickLines == 0);
     }
     StopChild(&child);

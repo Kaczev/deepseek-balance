@@ -37,14 +37,6 @@ struct CanvasSize {
     float scale = 1.0f;
 };
 
-// 币种符号在屏幕上的矩形（**像素**坐标）。点击命中测试要用。
-// 每帧由渲染层写入；还没画过符号时 valid=false。
-struct SymbolRect {
-    float l = 0.0f, t = 0.0f, r = 0.0f, b = 0.0f;
-    bool valid = false;
-};
-SymbolRect CurrencySymbolRect();
-
 class Renderer {
 public:
     ~Renderer();
@@ -167,8 +159,6 @@ void SetLayoutProbe(bool on);
     // 氛围曲线开关（--no-curve：关掉后文字位置必须逐像素不变，用于 A/B 对比）
     void SetCurveEnabled(bool on);
 
-    // 鼠标是否悬停在币种符号上（悬停时符号变暗一档，提示可点击）
-    void SetSymbolHover(bool on);
 void DumpLayoutProbe();
 
 // ---------------------------------------------------------------------------

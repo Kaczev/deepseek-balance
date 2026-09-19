@@ -273,8 +273,6 @@ inline constexpr float kPanelOpacity = 0.95f;
 inline constexpr float kTitleAlpha = 1.00f;      // 边缘文字：设为 1.0 才能渲染成 #afb2b7 本身
 inline constexpr float kAmountAlpha = 1.00f;     // 数字本身
 inline constexpr float kCurrencyAlpha = 1.00f;   // ¥ 符号：要精确等于 #f9fafb
-// 鼠标悬停在币种符号上时的不透明度（= 所有者说的"变深一点"：深色面板上变暗一档表示可按）。
-inline constexpr float kCurrencyHoverAlpha = 0.72f;
 inline constexpr float kEstimateAlpha = 1.00f;   // 边缘文字：同标题，渲染成 #afb2b7
 
 // 调试浮层里用的几个颜色（正常运行时看不到）。

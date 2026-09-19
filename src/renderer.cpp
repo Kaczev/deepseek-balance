@@ -221,8 +221,6 @@ int g_digitDrawMode = 0;
 
 // 氛围曲线开关：--no-curve 关掉它，用于 A/B 对比（关掉后文字位置必须逐像素不变）
 bool g_curveEnabled = true;
-bool g_symbolHover = false;   // 鼠标悬停在币种符号上
-void SetSymbolHover(bool on) { g_symbolHover = on; }
 
 // 氛围曲线：点由显示层算好（规格 §3），渲染层只连线——
 // 采样密度 1 像素一个点，所以肉眼看到的是连续曲线，不会出现折角。
@@ -387,12 +385,9 @@ static float g_numberFontSizeDip = 0.0f;
 static float g_numberX = 0.0f;
 static bool g_numberXValid = false;
 
-// 币种符号的矩形（像素），每帧刷新；点击命中测试要用
-static float g_symbolL = 0.0f, g_symbolT = 0.0f, g_symbolR = 0.0f, g_symbolB = 0.0f;
-// 心跳位移在**本帧**实际用掉的像素数。唯一的真相来源：绘制变换与命中矩形都读它，
-// 所以两者不可能对不上（本项目反复踩过"一个值两个来源"的坑）。
+// 心跳位移在**本帧**实际用掉的像素数。唯一的真相来源：所有要跟着心跳走的绘制都读它
+// （数字层与曲线层），所以两层不可能对不上（本项目反复踩过"一个值两个来源"的坑）。
 static float g_lastBeatDyPx = 0.0f;
-static bool g_symbolValid = false;
 static float g_blockShift = 0.0f;   // 整块数字当帧的横向位移（符号要跟着它走）
 
 // FONT SIZES (DIP) for the balance number, indexed by how many digits it shows
@@ -917,7 +912,6 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             const float targetX = cx - (inkW + gap + symbolW) * 0.5f - inkInsetDip * s;
             // ★ 横向缓动：列数一变，目标位置会跳半个字宽；让实际位置追上去，
             //   于是数字是"滑"过去而不是"瞬移"。风格与滚动一致：每帧把残差乘上 rate。
-            g_symbolValid = false;   // 每帧先作废；真的画了符号才置回 true
             // 符号与数字必须用**同一个坐标系**：数字画在 g_numberX + charXs[i]，
             // 所以符号的起点就是"数字墨迹宽 + 间距"，不能再用外层的 left（实测会跑到左边）
             if (!g_numberXValid) { g_numberX = targetX; g_numberXValid = true; }
@@ -1114,7 +1108,7 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                 dropDip = g_symbolAlign.dropDip;
             }
             ID2D1SolidColorBrush* sb = nullptr;
-            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kTextColorR, kTextColorG, kTextColorB, (g_symbolHover ? kCurrencyHoverAlpha : kCurrencyAlpha)), &sb)) && sb) {
+            if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kTextColorR, kTextColorG, kTextColorB, kCurrencyAlpha), &sb)) && sb) {
                 IDWriteTextLayout* layout = nullptr;
                 if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
                         symbol.c_str(), static_cast<UINT32>(symbol.size()), unitFmt, 256.0f, 64.0f,
@@ -1123,13 +1117,6 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                     const float symbolX = left + digitsW + gap + g_blockShift;
                     // 所有者当初的落点 + 这个字形量出来的位移。
                     const float symbolY = numberTop + (kSymbolBaselineDip + dropDip) * s;
-                    // 命中框是**画面上的**矩形，所以它必须跟着位移一起走，否则点击位置
-                    // 与看到的符号会差那几像素（悬停高亮那一层正是靠它判定）。
-                    g_symbolL = symbolX;
-                    g_symbolT = symbolY;
-                    g_symbolR = symbolX + (symbolW > 0.0f ? symbolW : 24.0f * s);
-                    g_symbolB = symbolY + 40.0f * s;   // 命中框给点余量，不必精确到行距
-                    g_symbolValid = true;
                     rt->DrawTextLayout(D2D1::Point2F(symbolX, symbolY),
                                        layout, sb, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     layout->Release();
@@ -2076,16 +2063,6 @@ HRESULT Renderer::RenderFrame(double elapsedSeconds) {
     }
     if (g_noPresent) return S_OK;   // 量光栅代价：不提交，也就没有等垂直空白那一段
     return d.swapchain->Present(1, 0);
-}
-
-SymbolRect CurrencySymbolRect() {
-    // ★ 命中框必须跟着心跳位移走，否则点击差 g_lastBeatDyPx 像素（币种符号命中、拖动判定都靠它）。
-    //   数值直接取本帧绘制时用的那一个，不重算、不猜。
-    SymbolRect r{};
-    r.l = g_symbolL; r.t = g_symbolT + g_lastBeatDyPx;
-    r.r = g_symbolR; r.b = g_symbolB + g_lastBeatDyPx;
-    r.valid = g_symbolValid;
-    return r;
 }
 
 bool Renderer::ExportFrame(const wchar_t* path, double elapsedSeconds) {
