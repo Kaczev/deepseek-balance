@@ -71,6 +71,24 @@ inline constexpr float kDebugSizeDip = 13.0f;
 inline constexpr float kTitleInsetXDip = 12.0f;
 inline constexpr float kTitleInsetYDip = 8.0f;
 
+// ★ "今日已 X.XX¥"：跟在标题同一行的**后面**，灰色（边缘文字色 #afb2b7），字号小于标题。
+//
+//  字号 13 是这样量出来的（不是猜的）：315 DIP 的实体区里，标题 "deepseek 余额" 在
+//  15 DIP 下的**墨迹**右端落在 x=102.62（量法见 renderer.cpp 的 TitleInkRightDip：
+//  逐字问 HitTestTextPosition，再问最后一个字自己的 GetOverhangMetrics —— 整串 layout
+//  的宽度含右边距，直接用它会把标题量宽 0.22 DIP）。到面板内缘 x=303 还剩 200.38 DIP。
+//  最大的那条字串（"今日已 100.00¥"，11 个字符）在 13 DIP 下墨迹宽约 84.1 DIP：
+//  12 + 102.62（标题）+ kTodayGapDip + 84.1 + 6 = 约 293 DIP，不越内缘；
+//  右上角的倒计时墨迹最左到 x≈294.3，两者之间还剩约 5.7 DIP。
+//  14 DIP 时同一条字串约 90.6 DIP，余量掉到 0 出头 —— 所以取 13，不取 14。
+//  ★ 预算在代码里**算了两次**，不是靠这段话：renderer.cpp 按当天真的那串字量宽度，
+//    放不下就不画（见那里的注释），导帧日志会打出量到的数字。
+inline constexpr float kTodaySizeDip = 13.0f;
+// 标题墨迹右端到"今日已…"墨迹左端的空档。
+inline constexpr float kTodayGapDip = 5.0f;
+// 没有倒计时可躲时的右端内缩（倒计时在时改用它的墨迹左端，见 renderer.cpp）。
+inline constexpr float kTodayRightInsetDip = 6.0f;
+
 // 数字与币种符号之间的空档。
 inline constexpr float kAmountSymbolGapDip = 2.0f;
 

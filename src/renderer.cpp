@@ -188,6 +188,11 @@ struct LayoutProbeData {
     float centerX = 0, symbolW = 0, digitsW = 0, left = 0;
     float boxLeft = 0, boxTop = 0, numberTop = 0, boxRight = 0;
     float lineH = 0;   // 相邻两个数字的垂直间距 h（排版引擎给的 line advance）
+    // "今日已 X.XX¥" 那一行在标题那一行上的实测几何（DIP，只在开启探针时填）。
+    // 为什么留这几个数：这一行的取位完全由"标题墨迹到哪结束 + 右边还剩多少"决定，而那两个
+    // 数只有排版引擎知道；导出图里的字要 OCR 才读得回来，所以把量到的事实从同一个出口写出来
+    // —— "同一行、不重叠、不越内缘"才有可复查的数字。
+    float todayInkLeft = 0, todayInkRight = 0, todayInkWidth = 0, todaySize = 0;
     // 币种符号基线补偿那一处量出来的三个数（只在开启探针时填）。放在这里而不是新开一个
     // 全局串：它就是"排版量出来的事实"，和上面那几个数是同一类东西、同一个出口。
     std::string symbolAlign;
@@ -208,6 +213,11 @@ void LayoutProbe(const char* tag, float a, float b, float c, float d) {
         g_probe.boxTop = b;
         g_probe.numberTop = c;
         g_probe.boxRight = d;
+    } else if (std::strcmp(tag, "today") == 0) {
+        g_probe.todayInkLeft = a;
+        g_probe.todayInkRight = b;
+        g_probe.todayInkWidth = c;
+        g_probe.todaySize = d;
     }
     g_probe.filled = true;
 }
@@ -259,6 +269,11 @@ void DumpLayoutProbe() {
                  blockCenter, blockCenter - g_probe.centerX);
         if (!g_probe.symbolAlign.empty()) {
             fwprintf(f, L"[layout] %hs\n", g_probe.symbolAlign.c_str());
+        }
+        if (g_probe.todaySize > 0.0f) {
+            fwprintf(f, L"[layout] 今日已行: 墨迹 %.2f..%.2f (宽 %.2f, 字号 %.1f DIP)\n",
+                     g_probe.todayInkLeft, g_probe.todayInkRight, g_probe.todayInkWidth,
+                     g_probe.todaySize);
         }
         fclose(f);
     }
@@ -391,7 +406,7 @@ static float g_lastBeatDyPx = 0.0f;
 static float g_blockShift = 0.0f;   // 整块数字当帧的横向位移（符号要跟着它走）
 
 // FONT SIZES (DIP) for the balance number, indexed by how many digits it shows
-enum class FontRole { Title, Number, NumberFlex, Unit, Estimate, Debug };
+enum class FontRole { Title, Number, NumberFlex, Unit, Estimate, Debug, Today };
 
 IDWriteTextFormat* TextFormatFor(FontRole role) {
     IDWriteFactory* dw = DebugWriteFactory();
@@ -401,7 +416,7 @@ IDWriteTextFormat* TextFormatFor(FontRole role) {
         IDWriteTextFormat* fmt = nullptr;
         bool tried = false;
     };
-    static Slot slots[6];
+    static Slot slots[7];
 
     const int idx = static_cast<int>(role);
     Slot& slot = slots[idx];
@@ -418,6 +433,7 @@ IDWriteTextFormat* TextFormatFor(FontRole role) {
         case FontRole::Number: size = kNumberFixedSizeDip; weight = DWRITE_FONT_WEIGHT_SEMI_BOLD; break;
         case FontRole::Unit: size = kCurrencySizeDip; break;
         case FontRole::Estimate: size = kEstimateSizeDip; break;
+        case FontRole::Today: size = kTodaySizeDip; break;
         case FontRole::Debug: size = kDebugSizeDip; break;
         case FontRole::NumberFlex:
             size = (flexSize > 0.0f) ? flexSize : kNumberFixedSizeDip;
@@ -490,6 +506,125 @@ void MeasureCharOrigins(const std::wstring& text, IDWriteTextFormat* fmt,
         pos += advance;
     }
     layout->Release();
+}
+
+// ---------------------------------------------------------------------------
+// INK measurements -- where a run of text actually puts pixels
+// ---------------------------------------------------------------------------
+//  Why these exist: the title row is "title, then today's spend, and the countdown on
+//  the right". Placing the middle run needs the title's INK to end somewhere and the
+//  countdown's ink to start somewhere, and neither number can be assumed. A layout's
+//  width carries side bearings (the title's layout is 0.22 DIP wider than its ink), and
+//  a one-glyph layout's overhang metrics are measured to the edge of the layout BOX
+//  rather than to the glyph: in a 256 DIP box every glyph reports a right overhang near
+//  -248, which is how an earlier version of this measurement came out at 328 DIP for a
+//  102 DIP title. Every one-glyph query below therefore uses a snug box, where
+//  `box + overhangRight` IS the glyph's advance and `box + overhangRight + overhangLeft`
+//  IS its ink width.
+constexpr float kOneGlyphBoxDip = 64.0f;
+
+// A character's advance (its origin to the next character's origin), in DIP.
+float GlyphAdvanceDip(wchar_t ch, IDWriteTextFormat* fmt) {
+    if (!fmt) return 0.0f;
+    IDWriteFactory* dw = DebugWriteFactory();
+    if (!dw) return 0.0f;
+    const wchar_t buf[2] = {ch, 0};
+    IDWriteTextLayout* one = nullptr;
+    if (FAILED(dw->CreateTextLayout(buf, 1, fmt, kOneGlyphBoxDip, 128.0f, &one)) || !one)
+        return 0.0f;
+    DWRITE_TEXT_METRICS m{};
+    DWRITE_OVERHANG_METRICS o{};
+    float advance = 0.0f;
+    if (SUCCEEDED(one->GetMetrics(&m)) && SUCCEEDED(one->GetOverhangMetrics(&o)))
+        advance = m.widthIncludingTrailingWhitespace + o.right;
+    one->Release();
+    return advance;
+}
+
+// A character's ink width, in DIP (advance minus both side bearings).
+float GlyphInkWidthDip(wchar_t ch, IDWriteTextFormat* fmt) {
+    if (!fmt) return 0.0f;
+    IDWriteFactory* dw = DebugWriteFactory();
+    if (!dw) return 0.0f;
+    const wchar_t buf[2] = {ch, 0};
+    IDWriteTextLayout* one = nullptr;
+    if (FAILED(dw->CreateTextLayout(buf, 1, fmt, kOneGlyphBoxDip, 128.0f, &one)) || !one)
+        return 0.0f;
+    DWRITE_OVERHANG_METRICS o{};
+    float ink = 0.0f;
+    if (SUCCEEDED(one->GetOverhangMetrics(&o))) ink = kOneGlyphBoxDip + o.right + o.left;
+    one->Release();
+    return ink;
+}
+
+// A character's right side bearing: the gap between its ink and the end of its advance.
+float GlyphRightBearingDip(wchar_t ch, IDWriteTextFormat* fmt) {
+    return GlyphAdvanceDip(ch, fmt) - GlyphInkWidthDip(ch, fmt);
+}
+
+// A character's left side bearing: how far its ink leans left of its origin.
+float GlyphInkLeftDip(wchar_t ch, IDWriteTextFormat* fmt) {
+    if (!fmt) return 0.0f;
+    IDWriteFactory* dw = DebugWriteFactory();
+    if (!dw) return 0.0f;
+    const wchar_t buf[2] = {ch, 0};
+    IDWriteTextLayout* one = nullptr;
+    if (FAILED(dw->CreateTextLayout(buf, 1, fmt, kOneGlyphBoxDip, 128.0f, &one)) || !one)
+        return 0.0f;
+    DWRITE_OVERHANG_METRICS o{};
+    one->GetOverhangMetrics(&o);
+    one->Release();
+    return -o.left;
+}
+
+// INK right edge of a run, in DIP, measured from the run's layout origin. The last
+// character is queried on its own because the string layout's width stops at the
+// advance -- and this renderer draws text character by character anyway (the amount,
+// the title and the countdown all go through per-character origins).
+float TextInkRightEdgeDip(const std::wstring& text, IDWriteTextFormat* fmt) {
+    if (text.empty() || !fmt) return 0.0f;
+    std::vector<float> xs;
+    MeasureCharOrigins(text, fmt, &xs, nullptr);
+    if (xs.empty()) return 0.0f;
+    const wchar_t last = text.back();
+    return xs.back() + GlyphAdvanceDip(last, fmt) - GlyphRightBearingDip(last, fmt);
+}
+
+// Distance from the layout origin to the run's first INK, in DIP.
+float TextInkLeftDip(const std::wstring& text, IDWriteTextFormat* fmt) {
+    if (text.empty() || !fmt) return 0.0f;
+    std::vector<float> xs;
+    MeasureCharOrigins(text, fmt, &xs, nullptr);
+    if (xs.empty()) return 0.0f;
+    return xs.front() - GlyphInkLeftDip(text.front(), fmt);
+}
+
+// How far the ink starts ABOVE the layout origin, in DIP: the line's ascent, as
+// DirectWrite laid this format's line box out. Read from a one-glyph layout's baseline.
+//  Needed to put two runs of DIFFERENT sizes on one baseline: they share the layout
+//  origin (margin + title inset y), and the ascent scales with the size, so the smaller
+//  run has to be lifted by exactly the difference between the two ink tops.
+float TextInkTopDip(const std::wstring& text, IDWriteTextFormat* fmt) {
+    if (text.empty() || !fmt) return 0.0f;
+    IDWriteFactory* dw = DebugWriteFactory();
+    if (!dw) return 0.0f;
+    const wchar_t buf[2] = {text.front(), 0};
+    IDWriteTextLayout* one = nullptr;
+    if (FAILED(dw->CreateTextLayout(buf, 1, fmt, kOneGlyphBoxDip, 128.0f, &one)) || !one)
+        return 0.0f;
+    DWRITE_LINE_METRICS lm{};
+    UINT32 count = 0;
+    float top = 0.0f;
+    if (SUCCEEDED(one->GetLineMetrics(&lm, 1, &count)) && count > 0) top = lm.baseline;
+    one->Release();
+    return top;
+}
+
+// Ink-top of the TITLE run, at the title's own size.
+float TitleInkTopDip() {
+    IDWriteTextFormat* fmt = TextFormatFor(FontRole::Title);
+    if (!fmt) return 0.0f;
+    return TextInkTopDip(std::wstring(L"\u4F59"), fmt);
 }
 
 // 姝ｆ枃锛圕 闃舵锛夛細鏍囬鍏肩姸鎬佽銆佷綑棰濇暟瀛椼€佸竵绉嶇鍙枫€佹竻闆堕浼般€?
@@ -804,7 +939,11 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
     IDWriteTextFormat* unitFmt = TextFormatFor(FontRole::Unit);
     IDWriteTextFormat* estFmt = TextFormatFor(FontRole::Estimate);
 
-    // 鏍囬鍏肩姸鎬佽锛氬乏涓婅銆傜姸鎬佸彉浜嗘枃瀛楀氨鎹紝涓嶅彧闈犻鑹茬紪鐮併€?
+    // 标题兼状态行：左上角。状态变了文字就换，不只靠颜色编码。
+    // "今日已 X.XX¥" 的墨迹左端（DIP）：由标题那一段量出来，倒计时那一段会把它往左收。
+    float todayInkLeftDip = 0.0f;
+    bool todayMeasured = false;
+    float countdownInkLeftDip = 0.0f;   // 0 = 这一行上没有倒计时
     if (f.statusText && titleFmt) {
         ID2D1SolidColorBrush* b = nullptr;
         if (SUCCEEDED(rt->CreateSolidColorBrush(StraightRgba(kEdgeTextColorR, kEdgeTextColorG, kEdgeTextColorB, kTitleAlpha), &b)) && b) {
@@ -819,6 +958,11 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             }
             b->Release();
         }
+        // What follows the title must start at the title's INK, not at its layout width
+        // (which carries the last glyph's right side bearing, 0.22 DIP too wide here).
+        const float titleInkRight = TextInkRightEdgeDip(f.statusText, titleFmt);
+        todayInkLeftDip = kMarginDip + kTitleInsetXDip + titleInkRight + kTodayGapDip;
+        todayMeasured = titleInkRight > 0.0f;
     }
     // 右上角：刷新倒计时。一个纯数字，每秒变一次，**不做滚动动画**。
     // 字号与标题同一档（15 号），位置是标题的镜像：右对齐、同样的边距。
@@ -837,6 +981,69 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                 cl->Release();
             }
             cb->Release();
+        }
+        // The countdown's own ink-left, so the middle run can stop short of it instead of
+        // guessing how wide the digits are (they change every second). Its ink runs about
+        // 0.1 DIP past the inset line the title mirrors.
+        countdownInkLeftDip = kMarginDip + kEntityWidthDip - kTitleInsetXDip -
+                              TextInkRightEdgeDip(f.countdownText, titleFmt);
+    }
+    // 标题那一行后面的灰色小字「今日已 X.XX¥」（所有者 2026-09-19）。
+    //  · Same row as the title: same y as the title and the countdown, then lifted by the
+    //    difference between the two ink tops, so the three runs share ONE BASELINE rather
+    //    than one line-box top (the ascent scales with the size, so at the same origin the
+    //    smaller run would sit high).
+    //  · Colour: kEdgeTextColor* (#afb2b7) with kTitleAlpha -- the pair the title itself
+    //    uses, so "grey" is not a second colour invented for this line.
+    //  · Size: kTodaySizeDip, smaller than kTitleSizeDip, chosen so the whole row fits.
+    //  · If the measurement or the fit fails, NOTHING is drawn. The alternatives --
+    //    shrinking the size on the fly, moving the title, wrapping this to a second row --
+    //    all change things the owner fixed, and silently overlapping the countdown is the
+    //    exact failure this budget exists to prevent.
+    if (todayMeasured && !f.todayUsageText.empty()) {
+        IDWriteTextFormat* todayFmt = TextFormatFor(FontRole::Today);
+        if (todayFmt) {
+            const std::wstring todayText = Widen(f.todayUsageText);
+            std::vector<float> todayXs;
+            MeasureCharOrigins(todayText, todayFmt, &todayXs, nullptr);
+            // Room to the right: the panel's inner edge, or the countdown's ink-left when
+            // there is a countdown on this row. The line never runs past either.
+            const float rightLimitDip = (countdownInkLeftDip > 0.0f)
+                                            ? (countdownInkLeftDip - kTodayGapDip)
+                                            : (kMarginDip + kEntityWidthDip - kTodayRightInsetDip);
+            if (!todayXs.empty()) {
+                const float inkLeft = todayXs.front() - GlyphInkLeftDip(todayText.front(), todayFmt);
+                const float inkRight = TextInkRightEdgeDip(todayText, todayFmt);
+                const float inkWidth = inkRight - inkLeft;
+                if (todayInkLeftDip + inkWidth <= rightLimitDip) {
+                    LayoutProbe("today", todayInkLeftDip, todayInkLeftDip + inkWidth, inkWidth,
+                                kTodaySizeDip);
+                    ID2D1SolidColorBrush* tb = nullptr;
+                    if (SUCCEEDED(rt->CreateSolidColorBrush(
+                            StraightRgba(kEdgeTextColorR, kEdgeTextColorG, kEdgeTextColorB,
+                                         kTitleAlpha),
+                            &tb)) &&
+                        tb) {
+                        IDWriteTextLayout* tl = nullptr;
+                        if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(
+                                todayText.c_str(), static_cast<UINT32>(todayText.size()), todayFmt,
+                                256.0f, 64.0f, &tl)) &&
+                            tl) {
+                            const float tx = (todayInkLeftDip - inkLeft) * s;
+                            const float titleInkTop = TitleInkTopDip();
+                            const float todayInkTop = TextInkTopDip(todayText, todayFmt);
+                            const float ty = (titleInkTop > 0.0f && todayInkTop > 0.0f)
+                                                 ? (kMarginDip + kTitleInsetYDip + titleInkTop -
+                                                    todayInkTop) * s
+                                                 : (kMarginDip + kTitleInsetYDip) * s;
+                            rt->DrawTextLayout(D2D1::Point2F(tx, ty), tl, tb,
+                                               D2D1_DRAW_TEXT_OPTIONS_NONE);
+                            tl->Release();
+                        }
+                        tb->Release();
+                    }
+                }
+            }
         }
     }
 

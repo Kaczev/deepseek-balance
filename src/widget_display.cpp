@@ -333,6 +333,18 @@ bool CurveValueOfEntry(const CurveStorePoint& point, Amount* out) {
     return false;
 }
 
+// 一个存储点在**指定币种**下的金额：指定了就只认它，没指定（空串）时退回上面那条口径。
+// ★ 为什么指定时**不回退**到别的币种：那是另一笔钱。回退等于把两条不同的曲线接起来，
+//   与速率估计器同一条规矩（RateInputForCurrency 的注释）。
+// ★ 为什么空串要回退：curve.json 在"第一次样本之前"就是这种形状（存储自己的
+//   lastPrimaryCurrency 也是空的），那时每个点的第一个条目正是数据层记这个点时用的那个。
+bool CurveValueOfEntryIn(const CurveStorePoint& point, const std::string& currency, Amount* out) {
+    if (currency.empty()) return CurveValueOfEntry(point, out);
+    const CurveStorePoint::Entry* entry = point.Find(currency);
+    if (entry == nullptr || entry->missing || entry->text.empty()) return false;
+    return ParseAmount(entry->text, out);
+}
+
 // "现在"：最近一次交付给显示层的样本（余额 + 它的整秒时间戳）。
 //   ★ 存在的唯一理由就是 `StoreStepPerMinuteAt()` 那句"最新点 → 现在"——存储里没有
 //     "现在"这个概念，它只记得变化发生的那一刻。**颜色不读它**（见下面那一段）。
@@ -1773,12 +1785,118 @@ void dshb::SetCurveStorePath(const std::wstring& path) {
     (void)g_curveStore.Load(s_path);
 }
 
+// ---------------------------------------------------------------------------
+// "今日已 X.XX¥"（所有者 2026-09-19）—— 口径与两个边界都在 widget_display.h 里
+// ---------------------------------------------------------------------------
+//  ★ 这里只说两件代码里看不出来的事：
+//
+//  1) **基线**（"今天零点那一刻的余额"）取的是"今天之前最后一个有时间的点"，不是
+//     存储里假装补一个零点。理由：存储只记变化（规格 §2.1），零点那一刻**通常没有点**，
+//     余额没动的时候更是完全没有；而"只记变化"是这条曲线的核心，为了这一行去追写
+//     一个零点采样会让那条规矩破洞。所以：
+//       · 有今天之前的点  -> 基线取它（余额在零点前后没动时，它逐位等于零点那一刻）；
+//       · 没有（首次运行 / 应用是在零点之后才启动 / 存储被 86400 秒规则清过）-> **不**
+//         编一个起点，直接从今天第一个可用点开始量。代价写在这里：零点到第一次变化
+//         之间那段消耗会漏掉，而漏掉多少**没有任何可用的数据能说明**（那一段没有点）。
+//         这是**选项 B**：所有者列的 A（内存里记跨午夜那一刻的余额）能补上这一段，
+//         代价是多一份状态，且只在"应用一直开着跨过零点"时才有用。
+//  2) 上涨**不抵消**：`if (after < before)` 才加。所以充值那一步只贡献 0 —— 累加值
+//     只增不减，永远非负（所有者选的规则）。
+// 这一层眼里的"现在"（epoch 秒）。0 = 没设过夹具 -> 真实墙钟。
+// ★ 时钟夹具（SetTodayUsageNowForProbe）只为探针存在：这一行的结果依赖"今天"，
+//   一个按真实时钟跑的命令明天会给出另一个数字，而"导帧可复现"是本项目唯一的验证方式。
+static int64_t g_todayNowOverride = 0;
+
+int64_t TodayUsageNowSeconds() {
+    if (g_todayNowOverride > 0) return g_todayNowOverride;
+    return static_cast<int64_t>(std::time(nullptr));
+}
+
+void SetTodayUsageNowForProbe(int64_t nowSeconds) { g_todayNowOverride = nowSeconds; }
+
+int64_t TodayStartSeconds(int64_t nowSeconds) {
+    const std::time_t t = static_cast<std::time_t>(nowSeconds);
+    std::tm local{};
+    if (localtime_s(&local, &t) != 0) return nowSeconds;   // 读不出本地日期：不退，当"今天刚开始"
+    local.tm_hour = 0;
+    local.tm_min = 0;
+    local.tm_sec = 0;
+    local.tm_isdst = -1;   // 让 CRT 按那个日期的本地时区规则重算（夏令时地区才看得出差别）
+    const std::time_t start = std::mktime(&local);
+    if (start == static_cast<std::time_t>(-1)) return nowSeconds;
+    return static_cast<int64_t>(start);
+}
+
+TodayUsage TodayUsageFromStore(const std::string& currency) {
+    TodayUsage usage;
+    const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
+    const int64_t todayStart = TodayStartSeconds(TodayUsageNowSeconds());
+
+    // 基线：今天之前**最后一个**有时间、有金额的点。找不到就是"零点到第一次变化之间
+    // 没有办法量的那一段"（见上面 1）。
+    bool haveBaseline = false;
+    AmountRaw baselineRaw = 0;
+    for (const CurveStorePoint& point : points) {
+        if (!point.atValid || point.at >= todayStart) break;
+        Amount amount;
+        if (CurveValueOfEntryIn(point, currency, &amount)) {
+            baselineRaw = amount.raw;
+            haveBaseline = true;
+        }
+    }
+
+    // 今天：`beforeRaw` 是"上一个可用余额"，它可能来自基线（零点之前）或者今天更早的点。
+    // 上一个可用点就是基线时，今天的**第一个**点相对它那一步照样被累计 —— 那一步是
+    // 真实的下降。若基线正好等于今天第一个点的余额，那一步贡献 0（余额没动）。
+    bool haveBefore = haveBaseline;
+    AmountRaw beforeRaw = baselineRaw;
+    bool anyToday = false;
+    for (const CurveStorePoint& point : points) {
+        if (!point.atValid || point.at < todayStart) continue;
+        Amount amount;
+        if (!CurveValueOfEntryIn(point, currency, &amount)) continue;   // 这个点没有可用金额
+        anyToday = true;
+        if (haveBefore && amount.raw < beforeRaw) usage.raw += beforeRaw - amount.raw;
+        beforeRaw = amount.raw;
+        haveBefore = true;
+    }
+    // 今天一个可用的点都没有 -> 算不出来（显示 --.--），不是 0。
+    usage.ok = anyToday;
+    return usage;
+}
+
+// ---- 时钟夹具（panelprobe 的 case5）----
+//  0 = 没设过 -> 用真实墙钟。"现在"只在这一行的计算里用一次，就是上面那次调用。
+
+std::string TodayUsageText() {
+    // 关闭态里标题、倒计时、数字都由 BuildWidgetFrame 收起来了；这一行没有理由还留着
+    // （它和那几个是同一行上的东西，只留一个字串在屏幕上是"关闭态里还留着某某东西"）。
+    if (ShutdownActive()) return std::string();
+    const TodayUsage usage = TodayUsageFromStore(g_curveStore.lastPrimaryCurrency());
+    // 算不出来 -> 所有者原话里那个形状（--.--），不是 0.00。两者的区别是
+    // "算出来是零"与"算不出来"，与余额那一行 0.00 / --.-- 同一条规矩。
+    // ★ ToString2 给的是 ASCII（只有数字、'-'、'.'），所以这一个字一个字地转就够，
+    //   不需要再走一次多字节转换（那正是"图省事的转换在中文上出错"的那个口子）。
+    std::wstring amount;
+    if (usage.ok) {
+        for (char c : Amount{usage.raw}.ToString2()) amount.push_back(static_cast<wchar_t>(c));
+    } else {
+        amount = L"--.--";
+    }
+    return Utf8FromWide(L"今日已 " + amount + L"\u00A5");
+}
+
 WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, bool currencyKnown,
                              const wchar_t* currencySymbol) {
     WidgetFrame f{};
     f.state = state;
     f.statusText = StatusTextFor(state);
     f.countdownText = CountdownText();
+    // "今日已 X.XX¥"（所有者 2026-09-19）：标题那一行后面的灰色小字。
+    // ★ 它与状态无关，只与曲线存储和"现在"有关 —— 所以状态是"读不到余额"时它照样在
+    //   （今天花了多少与"这一秒能不能读到余额"是两件事）。关闭态是唯一例外，见
+    //   TodayUsageText 的第一行。
+    f.todayUsageText = TodayUsageText();
 
     // ★ 这里就是设计要防的第一个错：**"查不到"和"余额为 0"必须分开**。
     //   只有拿到了真实数值才显示数字；读不到时显示占位符，绝不显示 0.00。

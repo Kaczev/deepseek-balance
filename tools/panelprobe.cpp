@@ -118,6 +118,42 @@ std::string Install(const dshb::CurveStore& store, const char* name) {
     return path;
 }
 
+// Feed ONE dated point. Same door as production (Append stamps the point with the time it is
+// given), and the amount is passed as a decimal STRING so nothing here goes through a double.
+void FeedPoint(dshb::CurveStore* store, const char* amount, int64_t at) {
+    dshb::CurveObservation obs;
+    obs.primaryCurrency = "CNY";
+    dshb::CurveObservation::Item item;
+    item.currency = "CNY";
+    item.amountOk = true;
+    item.text = amount;
+    obs.observations.push_back(item);
+    store->Append(obs, at, std::string());
+}
+
+// The text the panel would show for today's spend with the display layer's clock pinned at
+// `nowSeconds` -- the whole point: the answer must not depend on when this probe runs.
+std::string TodayLineAt(const dshb::CurveStore& store, const char* name, int64_t nowSeconds) {
+    if (Install(store, name).empty()) return std::string("<install failed>");
+    dshb::SetTodayUsageNowForProbe(nowSeconds);
+    dshb::DisplayedAmount display;
+    const dshb::WidgetFrame frame =
+        dshb::BuildWidgetFrame(dshb::ConnState::Ok, display, true, L"\u00A5");
+    return frame.todayUsageText;
+}
+
+// The same line in UTF-8, for evidence strings that are read by a person.
+std::string Encode(const std::wstring& text) {
+    if (text.empty()) return std::string();
+    const int need = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    if (need <= 0) return std::string();
+    std::string out(static_cast<std::size_t>(need), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), need,
+                        nullptr, nullptr);
+    return out;
+}
+
 // The point list the panel would draw for whatever the display layer currently holds.
 std::vector<dshb::CurvePoint> PanelPoints() {
     dshb::DisplayedAmount display;
@@ -351,6 +387,102 @@ int main(int argc, char** argv) {
                std::string("0 points -> CurveStartBalance returned ") +
                    (got ? "true (WRONG)" : "false"),
                !got);
+    }
+
+    // -----------------------------------------------------------------------
+    // (5) "今日已 X.XX¥" -- today's spend, on the title row.
+    //
+    //     The rule is the owner's: a CALENDAR DAY in local time, and only the DECREASES
+    //     count (a top-up must not shrink the number and it must never go negative).
+    //
+    //     The clock is pinned (SetTodayUsageNowForProbe) and the fixture is built from
+    //     LOCAL MIDNIGHT of that pinned instant, so this case gives the same answer today,
+    //     tomorrow, and in any timezone. That is why it is a probe case rather than a
+    //     screenshot: an exported frame would only be reproducible on one day.
+    //
+    //     Every sub-case is an exact string comparison, so a wrong sum, a missing "0.00",
+    //     a value that has a top-up subtracted, or "--.--" where a number belongs all fail.
+    // -----------------------------------------------------------------------
+    {
+        // 2026-09-19 12:00 local. Any instant works; this one is fixed so the evidence is
+        // readable and the arithmetic below (midnight, +5 min, +2 h, ...) can be checked.
+        const int64_t kNow = 1789790400;   // 2026-09-19T12:00:00+08:00
+        const int64_t midnight = dshb::TodayStartSeconds(kNow);
+        const std::string localDay = [] {
+            const std::time_t t = static_cast<std::time_t>(1789790400);
+            std::tm local{};
+            char buf[48];
+            if (localtime_s(&local, &t) != 0) return std::string("(localtime_s failed)");
+            std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+                          local.tm_year + 1900, local.tm_mon + 1, local.tm_mday, local.tm_hour,
+                          local.tm_min, local.tm_sec);
+            return std::string(buf);
+        }();
+
+        // (5a) Three drops and one top-up inside the day. Drops: 0.50 + 1.00 + 0.20 + 0.30 =
+        //      2.00; the 5.00 top-up in the middle must contribute nothing.
+        {
+            dshb::CurveStore store;
+            FeedPoint(&store, "20.00", midnight - 180);   // yesterday 23:57 -- the baseline
+            FeedPoint(&store, "19.50", midnight + 300);
+            FeedPoint(&store, "18.50", midnight + 900);
+            FeedPoint(&store, "23.50", midnight + 1200);  // top-up: +5.00
+            FeedPoint(&store, "23.30", midnight + 1800);
+            FeedPoint(&store, "23.00", midnight + 2400);
+            const std::string got = TodayLineAt(store, "today-drops", kNow);
+            const std::string want = "\xE4\xBB\x8A\xE6\x97\xA5\xE5\xB7\xB2 2.00\xC2\xA5";
+            std::printf("    today fixture (local day %s, midnight=%lld): 20.00@-3min, 19.50@+5min, "
+                        "18.50@+15min, 23.50@+20min (top-up), 23.30@+30min, 23.00@+40min\n",
+                        localDay.c_str(), static_cast<long long>(midnight));
+            h.Req("case5a", "today's spend is the sum of the day's DROPS only (a top-up adds 0)",
+                   "drops 0.50+1.00+0.20+0.30 = 2.00, top-up 5.00 ignored -> \"" + got + "\"",
+                   got == want);
+        }
+
+        // (5b) Only increases today: the answer is a NUMBER (0.00), not the placeholder.
+        //      "--.--" means "cannot be computed" and the store here can compute it.
+        {
+            dshb::CurveStore store;
+            FeedPoint(&store, "10.00", midnight - 60);
+            FeedPoint(&store, "12.00", midnight + 600);
+            FeedPoint(&store, "15.00", midnight + 1200);
+            const std::string got = TodayLineAt(store, "today-up", kNow);
+            const std::string want = "\xE4\xBB\x8A\xE6\x97\xA5\xE5\xB7\xB2 0.00\xC2\xA5";
+            h.Req("case5b", "a day with no drops shows 0.00, not the --.-- placeholder",
+                   "one baseline + two top-ups (no drop) -> \"" + got + "\"", got == want);
+        }
+
+        // (5c) Nothing dated today at all: the value cannot be computed, and the owner's own
+        //      placeholder shape is what must appear.
+        {
+            dshb::CurveStore store;
+            FeedPoint(&store, "20.00", midnight - 7200);
+            FeedPoint(&store, "19.00", midnight - 3600);
+            const std::string got = TodayLineAt(store, "today-none", kNow);
+            const std::string want = "\xE4\xBB\x8A\xE6\x97\xA5\xE5\xB7\xB2 --.--\xC2\xA5";
+            h.Req("case5c", "a store with no dated point for today shows --.--",
+                   "both points are yesterday -> \"" + got + "\"", got == want);
+        }
+
+        // (5d) The midnight boundary itself, with the two points that bracket it. Both are
+        //      DROPS (1.00 before midnight, 2.00 after), and only the second one is today --
+        //      so a baseline taken from the wrong side of midnight gives 1.00 or 3.00.
+        {
+            dshb::CurveStore store;
+            FeedPoint(&store, "20.00", midnight - 1800);
+            FeedPoint(&store, "19.00", midnight - 60);    // yesterday's drop: NOT today
+            FeedPoint(&store, "17.00", midnight + 600);   // today's drop from 19.00: 2.00
+            const std::string got = TodayLineAt(store, "today-midnight", kNow);
+            const std::string want = "\xE4\xBB\x8A\xE6\x97\xA5\xE5\xB7\xB2 2.00\xC2\xA5";
+            h.Req("case5d", "the day boundary is local midnight: a drop before it is not counted, "
+                            "and the balance it left is today's baseline",
+                   "20.00@-30min, 19.00@-1min, 17.00@+10min; only 19.00->17.00 is today -> \"" +
+                       got + "\"",
+                   got == want);
+        }
+
+        // Restore the real clock for anything that runs after this case.
+        dshb::SetTodayUsageNowForProbe(0);
     }
 
     std::printf("checks: %d passed, %d failed\n", h.passed, h.failed);

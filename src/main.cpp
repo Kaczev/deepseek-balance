@@ -2344,6 +2344,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                         dshb::RateStatusName(g_display.rateEstimate().status),
                         g_display.rateDisplay(), WidenUtf8(frame.zeroTimeText).c_str(),
                         frame.zeroTimeText.size());
+            // "今日已 X.XX¥" 的**原文**：和上面那行同一个理由 —— PNG 里的字要 OCR 才读得
+            // 回来，而验收要比的就是帧携带的这串字符。它为空只有两种情况（算不出来时
+            // 也不是空，是 "今日已 --.--¥"）：账户欠款（没有可显示的余额），或者关闭态。
+            SelfTestLog(L"[frame] today=\"%ls\" (utf8bytes=%zu)",
+                        WidenUtf8(frame.todayUsageText).c_str(), frame.todayUsageText.size());
             // 关闭态的导帧证据：这一帧**真的**交给渲染层的每一个字段都要留痕 ——
             // 屏幕上的"文字全无"是"这些字段全空 + amountText 就是那两个字"的结果，
             // 量像素量到的墨迹必须能从这一行对上号。
