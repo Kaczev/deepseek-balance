@@ -17,7 +17,8 @@ namespace dshb {
 // 一条采样
 // ---------------------------------------------------------------------------
 // 一个币种条目（响应的 balance_infos 里的一项）。
-// ★ 切换币种要用到**全部**条目，所以 Sample 不能只带"被选中的那一条"。
+// ★ Sample 不能只带"优先的那一条"：逐条比较两条样本（balance_source 的 SameAmounts）要
+//   全部条目，曲线存储按条目记下一个点，显示层还得按**名字**挑出当前显示的那一条。
 struct CurrencyAmount {
     std::string currency;
     Amount total{};
@@ -44,7 +45,8 @@ struct Sample {
     bool amountsOk = false;
 
     std::string currency;        // "CNY" / "USD" / "" 未知
-    // 响应里的全部币种条目（切换币种用）。空 = 只有 currency/total 这一条。
+    // 响应里的全部币种条目（逐条比较、曲线存储、按名字挑当前显示的那一条都用它）。
+    // 空 = 只有 currency/total 这一条。
     std::vector<CurrencyAmount> entries;
 
     bool isAvailable = false;

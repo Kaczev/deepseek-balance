@@ -53,7 +53,8 @@ Sample MakeSample(const api::BalanceResult& r) {
         ParseAmount(e.grantedBalance, &s.granted);
         ParseAmount(e.toppedUpBalance, &s.toppedUp);
     }
-    // 全部条目都带上：点击币种符号时要在它们之间切换（所以不能只留优先的那条）
+    // 全部条目都带上，不能只留优先的那条：SameAmounts（下面）要逐条比，
+    // 曲线存储按条目记下一个点，显示层还要按名字挑出当前显示的那一条。
     for (const api::BalanceEntry& e : r.entries) {
         CurrencyAmount ca{};
         ca.currency = e.currency;

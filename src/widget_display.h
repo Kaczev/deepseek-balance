@@ -178,7 +178,7 @@ public:
     // 本帧刷新的目标高度：clamp(min{max(s, 2B), 0} / 2B, 0, 1)，s = 最近一步的元/分钟。
     double ambienceRatioTarget() const { return ambienceRatioTarget_; }
     // 本帧的 D。★ 它的输入是**主币种余额**，不是屏幕上那个币种的数字 ——
-    //   所以点击币种符号切换显示时它逐位不变（所有者 2026-09-19 的口径）；
+    //   所以屏幕上显示的币种换了它逐位不变（所有者 2026-09-19 的口径）；
     //   主币种那一笔读不出来时它是 0（理由见 .cpp 的 AdvanceAmbience）。
     double ambienceDepth() const { return ambienceDepth_; }
     // 本帧**应当显示**的低余额程度（含"读不到余额按 D=1"这条状态规则）。
@@ -219,16 +219,10 @@ public:
     // 下次成功样本会经 OnSample 自动恢复。
     void MarkUnreadable();
 
-    // ---- 币种切换（点击币种符号）----
-    // 按**名字**记住选中的币种，不记数组下标：接口不保证数组顺序（设计 §2.2）。
-    void SelectCurrency(const std::string& code);
-    const std::string& selectedCurrency() const { return selectedCurrency_; }
-    // 当前**实际显示**的币种（选了哪个就显示哪个；没选则是接口的优先条目）
+    // ---- 当前显示的币种 ----
+    // 由 OnSample 每次样本判定（见 .cpp：与样本 currency 同名的那一条 -> 第一个有数据的条目）。
+    // main.cpp 拿它决定画哪个符号（¥ / $ / 空）。
     const std::string& shownCurrency() const { return currencyShown_; }
-    // 上一次切换币种实际换成的金额（-1 = 那次没有该币种）。给 main.cpp 记日志用。
-    double lastSwitchTarget() const { return lastSwitchTarget_; }
-    // 下一个币种（在当前清单里循环）。清单不足 2 个时返回空串。
-    std::string NextCurrency() const;
     // 最近一次**已提交**采样的墙钟毫秒：曲线的横轴锚在它上面（右端 = 最近一次确认的值）。
     int64_t lastSampleWallMs() const { return lastSampleWallMs_; }
 
@@ -252,20 +246,15 @@ private:
     bool zeroPending_ = false;
     bool zeroConfirmed_ = false;
     double latest_ = 0.0;
-    std::string selectedCurrency_;                 // 空 = 用接口给的优先条目
-    std::vector<std::string> availableCurrencies_;  // 最近一次样本里的币种清单
-    std::string currencyShown_;                     // 当前显示的币种
-    std::vector<CurrencyAmount> lastEntries_;       // 最近一次样本的条目（切换时要用金额）
-    double lastSwitchTarget_ = -1.0;
+    std::string currencyShown_;                     // 当前显示的币种（OnSample 每次样本改写）
 
     // ---- D 的输入：**本帧主币种余额**（写它的只有 OnSample，见 .cpp）----
-    // ★ 它**不随显示币种变**：切币种改的只是屏幕上的数字与符号，同一笔钱只有一个 D。
+    // ★ 它**不随显示币种变**：屏幕上换的是数字与符号，同一笔钱只有一个 D。
     //   这一条就是所有者 2026-09-19 报的那个 bug 的反面：原来 D 吃的是 `value_`
     //   （显示币种的数），显示 USD 时 "$2.81" 被当成"¥2.81"去比 10 元阈值。
     // ★ 阈值 kLowBalanceThresholdYuan = 10 与它必须同量纲。这里取的就是主币种的数，
     //   同量纲靠"主币种是 CNY"成立（真实账户只有 CNY；2026-09-19 去掉美元显示时
     //   汇率整条路一起删了，海外账号的美元数没有再折成元的依据）。
-    // ★ SelectCurrency **不许**碰它。
     // ★ primaryBalanceOk_ = false 表示主币种那一笔读不出来：AdvanceAmbience 据此取 D = 0，
     //   理由写在那个函数里。
     double primaryBalance_ = 0.0;
@@ -315,7 +304,7 @@ private:
     void AdvanceAmbience(double dtSeconds);
 
     // 曲线存储里"最近那一步"有多陡（元/分钟）= `StoreStepPerMinute()` 的转发。
-    // ★ 它量的是**存储里最新那个点 → 现在**（不看选中的币种，取每个点的第一个有值条目）。
+    // ★ 它量的是**存储里最新那个点 → 现在**（不看当前显示的币种，取每个点的第一个有值条目）。
     // ★ 它**只服务 R 的衰减**；曲线点的颜色走另一条路
     //   （`StepIntoNewestPointPerMinute()`，"进入这个点的那一步"）。
     //   两件事不能共用一个函数，理由写在 .cpp 那一段的实测里。

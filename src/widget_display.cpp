@@ -249,7 +249,7 @@ constexpr std::size_t kCurveSegments = kCurveDisplayPoints - 1;
 // 一个点对曲线的取值 = 这个点的**第一个可用条目**。
 // ★ 为什么不是"当前显示的币种"：数据层判定"变没变"用的就是响应第一个条目
 //   （primary）——一个点之所以存在，正是因为那个币种变了。让它与点一一对应，
-//   曲线画的就是"数据层记下的那条序列"，与用户此刻点了哪个币种符号无关。
+//   曲线画的就是"数据层记下的那条序列"，与屏幕上此刻显示的是哪个币种无关。
 //   条目为 null（该次响应没有这个币种）时跳过，往后找第一个有值的。
 bool CurveValueOf(const CurveStorePoint& point, double* out) {
     for (const CurveStorePoint::Entry& entry : point.entries) {
@@ -406,7 +406,7 @@ double StepIntoNewestPointPerMinute() {
 //     一次陡降之后约 100 秒内 R 平滑退下去，之后不再继续摊薄。
 //   ★ "现在"还没有（进程刚起、一个样本都没交付）时，退回"存储里最后两个点"——那种时刻
 //     两者本来就同值。
-//   ★ 金额取每个点的**第一个有值条目**（CurveValueOfEntry），与会话里选中的币种无关。
+//   ★ 金额取每个点的**第一个有值条目**（CurveValueOfEntry），与会话里当前显示的币种无关。
 //   ★ **颜色不要用这个函数**（见上面那段）：它量的是"现在"，而颜色要的是"进入这个点"。
 //     两者在 FeedCurve 那一刻必然给出不同的答案。
 //
@@ -760,14 +760,14 @@ std::vector<RateInputPoint> RateInputForCurrency(const std::string& currency) {
 
         const CurveStorePoint::Entry* entry = nullptr;
         if (currency.empty()) {
-            // 还没选过币种（第一次样本之前）：退回这个点的第一个有值的条目，
+            // 还没有显示中的币种（第一次样本之前）：退回这个点的第一个有值的条目，
             // 与曲线取值的口径一致。这不是"随便挑一个"——它就是数据层记这个点时
             // 用的那个币种（primary）。
             for (const CurveStorePoint::Entry& e : point.entries) {
                 if (!e.missing && !e.text.empty()) { entry = &e; break; }
             }
         } else {
-            // ★ 有选中的币种时**不回退**：这个点没有该币种就是"这个点没有可用金额"。
+            // ★ 有显示中的币种时**不回退**：这个点没有该币种就是"这个点没有可用金额"。
             //   回退到别的币种等于把两条不同的曲线接在一起，比不显著更糟。
             entry = point.Find(currency);
         }
@@ -848,89 +848,25 @@ void DisplayedAmount::MarkUnreadable() {
     tripsDirty_ = true;
 }
 
-// 用户点了币种符号：换成清单里的下一个。
-// 记住的是**名字**，所以下一次样本里顺序变了也切得对。
-void DisplayedAmount::SelectCurrency(const std::string& code) {
-    selectedCurrency_ = code;
-    currencyShown_ = code;
-
-    // ★ 立刻换掉**实际数字**，不等下一次样本。
-    //   理由（实测踩过）：真实账户 10 秒才一个样本、夹具根本不发新样本，
-    //   等下去符号和数字都不会动；而且符号只在这里更新才跟得上。
-    //   金额取自最近一次样本里的同币种条目，按"新目标"处理 -> 轮子滚过去并停住。
-    for (const CurrencyAmount& e : lastEntries_) {
-        if (!e.ok || e.currency != code) continue;
-        const double yuan = e.total.ToDouble();
-        latest_ = yuan;
-        if (e.total.raw != 0) {
-            zeroPending_ = false;
-            zeroConfirmed_ = false;
-        }
-        rollFromValue_ = hasValue_ ? value_ : yuan;
-        lastReal_ = hasValue_ ? target_ : yuan;
-        target_ = yuan;          // R：新的实际数字
-        frames_ = 0;
-        animating_ = true;
-        tripsDirty_ = true;
-        if (!hasValue_) {
-            value_ = yuan;
-            hasValue_ = true;
-        }
-        lastSwitchTarget_ = yuan;    // 回传给 main.cpp 记日志（这一层不能写日志）
-        return;
-    }
-    // ★ 这个币种在最近的样本里**没有数据**：显示 --.--，但符号仍然换成它的
-    //   （所有者：没有数据就显示 --.--，符号要变——否则看不出自己在看哪个币种）。
-    hasValue_ = false;
-    trips_.clear();
-    places_.clear();
-    animating_ = false;
-    tripsDirty_ = true;
-    lastSwitchTarget_ = -1.0;
-}
-
-std::string DisplayedAmount::NextCurrency() const {
-    if (availableCurrencies_.size() < 2) return std::string();
-    std::string current = selectedCurrency_.empty() ? currencyShown_ : selectedCurrency_;
-    for (size_t i = 0; i < availableCurrencies_.size(); ++i) {
-        if (availableCurrencies_[i] == current) {
-            return availableCurrencies_[(i + 1) % availableCurrencies_.size()];
-        }
-    }
-    return availableCurrencies_[0];
-}
-
 void DisplayedAmount::OnSample(const Sample& s) {
     if (!s.amountsOk) return;                 // 读不到的样本不参与显示
     lastSampleWallMs_ = s.wallMs;   // 曲线横轴锚点（见 widget_display.h）
 
-    // ---- 币种选择 ----
-    // 清单来自样本；没选中（或选中的这个币种这次没出现）就用接口给的优先条目。
-    // 按名字找而不是按下标：接口不保证数组顺序（设计 §2.2）。
-    lastEntries_ = s.entries;   // 留着给"点符号切换"用
-    availableCurrencies_.clear();
-    for (const CurrencyAmount& e : s.entries) {
-        if (e.ok) availableCurrencies_.push_back(e.currency);
-    }
-    // ★ 可切换的币种 = 本次样本里**有数据的**那些，一个都不补。
-    //   所有者 2026-09-19 去掉美元显示（汇率整条路一起删）：补出来的 USD 没有金额，
-    //   也没有"它值多少元"的依据 —— 它只会让单击切换在单币种账户上看起来有效果，
-    //   而那个效果是假的（符号变、数字 --.--）。清单里只留真数据币种。
+    // ---- 显示哪个币种：现在只剩**一条**规则 —— 接口给的那条优先条目 ----
+    // 优先条目 = balance_source 按 api::PreferredEntryIndex 挑出来的那一条，就是 s.currency。
+    // ★ 为什么只剩一条：币种符号曾经可点、双击能在币种之间切换，于是还有一条"上次选中的
+    //   币种优先"；那个入口在 97179eb 被删之后，记"选中了哪个"的字段再没有写方、恒为空，
+    //   那条分支结构上永远不成立 —— 规则与状态一起删了。
+    // ★ 按**名字**比对而不是按下标：接口不保证数组顺序（设计 §2.2）。
     Amount picked = s.total;
     std::string pickedCode = s.currency;
     if (!s.entries.empty()) {
         const CurrencyAmount* hit = nullptr;
-        if (!selectedCurrency_.empty()) {
-            for (const CurrencyAmount& e : s.entries) {
-                if (e.ok && e.currency == selectedCurrency_) { hit = &e; break; }
-            }
+        for (const CurrencyAmount& e : s.entries) {
+            if (e.ok && e.currency == s.currency) { hit = &e; break; }
         }
         if (!hit) {
-            for (const CurrencyAmount& e : s.entries) {
-                if (e.ok && e.currency == s.currency) { hit = &e; break; }
-            }
-        }
-        if (!hit) {
+            // 优先条目这一笔没有数：退回本次样本里第一个有数据的条目。
             for (const CurrencyAmount& e : s.entries) {
                 if (e.ok) { hit = &e; break; }
             }
@@ -961,8 +897,8 @@ void DisplayedAmount::OnSample(const Sample& s) {
     // ---- D 的输入：**主币种余额**（见 AdvanceAmbience 第 3 步）----
     // ★ 主币种 = 接口的**第一个条目**（数据层判定"变没变"用的就是它，见 curve_store.h）；
     //   没有条目时退回 Sample::currency/total（模拟数据源就是这种形状，币种是 CNY）。
-    //   ★ 它**不一定**等于屏幕上显示的那个币种：切币种只改显示，不该改危险度 ——
-    //     所以这一段算完就放着，SelectCurrency 一个字节都不碰它。
+    //   ★ 它**不一定**等于屏幕上显示的那个币种：币种选择只改显示，不该改危险度 ——
+    //     所以这一段算完就放着，币种选择那一段一个字节都不碰它。
     // ★ 主币种那一笔读不出来时不回落到别的条目：那是另一个数字（这里要的是"这一笔钱
     //   多少"，不是"随便找得到的某个数"）—— 读不出来就是 primaryBalanceOk_ = false，D 取 0。
     {
@@ -1876,7 +1812,7 @@ WidgetFrame BuildWidgetFrame(ConnState state, const DisplayedAmount& amount, boo
     f.beatOffsetDip = static_cast<float>(amount.beatOffsetDip());
 
     // ★ 符号与数字**分开决定**（所有者）：只要币种是确定的，即使没有数字也要显示符号，
-    //   否则切到没数据的币种时看不出自己在看哪个币种。
+    //   否则余额读不出来、界面只剩 --.-- 的时候看不出自己在看哪个币种。
     f.currencySymbol = currencyKnown ? (currencySymbol ? currencySymbol : L"") : L"";
 
     // 每一位的纵坐标交给渲染层。空则渲染层退回整串绘制。

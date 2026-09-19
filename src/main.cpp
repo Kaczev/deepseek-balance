@@ -2206,7 +2206,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                     g_display.Update(dt);
 
                     const dshb::ConnState st = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
-    // 币种跟着**显示层当前选中的那个**走（点符号可切换），不再只看状态机里那条
+    // 币种跟着**显示层当前显示的那个**走（显示层每次样本按接口的优先条目判定），不再只看状态机里那条
     const std::string shownCode = g_display.shownCurrency();
     const bool currencyKnown = g_states.hasGood() && (shownCode == "CNY" || shownCode == "USD");
     const wchar_t* shownSym = (shownCode == "CNY") ? L"\u00A5" : ((shownCode == "USD") ? L"$" : L"");
