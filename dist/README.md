@@ -1,4 +1,4 @@
-# DeepSeek 余额挂件 0.2.1
+# DeepSeek 余额挂件 0.2.2
 
 桌面上一个小面板，实时显示你 DeepSeek 账户的余额。
 
