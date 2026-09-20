@@ -284,6 +284,18 @@ public:
     // starts from, which is only known once that next point arrives. False when size < 2.
     bool SetColorOfPrevNewest(const std::string& colorHex);
 
+    // Overwrite the colour of the NEWEST point (value, time and entries untouched).
+    // ★ Why this exists (owner, 2026-09-19: "氛围红了，下一段冒出来的曲线也应该红"): the
+    //   newest point's segment runs to the NEXT point, which does not exist yet -- so under
+    //   pure backfill that segment stays colourless and the renderer borrows the colour of
+    //   the point to its RIGHT (renderer.cpp), i.e. an OLD colour. The ambience, meanwhile,
+    //   turns red the same instant the step is measured. Result: red glow, blue curve.
+    //   Writing the newest point's colour with the step we just measured makes the newest
+    //   segment speak in the same instant as the glow; the next point arriving overwrites
+    //   it with the real step's colour (SetColorOfPrevNewest), so the estimate never sticks.
+    // False when the store is empty.
+    bool SetColorOfNewest(const std::string& colorHex);
+
     // The newest n points, oldest -> newest; fewer when the store holds fewer.
     std::vector<CurveStorePoint> Newest(std::size_t n) const;
 

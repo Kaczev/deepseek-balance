@@ -605,6 +605,32 @@ void FeedCurve(const Sample& s) {
             }
         }
     }
+    // ★★ 再给**最新那一段**写上"刚量到的这一步"的颜色 —— 这是"氛围与曲线同一拍"的全部实现
+    //   （所有者 2026-09-19："氛围红了，下一段冒出来的曲线也应该红"）。
+    //   ★ 为什么非补这一步不可：最新那个点右边那一段伸向**还没到的下一个点**，纯回填口径下
+    //     它永远没颜色；而没颜色的点在渲染层是**沿用它右边那个点**的颜色（借到的是旧的冷色），
+    //     于是氛围已经红了、最右边那段还是蓝的。所有者看到的"曲线不是红的"就是这个。
+    //   ★ 它写的是**预估值**：量的是"上一个点 → 这个新点"那一步，而这一段真正要讲的是
+    //     "这个新点 → 下一个点"。下一个点到达时 `SetColorOfPrevNewest` 会用那一步的**真实**
+    //     颜色把它覆盖掉，所以预估值停不下来。
+    //   ★ 代价（为"同一拍"付的，不是 bug）：若相邻两步的陡度差很多，那一段的颜色会在下一个
+    //     点到达时**变一下**（先按这一步、再按那一步）。要让它不变，就只能不预估 ——
+    //     代价是氛围红着的时候曲线还是蓝的，那正是要被修掉的东西。
+    //   ★★ 这里**只写颜色**：几何仍走三点单调三次插值那条路（点的 x/y 一个都不动），
+    //     颜色只是贴在**已经算好的**那一段上的标签。"两点的线不平滑"正是不能为颜色快一拍
+    //     把几何退回两点的原因。
+    {
+        const std::vector<CurveStorePoint> pts = g_curveStore.Points();
+        if (!pts.empty()) {
+            const CurveStorePoint::Entry* primary = pts.back().Find(obs.primaryCurrency);
+            Amount newestAmount{};
+            if (primary != nullptr && !primary->missing && !primary->text.empty() &&
+                ParseAmount(primary->text, &newestAmount)) {
+                g_curveStore.SetColorOfNewest(
+                    HexOf(BalanceColorAt(newestAmount.ToDouble(), SeverityRatio(stepIntoNewest))));
+            }
+        }
+    }
     // ★ R 的衰减要的是**另一件事**：从最后一次变化，摊到"现在"。它必须在这里再量一次
     //   （见上面那一段）—— 余额没变的采样不成点，只有时间在往前走，平静期才摊得薄。
     //   这一步刚测出来，留给**下一次**用：主循环滞后一拍，所以下一次刷新时屏幕上

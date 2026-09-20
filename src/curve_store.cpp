@@ -659,4 +659,22 @@ bool CurveStore::SetColorOfPrevNewest(const std::string& colorHex) {
     return true;
 }
 
+// 给"最新那个点"写颜色 —— 也就是给**最右边那一段**上色。
+// ★ 为什么需要它（所有者 2026-09-19："氛围红了，下一段冒出来的曲线也应该红"）：
+//   最新那个点右边那一段伸向**下一个点**，而下一个点还不存在。纯回填的口径下这一段
+//   一直没有颜色，渲染层于是**沿用它右边那个点的颜色**（`renderer.cpp` 的规则），
+//   也就是一段**旧**颜色 —— 而氛围色在量出这一步的同一拍就红了。于是"氛围红、曲线蓝"。
+//   在这里写上"刚量出的这一步"的颜色，最新那一段就与氛围**同一拍**开口说话；
+//   下一个点到达时 `SetColorOfPrevNewest` 会用**那一步的真实颜色**覆盖它，
+//   所以这个预估值不会留下来。
+// ★ 与 `SetColorOfPrevNewest` 的关系：两者写的是**不同的槽**（最新 / 次新），
+//   只有"存储里只有一个点"时才是同一个槽 —— 那时两次写的颜色也相同（量的是同一步），
+//   所以先写哪个都对。
+bool CurveStore::SetColorOfNewest(const std::string& colorHex) {
+    if (count_ == 0) return false;
+    const std::size_t newest = (next_ + kCapacity - 1) % kCapacity;
+    buf_[newest].color = IsHexColor(colorHex) ? colorHex : std::string();
+    return true;
+}
+
 }  // namespace dshb
