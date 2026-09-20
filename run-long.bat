@@ -35,6 +35,6 @@ timeout /t 2 /nobreak >nul
 
 echo.
 echo [run-long] widget exited with code %ERRORLEVEL%
-echo [run-long] diagnostics: %ROOT%build\selftest.log
+echo [run-long] diagnostics: %LOCALAPPDATA%\deepseek-balance\dshb.log
 echo.
 pause

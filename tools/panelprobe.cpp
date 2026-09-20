@@ -407,6 +407,11 @@ int main(int argc, char** argv) {
         // 2026-09-19 12:00 local. Any instant works; this one is fixed so the evidence is
         // readable and the arithmetic below (midnight, +5 min, +2 h, ...) can be checked.
         const int64_t kNow = 1789790400;   // 2026-09-19T12:00:00+08:00
+        // ★ CurveStore 的**载入**也看时钟：update_at 超过 24 h（kExpirySeconds）就整体丢掉。
+        //   不钉它的话，这个夹具的点会在真实时钟走过 24 小时之后全部过期，于是
+        //   "今天没有带时间的点"→ 三条断言从某天起永远为红，而代码一个字没改。
+        //   实测：9/20 12:39 跑就变成这样（且 case5c 是"因为错误的原因"通过的）。
+        dshb::SetCurveStoreNowForProbe(kNow);
         const int64_t midnight = dshb::TodayStartSeconds(kNow);
         const std::string localDay = [] {
             const std::time_t t = static_cast<std::time_t>(1789790400);

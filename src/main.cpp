@@ -5,10 +5,11 @@
 // 数字、曲线、颜色、心跳都是后面步骤的事。
 //
 // 自检（给自动化用，不弹窗）：--selftest [--seconds=N]
-//   把窗口与 DPI 的事实、帧统计写进 build\selftest.log。
+//   把窗口与 DPI 的事实、帧统计写进日志（落点见 src\dshb_log.h：%LOCALAPPDATA%\deepseek-balance\dshb.log）。
 //   不弹对话框：Start-Process -PassThru 的 HasExited 在弹窗时会永远读成 false（踩过）。
 
 #include "amount.h"
+#include "dshb_log.h"     // 日志落点与写入的唯一实现（三个写入者曾各写各的 exe 同目录）
 #include "panel_drag.h"   // 自控拖动 / 边界钳制 / config.json（设计 §10.1）
 #include "paths.h"
 #include "renderer.h"
@@ -36,7 +37,6 @@
 namespace {
 
 constexpr wchar_t kClassName[] = L"DshbWnd";
-constexpr wchar_t kSelfTestLog[] = L"selftest.log";
 
 bool g_selfTest = false;
 double g_runSeconds = 0.0;        // 0 = 不自动退出，一直跑到关闭流程或 WM_CLOSE（--seconds=N 可改）
@@ -257,25 +257,26 @@ struct Clock {
     }
 };
 
+// 日志与落点都收口在 src\dshb_log.h —— 那边写着为什么（这个程序曾有**三个**写入者，
+// 各写各的 exe 同目录，所有者报的"运行完在目录下冒出 selftest.log"就是这么来的）。
+//
+// 这里只留两个名字，好让 162 个调用点保持短：
+//   SelfTestLog        —— 无条件写（用户报症状时留着它才定得了位）
+//   SelfTestLogVerbose —— 只有开发/测试调用（`--` 开头有开关）才写
 void SelfTestLog(const wchar_t* fmt, ...) {
-    // 这个程序是 GUI 子系统，没有控制台：往 stdout 写等于丢掉。
-    // 所以日志只落文件。路径必须是绝对的——相对路径会落到"启动时的工作目录"里。
-    static wchar_t path[MAX_PATH] = L"";
-    if (path[0] == L'\0') {
-        GetModuleFileNameW(nullptr, path, MAX_PATH);
-        if (wchar_t* slash = wcsrchr(path, L'\\')) *(slash + 1) = L'\0';
-        wcscat_s(path, kSelfTestLog);
-    }
+    // 这个程序是 GUI 子系统，没有控制台：往 stdout 写等于丢掉。所以日志只落文件。
+    va_list args;
+    va_start(args, fmt);
+    dshb::LogWriteV(fmt, args);
+    va_end(args);
+}
 
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, path, L"a, ccs=UTF-8") == 0 && f) {
-        va_list args;
-        va_start(args, fmt);
-        vfwprintf(f, fmt, args);
-        va_end(args);
-        fwprintf(f, L"\n");
-        fclose(f);
-    }
+void SelfTestLogVerbose(const wchar_t* fmt, ...) {
+    if (!dshb::LogVerboseEnabled()) return;
+    va_list args;
+    va_start(args, fmt);
+    dshb::LogWriteV(fmt, args);
+    va_end(args);
 }
 
 // UTF-8（显示层给的窄字符串）-> UTF-16，只给日志用。
@@ -373,16 +374,16 @@ void FinishLeftGesture(int x, int y) {
     const int dist2 = dx * dx + dy * dy;
     const int held = static_cast<int>(GetTickCount64() - g_pressTick);
     if (dist2 > 16) {
-        SelfTestLog(L"[click] 移动 %dpx：算拖动，不算点击", static_cast<int>(std::sqrt(static_cast<double>(dist2))));
+        SelfTestLogVerbose(L"[click] 移动 %dpx：算拖动，不算点击", static_cast<int>(std::sqrt(static_cast<double>(dist2))));
         return;
     }
     if (held > 600) {
-        SelfTestLog(L"[click] 按住 %dms：算长按，不算点击", held);
+        SelfTestLogVerbose(L"[click] 按住 %dms：算长按，不算点击", held);
         return;
     }
     // 三种结果各写一行 —— 于是"一行 [click] 都没有"就等于"这个函数一次都没被调用"，
     // dragprobe 的 live-drag-not-a-click 正是拿这条等式判"真拖动没被当成点击"的。
-    SelfTestLog(L"[click] 干净的单击：算点击");
+    SelfTestLogVerbose(L"[click] 干净的单击：算点击");
 }
 
 // ---------------------------------------------------------------------------
@@ -422,11 +423,11 @@ double g_dragWorstIntervalMs = 0.0;  // 拖动期间最长的一次帧间隔
 void SavePanelPos(POINT pos) {
     std::wstring why;
     if (dshb::SaveWindowPos(g_configFile, pos, &why)) {
-        SelfTestLog(L"[drag] 位置已存 %ls: (%ld,%ld)", g_configFile.c_str(), pos.x, pos.y);
+        SelfTestLogVerbose(L"[drag] 位置已存 %ls: (%ld,%ld)", g_configFile.c_str(), pos.x, pos.y);
     } else {
         // 写失败不是终点：位置只决定"下次打开落在哪"，不该打断使用，也不该弹窗
         // （设计 §10.1 的容错要求）。但必须留一行，否则用户只会觉得"位置偶尔会丢"。
-        SelfTestLog(L"[drag] 位置没能存进 %ls：%ls", g_configFile.c_str(), why.c_str());
+        SelfTestLogVerbose(L"[drag] 位置没能存进 %ls：%ls", g_configFile.c_str(), why.c_str());
     }
 }
 
@@ -479,7 +480,7 @@ void EndDrag() {
     // 验收"跟手不漂"的取证：窗口位移必须**逐像素等于**光标位移。两者都是屏幕像素，
     // 同一次拖动里不需要任何换算 —— 有偏差就说明某个环节混进了第二套坐标。
     if (haveRect && haveCursor) {
-        SelfTestLog(L"[drag] 松手：窗口位移=(%ld,%ld) 光标位移=(%ld,%ld) 偏差=(%ld,%ld) "
+        SelfTestLogVerbose(L"[drag] 松手：窗口位移=(%ld,%ld) 光标位移=(%ld,%ld) 偏差=(%ld,%ld) "
                     L"位置=(%ld,%ld) 钳制=%ls",
                     finalPos.x - g_dragWindowStart.x, finalPos.y - g_dragWindowStart.y,
                     cursor.x - g_dragPressCursor.x, cursor.y - g_dragPressCursor.y,
@@ -490,7 +491,7 @@ void EndDrag() {
     if (g_dragClamped) {
         // 钳制生效过：把"不钳制会到哪"和"实际留在哪"都记下来 —— 否则"窗口为什么停在
         // 屏幕边上不动了"只能靠猜（判据是面积，不是位置本身）。
-        SelfTestLog(L"[drag] 钳制生效：不钳制时想要 (%ld,%ld)，实际停在 (%ld,%ld)",
+        SelfTestLogVerbose(L"[drag] 钳制生效：不钳制时想要 (%ld,%ld)，实际停在 (%ld,%ld)",
                     g_dragDesired.x, g_dragDesired.y, finalPos.x, finalPos.y);
     }
 
@@ -500,7 +501,7 @@ void EndDrag() {
     if (g_dragFrames > 0) {
         const double avgRender = g_dragFrameMsSum / static_cast<double>(g_dragFrames);
         const double avgInterval = g_dragIntervalSum / static_cast<double>(g_dragFrames);
-        SelfTestLog(L"[drag] 拖动期间 frames=%llu 平均帧间隔=%.2fms(%.1fHz) 最长帧间隔=%.2fms "
+        SelfTestLogVerbose(L"[drag] 拖动期间 frames=%llu 平均帧间隔=%.2fms(%.1fHz) 最长帧间隔=%.2fms "
                     L"平均单帧=%.2fms 最长单帧=%.2fms",
                     static_cast<unsigned long long>(g_dragFrames), avgInterval,
                     avgInterval > 0.0 ? 1000.0 / avgInterval : 0.0, g_dragWorstIntervalMs,
@@ -525,7 +526,7 @@ void UpdateDrag() {
         const int dy = cursor.y - g_dragPressCursor.y;
         if (dx * dx + dy * dy <= kDragThresholdPx * kDragThresholdPx) return;   // 还没动够：仍是点击
         g_dragActive = true;
-        SelfTestLog(L"[drag] 开始跟手：锚点=(%ld,%ld) 起点=(%ld,%ld)", g_dragAnchor.x,
+        SelfTestLogVerbose(L"[drag] 开始跟手：锚点=(%ld,%ld) 起点=(%ld,%ld)", g_dragAnchor.x,
                     g_dragAnchor.y, g_dragWindowStart.x, g_dragWindowStart.y);
     }
 
@@ -546,7 +547,7 @@ void UpdateDrag() {
     if ((g_dragSnapped.x != g_dragDesired.x || g_dragSnapped.y != g_dragDesired.y) != g_dragSnapOn) {
         g_dragSnapOn = (g_dragSnapped.x != g_dragDesired.x || g_dragSnapped.y != g_dragDesired.y);
         if (g_dragSnapOn) {
-            SelfTestLog(L"[drag] 吸附生效：不吸附想要 (%ld,%ld)，吸附后 (%ld,%ld)（x 吸了 %ld，"
+            SelfTestLogVerbose(L"[drag] 吸附生效：不吸附想要 (%ld,%ld)，吸附后 (%ld,%ld)（x 吸了 %ld，"
                         L"y 吸了 %ld）；光标 (%ld,%ld) 仍在面板内=%ls",
                         g_dragDesired.x, g_dragDesired.y, g_dragSnapped.x, g_dragSnapped.y,
                         g_dragSnapped.x - g_dragDesired.x, g_dragSnapped.y - g_dragDesired.y,
@@ -558,7 +559,7 @@ void UpdateDrag() {
                             ? L"是"
                             : L"否");
         } else {
-            SelfTestLog(L"[drag] 吸附脱开：光标 (%ld,%ld) 已离开吸附范围，窗口回到跟手位置 "
+            SelfTestLogVerbose(L"[drag] 吸附脱开：光标 (%ld,%ld) 已离开吸附范围，窗口回到跟手位置 "
                         L"(%ld,%ld)", cursor.x, cursor.y, g_dragDesired.x, g_dragDesired.y);
         }
     }
@@ -698,7 +699,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (evt == WM_CONTEXTMENU) {
             // 记一行：这条消息我们**故意不处理**（上面写了为什么）。留着它才能在日志里
             // 一眼看出"外壳到底给了几条"，而不是让下一个人再去猜一次。
-            SelfTestLog(L"[tray] 收到 WM_CONTEXTMENU：故意不处理（一次右键只认 WM_RBUTTONUP，"
+            SelfTestLogVerbose(L"[tray] 收到 WM_CONTEXTMENU：故意不处理（一次右键只认 WM_RBUTTONUP，"
                         L"否则一个手势会弹两次、叠出孤儿面板）");
             return 0;
         }
@@ -707,7 +708,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case dshb::kMsgTrayMenu:
         // 菜单面板选了某一项。★ 只可能是我们自己投的（tray.h 里写了为什么不用 WM_COMMAND）：
         //   WM_COMMAND 谁都能 Post，那会让"点菜单「关闭」"多出一个能被假造的入口。
-        SelfTestLog(L"[tray] WndProc 收到 kMsgTrayMenu：cmd=%u（面板 -> 属主这一跳）", wp);
+        SelfTestLogVerbose(L"[tray] WndProc 收到 kMsgTrayMenu：cmd=%u（面板 -> 属主这一跳）", wp);
         HandleTrayMenuCommand(static_cast<UINT>(wp));
         return 0;
     case WM_KEYDOWN:
@@ -715,17 +716,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp >= VK_F1 && wp < VK_F1 + static_cast<WPARAM>(dshb::Scenario::Count)) {
             const auto idx = static_cast<dshb::Scenario>(wp - VK_F1);
             g_fake.Select(idx);
-            SelfTestLog(L"[key] 情形 -> %ls", dshb::ScenarioName(idx));
+            SelfTestLogVerbose(L"[key] 情形 -> %ls", dshb::ScenarioName(idx));
             return 0;
         }
         if (wp == 'R') {
             g_fake.TriggerRecharge();
-            SelfTestLog(L"[key] 触发充值跳变");
+            SelfTestLogVerbose(L"[key] 触发充值跳变");
             return 0;
         }
         if (wp == 'C') {
             g_fake.TriggerClockJump();
-            SelfTestLog(L"[key] 触发时钟跳变");
+            SelfTestLogVerbose(L"[key] 触发时钟跳变");
             return 0;
         }
         return 0;
@@ -868,7 +869,7 @@ bool InstallShutdownMouseHook() {
     if (g_noMouseHook) {
         // 测试旁路（--no-mouse-hook，生产默认关）：故意走"装不上"那一支。本机平时装得上
         // WH_MOUSE_LL，而"装不上就不进关闭态"这条规则只有在装不上时才看得见。
-        SelfTestLog(L"[close][test] --no-mouse-hook 开着：**故意不装**全局鼠标钩子，"
+        SelfTestLogVerbose(L"[close][test] --no-mouse-hook 开着：**故意不装**全局鼠标钩子，"
                     L"本轮当作 SetWindowsHookEx 失败");
         return false;
     }
@@ -925,7 +926,7 @@ POINT PanelCenterClient() {
 //   挂一个只活几百毫秒的图标除了在任务栏上闪一下没有任何意义。
 void InstallTrayIcon() {
     if (g_exportFrame || g_premulProbe || g_noTray) {
-        SelfTestLog(L"[tray] 本次不挂托盘图标（离屏模式或 --no-tray）");
+        SelfTestLogVerbose(L"[tray] 本次不挂托盘图标（离屏模式或 --no-tray）");
         return;
     }
     if (!g_tray.Install(g_hwnd, kTrayIconId)) {
@@ -943,9 +944,9 @@ void InstallTrayIcon() {
 void LogTrayFacts() {
     dshb::IconRectSource source = dshb::IconRectSource::None;
     const RECT r = g_tray.IconRect(&source);
-    SelfTestLog(L"[tray] 事实：hWnd=0x%p uID=%u 图标边长=%dpx", g_tray.hwnd(), g_tray.id(),
+    SelfTestLogVerbose(L"[tray] 事实：hWnd=0x%p uID=%u 图标边长=%dpx", g_tray.hwnd(), g_tray.id(),
                 g_tray.iconSizePx());
-    SelfTestLog(L"[tray] 图标矩形来源=%ls 矩形=(%ld,%ld,%ld,%ld) 尺寸=%ldx%ld",
+    SelfTestLogVerbose(L"[tray] 图标矩形来源=%ls 矩形=(%ld,%ld,%ld,%ld) 尺寸=%ldx%ld",
                 source == dshb::IconRectSource::System ? L"Shell_NotifyIconGetRect 精确值"
                                                       : L"取不到（一律取消，不用整块托盘区域顶替）",
                 r.left, r.top, r.right, r.bottom, r.right - r.left, r.bottom - r.top);
@@ -955,12 +956,12 @@ void LogTrayFacts() {
     wchar_t text[128] = L"";
     const int len = (menu && count > 0) ? GetMenuStringW(menu, 0, text, 128, MF_BYPOSITION) : 0;
     const UINT cmd = (menu && count > 0) ? GetMenuItemID(menu, 0) : 0;
-    SelfTestLog(L"[tray] 菜单：GetMenuItemCount=%d 第 0 项=L\"%ls\"（%d 字符）id=%u", count, text,
+    SelfTestLogVerbose(L"[tray] 菜单：GetMenuItemCount=%d 第 0 项=L\"%ls\"（%d 字符）id=%u", count, text,
                 len, cmd);
     g_tray.DestroyMenu();
     // 屏幕上真的有几个面板窗口。★ 这条与上面那些"菜单里有什么"是两件事：上面量的是内容，
     //   这一条量的是**屏幕上有几个**（这次修的就是"叠出多个、最早那个不消失"）。
-    SelfTestLog(L"[tray] 屏幕上的菜单面板数=%d（EnumWindows + 类名 DshbTrayMenu + 本进程）",
+    SelfTestLogVerbose(L"[tray] 屏幕上的菜单面板数=%d（EnumWindows + 类名 DshbTrayMenu + 本进程）",
                 dshb::detail::CountMenuPanels());
 }
 
@@ -1061,7 +1062,7 @@ void RunTrayMenuTestScript(double elapsed) {
         if (mPosted < 5 && elapsed >= mNext) {
             ++mPosted;
             const int before = dshb::detail::CountMenuPanels();
-            SelfTestLog(L"[tray][menu-test] 第 %d 次右键：投递前屏幕上的面板数=%d", mPosted, before);
+            SelfTestLogVerbose(L"[tray][menu-test] 第 %d 次右键：投递前屏幕上的面板数=%d", mPosted, before);
             // ★ 一次右键投**两条**消息：外壳在 Vista 之后就是这样给的
             //   （一条 lp 低位=WM_RBUTTONUP，一条=WM_CONTEXTMENU）。所有者日志里成对的
             //   "已弹出"就是这两条造成的 —— 所以夹具必须照这个样子投，才算真的复现。
@@ -1077,7 +1078,7 @@ void RunTrayMenuTestScript(double elapsed) {
         }
         if (mStage == 1 && mPosted >= 5 && elapsed >= mNext) {
             const int now = dshb::detail::CountMenuPanels();
-            SelfTestLog(L"[tray][menu-test] 连点 5 次之后：屏幕上的面板数=%d %ls（必须是 1）", now,
+            SelfTestLogVerbose(L"[tray][menu-test] 连点 5 次之后：屏幕上的面板数=%d %ls（必须是 1）", now,
                         (now == 1) ? L"✅" : L"★ 不对：这一串右键叠出了多个面板");
             // ★ "按钮太大"要能证伪：把面板**此刻在屏幕上真正占的矩形**量出来（有几个就并几个）。
             //   个数 > 1 时这一行量的就是"叠起来的那一坨"有多大 —— 所有者看到的"太大"
@@ -1085,7 +1086,7 @@ void RunTrayMenuTestScript(double elapsed) {
             //   ★ 必须在这里量：面板 2 秒后就自己收了，那时候什么都量不到（第一版就是这么空的）。
             RECT uni{};
             if (now > 0 && dshb::detail::MenuPanelsUnionRect(&uni)) {
-                SelfTestLog(L"[tray][menu-test] 面板合计占屏：(%ld,%ld,%ld,%ld) = %ldx%ld 物理像素"
+                SelfTestLogVerbose(L"[tray][menu-test] 面板合计占屏：(%ld,%ld,%ld,%ld) = %ldx%ld 物理像素"
                             L"（%d 个窗口并起来；单个的尺寸见上面「尺寸=」那一行）",
                             uni.left, uni.top, uni.right, uni.bottom, uni.right - uni.left,
                             uni.bottom - uni.top, now);
@@ -1098,7 +1099,7 @@ void RunTrayMenuTestScript(double elapsed) {
         }
         if (mStage == 2 && elapsed >= mNext) {
             const int now = dshb::detail::CountMenuPanels();
-            SelfTestLog(L"[tray][menu-test] 面板时限（2 秒）已过：屏幕上的面板数=%d %ls", now,
+            SelfTestLogVerbose(L"[tray][menu-test] 面板时限（2 秒）已过：屏幕上的面板数=%d %ls", now,
                         (now == 0) ? L"✅ 自己收回，没有孤儿窗口" : L"★ 还有面板没消失");
             // ★ 孤儿检测的**正面实验**：孤儿窗口的症状是"它还在屏幕上，但 g_menuPanel 不认它"。
             //   做法是再投一次右键 —— 如果外面真有孤儿，PopupMenu 会再建一个，
@@ -1108,7 +1109,7 @@ void RunTrayMenuTestScript(double elapsed) {
             PostMessageW(g_hwnd, dshb::kMsgTrayIcon, kTrayIconId,
                          MAKELPARAM(static_cast<WORD>(WM_RBUTTONUP),
                                     static_cast<WORD>(kTrayIconId)));
-            SelfTestLog(L"[tray][menu-test] 孤儿检测：又投一次右键（投递前个数=%d），"
+            SelfTestLogVerbose(L"[tray][menu-test] 孤儿检测：又投一次右键（投递前个数=%d），"
                         L"下一帧数屏幕上的个数", before);
             mStage = 3;
             mNext = elapsed + 0.4;
@@ -1116,7 +1117,7 @@ void RunTrayMenuTestScript(double elapsed) {
         }
         if (mStage == 3 && elapsed >= mNext) {
             const int now = dshb::detail::CountMenuPanels();
-            SelfTestLog(L"[tray][menu-test] 孤儿检测结论：屏幕上的面板数=%d %ls", now,
+            SelfTestLogVerbose(L"[tray][menu-test] 孤儿检测结论：屏幕上的面板数=%d %ls", now,
                         (now <= 1) ? L"✅ 没有孤儿窗口" : L"★ 有孤儿：屏幕上不止一个面板");
             g_running = false;
             PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
@@ -1141,12 +1142,12 @@ void RunTrayMenuTestScript(double elapsed) {
             popCalls = calls;
             // ★ 判据是"主循环**又转了多少圈**"：这个函数每帧被调一次，而帧循环一旦停在
             //   某个模态调用里，它就不再被调（实测旧实现：停在 t=3.0s，之后这个数不涨）。
-            SelfTestLog(L"[tray][menu-test] 面板已弹出，**这一轮一次都不点**：看它会不会"
+            SelfTestLogVerbose(L"[tray][menu-test] 面板已弹出，**这一轮一次都不点**：看它会不会"
                         L"按时限自己收回（旧实现在这里会永远挂住）");
             return;
         }
         if ((GetTickCount64() - popAt) < 8000) return;
-        SelfTestLog(L"[tray][menu-test] 8 秒过去了：面板 %ls，期间主循环又转了 %d 圈"
+        SelfTestLogVerbose(L"[tray][menu-test] 8 秒过去了：面板 %ls，期间主循环又转了 %d 圈"
                     L"（旧实现停在 t=N 那一刻，这个数不会再涨）",
                     panel ? L"**还在**（时限没起作用）" : L"已经自己消失", calls - popCalls);
         stage = 9;
@@ -1157,7 +1158,7 @@ void RunTrayMenuTestScript(double elapsed) {
         if (elapsed < at) return;
         stage = 1;
         at = elapsed + 0.4;
-        SelfTestLog(L"[tray][menu-test] t=%.3f 投递一条真正的托盘右键消息（与点托盘图标时"
+        SelfTestLogVerbose(L"[tray][menu-test] t=%.3f 投递一条真正的托盘右键消息（与点托盘图标时"
                     L"WndProc 收到的是同一条）",
                     elapsed);
         // 高位是图标 id、低位是按键事件：这就是 NOTIFYICON_VERSION_4 的形状。
@@ -1173,7 +1174,7 @@ void RunTrayMenuTestScript(double elapsed) {
         if (!panel) {
             // ★ 这一行分两种情形，别混成一句"菜单没弹出来"：面板**弹出过又收回**是
             //   正常结果（[tray] 菜单面板那两行已经记了原因），只有"压根没出现过"才是问题。
-            SelfTestLog(L"[tray][menu-test] 0.4 s 后面板窗口不在了（%ls）：这一轮不注入点击",
+            SelfTestLogVerbose(L"[tray][menu-test] 0.4 s 后面板窗口不在了（%ls）：这一轮不注入点击",
                         (panelSeenAt != 0) ? L"弹出过又收回，见上面 [tray] 菜单面板那几行"
                                            : L"从头到尾没出现过");
             stage = 9;
@@ -1183,7 +1184,7 @@ void RunTrayMenuTestScript(double elapsed) {
         //   跑，否则"面板已经不在了"会先把这一轮结束掉）。
         RECT pr{};
         GetWindowRect(panel, &pr);
-        SelfTestLog(L"[tray][menu-test] 面板在屏幕上：窗口=0x%p 矩形=(%ld,%ld,%ld,%ld) "
+        SelfTestLogVerbose(L"[tray][menu-test] 面板在屏幕上：窗口=0x%p 矩形=(%ld,%ld,%ld,%ld) "
                     L"前台=0x%p（我们主窗口=0x%p）—— 弹出来之后帧循环还在跑（见这一轮的 "
                     L"[tray][menu-test] 帧线）",
                     panel, pr.left, pr.top, pr.right, pr.bottom, GetForegroundWindow(), g_hwnd);
@@ -1204,7 +1205,7 @@ void RunTrayMenuTestScript(double elapsed) {
         //   约定就是被真输入验过的，而不是只写在注释里。落在哪一条上不影响结论（整个面板
         //   的右键都是取消），所以坐标沿用"那一条的中心"。
         const bool rightButton = (g_trayMenuTest == 9);
-        SelfTestLog(L"[tray][menu-test] t=%.3f 注入一次**真实**鼠标%s（SendInput）到 (%d,%d)"
+        SelfTestLogVerbose(L"[tray][menu-test] t=%.3f 注入一次**真实**鼠标%s（SendInput）到 (%d,%d)"
                     L"（那一条的中心）；注入前光标在 (%ld,%ld)",
                     elapsed, rightButton ? L"右键" : L"左键", x, y, cursor.x, cursor.y);
 
@@ -1215,7 +1216,7 @@ void RunTrayMenuTestScript(double elapsed) {
         in[1].type = INPUT_MOUSE;
         in[1].mi.dwFlags = rightButton ? MOUSEEVENTF_RIGHTUP : MOUSEEVENTF_LEFTUP;
         const UINT sent = SendInput(2, in, sizeof(INPUT));
-        SelfTestLog(L"[tray][menu-test] SendInput 返回 %u（2 = 按下与抬起都投递成功）", sent);
+        SelfTestLogVerbose(L"[tray][menu-test] SendInput 返回 %u（2 = 按下与抬起都投递成功）", sent);
         stage = 2;
         at = elapsed + 0.6;
         return;
@@ -1226,7 +1227,7 @@ void RunTrayMenuTestScript(double elapsed) {
         //   0.5 s 后进程就退出了，所以它由面板上点**右键**那个剧本（= 取消）读到 ——
         //   "什么都没发生"在那里就是正确结果。关闭那一条的证据是紧接着注入打出的
         //   `已发粒子信号 ... -> N 颗` 与收尾的 `粒子播完：关闭 = 进程退出`。
-        SelfTestLog(L"[tray][menu-test] 收尾：注入之后面板窗口 %ls，关闭态 active=%d clicks=%d "
+        SelfTestLogVerbose(L"[tray][menu-test] 收尾：注入之后面板窗口 %ls，关闭态 active=%d clicks=%d "
                     L"R_d=%.2f",
                     panel ? L"还在（这一下没收走面板）" : L"已经不在了",
                     dshb::ShutdownActive() ? 1 : 0, dshb::ShutdownClicks(),
@@ -1241,7 +1242,7 @@ void RunTrayMenuTestScript(double elapsed) {
     if ((stage == 2 || stage == 10) && panelSeenAt != 0 && panel &&
         (GetTickCount64() - panelSeenAt) > 3000) {
         panelSeenAt = 0;
-        SelfTestLog(L"[tray][menu-test] ★ 面板弹了 3 秒还没消失：SetForegroundWindow 那一手"
+        SelfTestLogVerbose(L"[tray][menu-test] ★ 面板弹了 3 秒还没消失：SetForegroundWindow 那一手"
                     L"没起作用（点别处菜单不消失就是这个症状）");
     }
 }
@@ -1267,7 +1268,7 @@ DWORD WINAPI TrayMenuFixtureDeadline(LPVOID param) {
         if (!g_running) return 0;
         if ((GetTickCount64() - start) < limitMs) continue;
         // 到点就报一句然后关窗口退进程：夹具的价值在于"报出来"，不是"永远等着"。
-        SelfTestLog(L"[tray][menu-test] 夹具时限 %lu 秒到：这一轮不再等下去，关窗口退进程"
+        SelfTestLogVerbose(L"[tray][menu-test] 夹具时限 %lu 秒到：这一轮不再等下去，关窗口退进程"
                     L"（这不是「救回了挂在模态调用里的主线程」—— 面板非模态，主线程一直在跑）",
                     limitMs / 1000);
         g_running = false;
@@ -1407,14 +1408,14 @@ void RunShutdownTestScript(double elapsed) {
     const POINT c = PanelCenterClient();
     const LPARAM lp = MAKELPARAM(static_cast<short>(c.x), static_cast<short>(c.y));
     if (stage == 0) {
-        SelfTestLog(L"[close][test] t=%.3f 注入右键（PostMessage）-> 应当进入关闭态", elapsed);
+        SelfTestLogVerbose(L"[close][test] t=%.3f 注入右键（PostMessage）-> 应当进入关闭态", elapsed);
         PostMessageW(g_hwnd, WM_RBUTTONDOWN, MK_RBUTTON, lp);
         PostMessageW(g_hwnd, WM_RBUTTONUP, 0, lp);
         at = elapsed + 0.6;
     } else if (stage == 1) {
         RECT before{}, after{};
         GetWindowRect(g_hwnd, &before);
-        SelfTestLog(L"[close][test] t=%.3f 拖动尝试：按下 + 移动(+120,+90) 三次 + 抬起"
+        SelfTestLogVerbose(L"[close][test] t=%.3f 拖动尝试：按下 + 移动(+120,+90) 三次 + 抬起"
                     L"（关闭态禁止拖动；这一次按下同时是第 1 击）", elapsed);
         PostMessageW(g_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp);
         for (int i = 1; i <= 3; ++i) {
@@ -1425,19 +1426,19 @@ void RunShutdownTestScript(double elapsed) {
         PostMessageW(g_hwnd, WM_LBUTTONUP, 0,
                      MAKELPARAM(static_cast<short>(c.x + 120), static_cast<short>(c.y + 90)));
         GetWindowRect(g_hwnd, &after);
-        SelfTestLog(L"[close][test] 拖动尝试前后：窗口 (%ld,%ld) -> (%ld,%ld) 位移=(%ld,%ld)"
+        SelfTestLogVerbose(L"[close][test] 拖动尝试前后：窗口 (%ld,%ld) -> (%ld,%ld) 位移=(%ld,%ld)"
                     L"（关闭态应当一个像素都不动）",
                     before.left, before.top, after.left, after.top, after.left - before.left,
                     after.top - before.top);
         at = elapsed + 0.6;
     } else if (stage == 2) {
-        SelfTestLog(L"[close][test] t=%.3f 注入右键 -> 第 2 击（右键也计数；R_d 应到 1.00）",
+        SelfTestLogVerbose(L"[close][test] t=%.3f 注入右键 -> 第 2 击（右键也计数；R_d 应到 1.00）",
                     elapsed);
         PostMessageW(g_hwnd, WM_RBUTTONDOWN, MK_RBUTTON, lp);
         PostMessageW(g_hwnd, WM_RBUTTONUP, 0, lp);
         at = elapsed + g_shutdownTest;
     } else {
-        SelfTestLog(L"[close][test] t=%.3f 注入左键 -> 第 3 击（GAP=%.1fs 之后，仍应关闭）",
+        SelfTestLogVerbose(L"[close][test] t=%.3f 注入左键 -> 第 3 击（GAP=%.1fs 之后，仍应关闭）",
                     elapsed, g_shutdownTest);
         PostMessageW(g_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp);
         PostMessageW(g_hwnd, WM_LBUTTONUP, 0, lp);
@@ -1454,7 +1455,7 @@ void RunShutdownEnterHold(double elapsed) {
     if (done || elapsed < g_shutdownEnterAt) return;
     done = true;
     const POINT c = PanelCenterClient();
-    SelfTestLog(L"[close][hold] t=%.3f 注入右键 -> 进入关闭态，之后不受理脚本输入", elapsed);
+    SelfTestLogVerbose(L"[close][hold] t=%.3f 注入右键 -> 进入关闭态，之后不受理脚本输入", elapsed);
     PostMessageW(g_hwnd, WM_RBUTTONDOWN, MK_RBUTTON,
                  MAKELPARAM(static_cast<short>(c.x), static_cast<short>(c.y)));
     PostMessageW(g_hwnd, WM_RBUTTONUP, 0,
@@ -1569,7 +1570,7 @@ void CommitDelayed() {
         return;
     }
     g_display.OnSample(g_stash);
-    SelfTestLog(L"[commit] t=%.1fs 提交上一个采样 %hs（最新 %hs 已收到，压着等下一点）",
+    SelfTestLogVerbose(L"[commit] t=%.1fs 提交上一个采样 %hs（最新 %hs 已收到，压着等下一点）",
                 g_elapsed, g_stash.total.ToString2().c_str(), s.total.ToString2().c_str());
     g_stash = s;
 }
@@ -1577,6 +1578,36 @@ void CommitDelayed() {
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+
+    // ★ 详细日志的开关必须在**第一行日志之前**定下来（下面几行就开始写文件了）。
+    //   判据见 dshb_log.h：命令行里有没有 `--` 开头的开关——所有者双击时命令行是空的。
+    //   两个例外只换数据位置（普通用户也可能用），不单独算"开发调用"。
+    // ★ `--log-file=` 也在这里处理：它改的是**落点**，同样必须早于第一行日志。
+    {
+        for (int i = 1; i < argc; ++i) {
+            if (wcsncmp(argv[i], L"--log-file=", 11) == 0) {
+                dshb::SetLogFilePathOverride(argv[i] + 11);
+            }
+        }
+        bool verbose = false;
+        for (int i = 1; i < argc; ++i) {
+            const wchar_t* a = argv[i];
+            if (a[0] != L'-' || a[1] != L'-') continue;
+            if (wcsncmp(a, L"--config=", 9) == 0) continue;
+            if (wcsncmp(a, L"--curve-store=", 14) == 0) continue;
+            // `--log-file=` 也是"写到哪"，与上面两个同类，不单独算"开发调用"。
+            if (wcsncmp(a, L"--log-file=", 11) == 0) continue;
+            verbose = true;
+            break;
+        }
+        // 显式开关压过判据，两个方向都给：探针想静音、或普通调用想详查。
+        for (int i = 1; i < argc; ++i) {
+            if (wcscmp(argv[i], L"--log-quiet") == 0) verbose = false;
+            if (wcscmp(argv[i], L"--log-verbose") == 0) verbose = true;
+        }
+        dshb::SetLogVerbose(verbose);
+    }
+
     for (int i = 1; i < argc; ++i) {
         if (wcscmp(argv[i], L"--selftest") == 0) {
             g_selfTest = true;
@@ -1618,15 +1649,15 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // No pixels involved: exactness + no-overshoot are pure properties.
             std::string rep;
             const bool ok = dshb::SelfTestMonotoneCurve(&rep);
-            SelfTestLog(L"[curve] --- monotone interpolation self-test ---");
+            SelfTestLogVerbose(L"[curve] --- monotone interpolation self-test ---");
             size_t pos = 0;
             while (pos < rep.size()) {
                 size_t eol = rep.find('\n', pos);
                 if (eol == std::string::npos) eol = rep.size();
-                SelfTestLog(L"[curve] %hs", rep.substr(pos, eol - pos).c_str());
+                SelfTestLogVerbose(L"[curve] %hs", rep.substr(pos, eol - pos).c_str());
                 pos = eol + 1;
             }
-            SelfTestLog(ok ? L"[curve] RESULT: all properties hold" : L"[curve] RESULT: FAILED");
+            SelfTestLogVerbose(ok ? L"[curve] RESULT: all properties hold" : L"[curve] RESULT: FAILED");
             g_runSeconds = 0.2;   // 跑完就退
         } else if (wcscmp(argv[i], L"--no-curve") == 0) {
             g_noCurve = true;
@@ -1638,7 +1669,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // 三击剧本。参数 = 第 2 击与第 3 击之间的间隔（秒）：跑 1 与 12 各一次，
             // 后者就是"没有时间窗"的证据。
             g_shutdownTest = _wtof(argv[i] + 16);
-            SelfTestLog(L"[argv] --shutdown-test=%.1fs（第 2 击之后停这么久再点第 3 击）",
+            SelfTestLogVerbose(L"[argv] --shutdown-test=%.1fs（第 2 击之后停这么久再点第 3 击）",
                         g_shutdownTest);
         } else if (wcsncmp(argv[i], L"--shutdown-enter-at=", 20) == 0) {
             // 三击剧本的**起始时刻**（秒）。为什么要能推迟：R 只抬不降，而"第 1 击把 R 抬到
@@ -1648,13 +1679,13 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             //   两次右键（一次来自剧本、一次来自挂住），点击序号整体错位一位 —— 那次实测
             //   就是这条注释的来源；挂住改成独立的 --shutdown-hold。
             g_shutdownEnterAt = _wtof(argv[i] + 20);
-            SelfTestLog(L"[argv] --shutdown-enter-at=%.1fs（三击剧本从这一刻开始）",
+            SelfTestLogVerbose(L"[argv] --shutdown-enter-at=%.1fs（三击剧本从这一刻开始）",
                         g_shutdownEnterAt);
         } else if (wcscmp(argv[i], L"--shutdown-hold") == 0) {
             // 进入关闭态之后**不受理脚本输入**：给外部测试用（PowerShell 从外面 SendInput
             // 一次真实点击，验证"点面板之外就取消"与"钩子把点击原样放行"）。
             g_shutdownEnterHold = true;
-            SelfTestLog(L"[argv] --shutdown-hold：进入关闭态后挂住（等外部点击）");
+            SelfTestLogVerbose(L"[argv] --shutdown-hold：进入关闭态后挂住（等外部点击）");
         } else if (wcsncmp(argv[i], L"--shutdown-frame=", 17) == 0) {
             // 导帧夹具：把关闭态钉在"进入以来第 k 帧"（抖动与进入段都是帧号的纯函数，
             // 所以不必连跑 k 帧）。与 --curve-frame / --beat-frame 同一套惯例。
@@ -1665,17 +1696,17 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // 离线探针用：整轮跑下来不碰通知区域，因此**绝不会留下一颗僵尸图标**
             // （探针进程跑完就退，NIM_ADD 之后直接死掉会在任务栏上留一个点不动的图标）。
             g_noTray = true;
-            SelfTestLog(L"[argv] --no-tray：本次不挂托盘图标");
+            SelfTestLogVerbose(L"[argv] --no-tray：本次不挂托盘图标");
         } else if (wcscmp(argv[i], L"--no-mouse-hook") == 0) {
             // 测试旁路（见 g_noMouseHook）：造出"全局鼠标钩子装不上"那一条路。
             g_noMouseHook = true;
-            SelfTestLog(L"[argv] --no-mouse-hook：本轮当作全局鼠标钩子装不上"
+            SelfTestLogVerbose(L"[argv] --no-mouse-hook：本轮当作全局鼠标钩子装不上"
                         L"（测试旁路，右键因此不进关闭态）");
         } else if (wcsncmp(argv[i], L"--tray-probe=", 13) == 0) {
             // 一次性把托盘的事实逐条写进日志：图标矩形的来源与矩形本身、菜单项数与文字、
             // 窗口句柄与 uID。它**不弹菜单**（弹菜单是 --tray-menu-test 的事）。
             g_trayProbe = _wtoi(argv[i] + 13) != 0;
-            SelfTestLog(L"[argv] --tray-probe=%d：写一轮托盘事实", g_trayProbe ? 1 : 0);
+            SelfTestLogVerbose(L"[argv] --tray-probe=%d：写一轮托盘事实", g_trayProbe ? 1 : 0);
         } else if (wcsncmp(argv[i], L"--tray-menu-test=", 17) == 0) {
             // t=N 秒时弹出**真的**右键菜单面板，并用 SendInput 真的点里面的「关闭」。
             // 动真实光标，所以只在显式传参时才做。
@@ -1685,7 +1716,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             //  （面板是属主的子窗口，与通知区域无关）。"图标真的进了通知区域"由
             //   --tray-probe=1 的 [tray] 事实那一行证明（那一轮不加这个参数）。
             if (g_trayMenuTest > 0) g_noTray = true;
-            SelfTestLog(L"[argv] --tray-menu-test=%d：%d 秒后弹菜单并真的点「关闭」"
+            SelfTestLogVerbose(L"[argv] --tray-menu-test=%d：%d 秒后弹菜单并真的点「关闭」"
                         L"（本次不挂真图标，见上面那条 [tray] 行）；"
                         L"=5 只弹不点、=7 连点 5 次右键（每次照外壳的样子投两条消息）",
                         g_trayMenuTest, g_trayMenuTest);
@@ -1723,7 +1754,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             if (idx >= 0) {
                 g_fake.Select(static_cast<dshb::Scenario>(idx));
             } else {
-                SelfTestLog(L"[argv] --scenario=%ls not recognised (use 1..%d or a name); ignored",
+                SelfTestLogVerbose(L"[argv] --scenario=%ls not recognised (use 1..%d or a name); ignored",
                             v, static_cast<int>(dshb::Scenario::Count));
             }
         } else if (wcsncmp(argv[i], L"--speed=", 8) == 0) {
@@ -1742,17 +1773,17 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             char amb[64] = {0};
             WideCharToMultiByte(CP_UTF8, 0, argv[i] + 11, -1, amb, sizeof(amb), nullptr, nullptr);
             if (!dshb::SetAmbienceGiven(amb)) {
-                SelfTestLog(L"[argv] --ambience 参数无法解析（要 R,D）：%ls", argv[i] + 11);
+                SelfTestLogVerbose(L"[argv] --ambience 参数无法解析（要 R,D）：%ls", argv[i] + 11);
             } else {
-                SelfTestLog(L"[argv] --ambience=%ls（测试夹具：这一帧的氛围钉在给定的 R,D）",
+                SelfTestLogVerbose(L"[argv] --ambience=%ls（测试夹具：这一帧的氛围钉在给定的 R,D）",
                             argv[i] + 11);
             }
         } else if (wcscmp(argv[i], L"--no-text") == 0) {
             dshb::SetTextEnabled(false);
-            SelfTestLog(L"[argv] --no-text：正文一层不画（量底色用）");
+            SelfTestLogVerbose(L"[argv] --no-text：正文一层不画（量底色用）");
         } else if (wcscmp(argv[i], L"--pause-ambience") == 0) {
             dshb::SetAmbienceFrozen(true);
-            SelfTestLog(L"[argv] --pause-ambience：氛围冻结（暂停时颜色与光强一步都不推进）");
+            SelfTestLogVerbose(L"[argv] --pause-ambience：氛围冻结（暂停时颜色与光强一步都不推进）");
         // ===== END TEMPORARY LOCAL WIRING =====
         // ===== TEMPORARY: inner-glow re-bake accounting (task 2) =====
         // ★ 必须挂在参数解析里（此刻还没画过帧，数字必然是 0）是错的 —— 所以这里
@@ -1761,38 +1792,38 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             g_logGlowStats = true;
         } else if (wcsncmp(argv[i], L"--ambience-glide=", 17) == 0) {
             g_ambienceGlide = _wtoi(argv[i] + 17);
-            SelfTestLog(L"[argv] --ambience-glide=%d（跑 %d 帧真实氛围推进，量重烘代价）",
+            SelfTestLogVerbose(L"[argv] --ambience-glide=%d（跑 %d 帧真实氛围推进，量重烘代价）",
                         g_ambienceGlide, g_ambienceGlide);
         } else if (wcsncmp(argv[i], L"--real-frames=", 14) == 0) {
             g_realFrames = _wtoi(argv[i] + 14);
-            SelfTestLog(L"[argv] --real-frames=%d（真实循环跑这么多帧就退出并记 [glow]）",
+            SelfTestLogVerbose(L"[argv] --real-frames=%d（真实循环跑这么多帧就退出并记 [glow]）",
                         g_realFrames);
         } else if (wcscmp(argv[i], L"--force-new-instance") == 0) {
             g_forceNewInstance = true;
-            SelfTestLog(L"[argv] --force-new-instance：跳过单实例检查（测真实路径时用）");
+            SelfTestLogVerbose(L"[argv] --force-new-instance：跳过单实例检查（测真实路径时用）");
         // ===== END TEMPORARY: task 2 =====
         // ===== 关闭粒子（设计 §11.6）=====
         } else if (wcscmp(argv[i], L"--shutdown-particles") == 0) {
             g_shutdownParticles = true;
-            SelfTestLog(L"[argv] --shutdown-particles：导出模式导第 k 帧；真循环模式 t=%.2fs 触发",
+            SelfTestLogVerbose(L"[argv] --shutdown-particles：导出模式导第 k 帧；真循环模式 t=%.2fs 触发",
                         kShutdownParticlesArmSeconds);
         } else if (wcscmp(argv[i], L"--particles-only") == 0) {
             // 量粒子**颜色**用的夹具：背景整层不画，PNG 里只剩粒子自己。
             // 它必须与 --shutdown-particles + --export-frame 一起用（否则画布是空的）。
             g_particlesOnly = true;
-            SelfTestLog(L"[argv] --particles-only：只画粒子层（量颜色用；背景不画）");
+            SelfTestLogVerbose(L"[argv] --particles-only：只画粒子层（量颜色用；背景不画）");
         } else if (wcscmp(argv[i], L"--no-particles") == 0) {
             // "面板先没了"这一条的 A/B 尺子：同一帧号、同一条绘制路径，去掉粒子。
             // 剩下任何不透明像素都只可能来自面板（底色/边框/蒙光/曲线/正文）。
             g_noParticles = true;
-            SelfTestLog(L"[argv] --no-particles：面板照样消失，但一颗粒子都不撒（量面板用）");
+            SelfTestLogVerbose(L"[argv] --no-particles：面板照样消失，但一颗粒子都不撒（量面板用）");
         } else if (wcscmp(argv[i], L"--no-present") == 0) {
             // §11.3 的预算是**帧内计算**，不能把等垂直空白的时间算进去。
             g_noPresent = true;
-            SelfTestLog(L"[argv] --no-present：画完不提交（量光栅代价，不含等显示的等待）");
+            SelfTestLogVerbose(L"[argv] --no-present：画完不提交（量光栅代价，不含等显示的等待）");
         } else if (wcsncmp(argv[i], L"--frame-stats=", 14) == 0) {
             g_frameStatsFrames = _wtoi(argv[i] + 14);
-            SelfTestLog(L"[argv] --frame-stats=%d：记全部帧的 p50/p99 后退出", g_frameStatsFrames);
+            SelfTestLogVerbose(L"[argv] --frame-stats=%d：记全部帧的 p50/p99 后退出", g_frameStatsFrames);
         } else if (wcsncmp(argv[i], L"--dpi=", 6) == 0) {
             g_dpiOverride = _wtoi(argv[i] + 6);
         } else if (wcsncmp(argv[i], L"--ui-scale=", 11) == 0) {
@@ -1862,7 +1893,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         fs.total = dshb::Amount::FromYuanDouble(g_fixedAmount);
         g_states.OnSample(fs, fs.wallMs);
         g_display.OnSample(g_states.lastGood());
-        SelfTestLog(L"[pin] 余额钉在 %.2f（不再取样、不再变化）", g_fixedAmount);
+        SelfTestLogVerbose(L"[pin] 余额钉在 %.2f（不再取样、不再变化）", g_fixedAmount);
     }
 
     // 手动设定三件参数（所有者定的接口）：实际数字 R、上次的实际数字 L、运算了 k 帧。
@@ -1887,7 +1918,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         g_states.OnSample(ms, ms.wallMs);
         g_display.OnSample(g_states.lastGood());
         g_display.SetManual(L, R, k);
-        SelfTestLog(L"[manual] R(实际)=%.4f L(上次)=%.4f k(帧)=%d", R, L, k);
+        SelfTestLogVerbose(L"[manual] R(实际)=%.4f L(上次)=%.4f k(帧)=%d", R, L, k);
     }
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -1938,10 +1969,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     {
         std::wstring why;
         if (dshb::LoadWindowPos(g_configFile, SIZE{w0, h0}, &startPos, &why)) {
-            SelfTestLog(L"[drag] 起点取自 config.json：(%ld,%ld)（文件 %ls）", startPos.x,
+            SelfTestLogVerbose(L"[drag] 起点取自 config.json：(%ld,%ld)（文件 %ls）", startPos.x,
                         startPos.y, g_configFile.c_str());
         } else {
-            SelfTestLog(L"[drag] config.json 没有可用位置（%ls）：起点退回 (%d,%d)（文件 %ls）",
+            SelfTestLogVerbose(L"[drag] config.json 没有可用位置（%ls）：起点退回 (%d,%d)（文件 %ls）",
                         why.c_str(), dshb::kWindowXDefault, dshb::kWindowYDefault,
                         g_configFile.c_str());
             startPos = POINT{dshb::kWindowXDefault, dshb::kWindowYDefault};
@@ -1965,10 +1996,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
     RECT wr{};
     GetWindowRect(g_hwnd, &wr);
-    SelfTestLog(L"[win] dpi(system)=%u dpi(window)=%u exStyle=0x%08lX（缩放固定 1.0，不随 DPI）",
+    SelfTestLogVerbose(L"[win] dpi(system)=%u dpi(window)=%u exStyle=0x%08lX（缩放固定 1.0，不随 DPI）",
                 GetDpiForSystem(), dpi,
                 static_cast<unsigned long>(GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE)));
-    SelfTestLog(L"[win] 窗口矩形=(%ld,%ld,%ld,%ld) 尺寸=%ldx%ld 实体区(理论)=%dx%d",
+    SelfTestLogVerbose(L"[win] 窗口矩形=(%ld,%ld,%ld,%ld) 尺寸=%ldx%ld 实体区(理论)=%dx%d",
                 wr.left, wr.top, wr.right, wr.bottom, wr.right - wr.left, wr.bottom - wr.top,
                 clientW, clientH);
 
@@ -1987,7 +2018,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 窗口也要跟着缩，否则画布缩了、窗口没缩，面板会在窗口里偏到一角
         SetWindowPos(g_hwnd, nullptr, 0, 0, size.widthPx, size.heightPx,
                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-        SelfTestLog(L"[render] 视觉缩放 %.2f -> 画布 %dx%d 像素", g_uiScale, size.widthPx,
+        SelfTestLogVerbose(L"[render] 视觉缩放 %.2f -> 画布 %dx%d 像素", g_uiScale, size.widthPx,
                     size.heightPx);
     }
 
@@ -1998,7 +2029,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         size.scale = static_cast<float>(scale);
         size.widthPx = static_cast<int>(dshb::kCanvasWidthDip * scale + 0.5);
         size.heightPx = static_cast<int>(dshb::kCanvasHeightDip * scale + 0.5);
-        SelfTestLog(L"[render] 缩放被 --dpi 覆盖为 %d%% -> 画布 %dx%d", g_dpiOverride * 100 / 96,
+        SelfTestLogVerbose(L"[render] 缩放被 --dpi 覆盖为 %d%% -> 画布 %dx%d", g_dpiOverride * 100 / 96,
                     size.widthPx, size.heightPx);
     }
     if (!renderer.Create(g_hwnd, size)) {
@@ -2007,7 +2038,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         CoUninitialize();
         return 3;
     }
-    SelfTestLog(L"[render] 画布=%dx%d scale=%.4f（外扩 %d DIP 余量）",
+    SelfTestLogVerbose(L"[render] 画布=%dx%d scale=%.4f（外扩 %d DIP 余量）",
                 size.widthPx, size.heightPx, size.scale, dshb::kMarginDip);
 
     // A12b：路径解析结果必须留痕。降级（目录不可写）时尤其要让用户找得到原因，
@@ -2016,7 +2047,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         const dshb::AppPaths& paths = dshb::Paths();
         SelfTestLog(L"[paths] 数据目录=%ls 可写=%ls", paths.dataDir.c_str(),
                     paths.writable ? L"是" : L"否");
-        SelfTestLog(L"[paths] 采样=%ls", paths.samples.c_str());
         SelfTestLog(L"[paths] 日志=%ls", paths.log.c_str());
         SelfTestLog(L"[paths] 设置=%ls", paths.config.c_str());
         // 曲线记录文件：给了路径就顺手加载（重启后曲线接上，规格验收 8）
@@ -2035,7 +2065,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 }
             }
             dshb::SetCurveStorePath(curvePath);
-            SelfTestLog(L"[paths] 曲线=%ls", curvePath.c_str());
+            SelfTestLogVerbose(L"[paths] 曲线=%ls", curvePath.c_str());
         }
         if (!paths.writable) {
             SelfTestLog(L"[paths] 降级：目录不可写（%ls），采样只留在内存，重启后没有历史",
@@ -2057,15 +2087,15 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         const bool ok = renderer.PremulProbe(bgra, &px, &py);
         const bool straight = ok && bgra[2] > bgra[3];
         const bool premultiplied = ok && !straight;
-        SelfTestLog(L"[premul] 像素(%d,%d) BGRA=(%u,%u,%u,%u) alpha=%u",
+        SelfTestLogVerbose(L"[premul] 像素(%d,%d) BGRA=(%u,%u,%u,%u) alpha=%u",
                     px, py, bgra[0], bgra[1], bgra[2], bgra[3], bgra[3]);
-        SelfTestLog(L"[premul] R>A 吗？%ls  →  结论：%ls",
+        SelfTestLogVerbose(L"[premul] R>A 吗？%ls  →  结论：%ls",
                     straight ? L"是（直通数据，错误）" : L"否",
                     premultiplied ? L"已预乘（正确）" : L"读取失败（错误）");
 
         if (g_exportFrame) {
             const bool saved = renderer.ExportFrame(g_exportPath, 0.0);
-            SelfTestLog(L"[export] 预乘探针 PNG: %ls 结果=%ls", g_exportPath,
+            SelfTestLogVerbose(L"[export] 预乘探针 PNG: %ls 结果=%ls", g_exportPath,
                         saved ? L"成功" : L"失败");
         }
 
@@ -2133,7 +2163,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             nullptr, 0, TrayMenuFixtureDeadline,
             reinterpret_cast<LPVOID>(static_cast<ULONG_PTR>(limitSeconds)), 0, nullptr);
         if (wd) CloseHandle(wd);   // 线程到点自己退出，句柄不需要留
-        SelfTestLog(L"[tray][menu-test] 夹具时限线程已启动：%d 秒还没跑完就报一句并收工"
+        SelfTestLogVerbose(L"[tray][menu-test] 夹具时限线程已启动：%d 秒还没跑完就报一句并收工"
                     L"（它不再做 EndMenu 那种事 —— 没有模态等待可以救）",
                     limitSeconds);
     }
@@ -2189,7 +2219,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // ★ 循环模式（--roll=loop）：每 2 秒来回跳一次，便于用肉眼观察滚动。
             //   观感是要人看的东西，一次性跳变太快，看不住。
             if (g_rollLoop) {
-                SelfTestLog(L"[roll] 循环模式：20.00 <-> 99.50 每 2 秒一次");
+                SelfTestLogVerbose(L"[roll] 循环模式：20.00 <-> 99.50 每 2 秒一次");
                 g_fake.Select(dshb::Scenario::Recharge);
                 g_fake.TriggerRecharge(99.5);
                 bool high = true;
@@ -2271,11 +2301,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 const double tgt = g_display.target();
                 const double span = 19.90 - tgt;
                 const double rem = (span == 0.0) ? 0.0 : (g_display.value() - tgt) / span;
-                SelfTestLog(L"[rollstep] i=%d value=%.4f target=%.4f rem=%.4f text=%hs",
+                SelfTestLogVerbose(L"[rollstep] i=%d value=%.4f target=%.4f rem=%.4f text=%hs",
                             i, g_display.value(), tgt, rem, fd.amountText.c_str());
             }
 
-            SelfTestLog(L"[roll] 跳变前=%.2f 跳变后目标=%.2f 推进 %d 帧后显示=%.2f",
+            SelfTestLogVerbose(L"[roll] 跳变前=%.2f 跳变后目标=%.2f 推进 %d 帧后显示=%.2f",
                         before, g_display.target(), g_rollSteps, g_display.value());
         } else {
             for (double vt = 0.0; !g_fixedGiven && !g_realGiven && !g_lastGiven && g_frames < 0 && vt <= t + 0.0001; vt += (1.0 / 60.0)) {
@@ -2312,7 +2342,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         }
         g_display.Update(0.0);
         if (g_beatFrame >= 0) {
-            SelfTestLog(L"[beat] frame=%d sim=%.4f dip=%.4f beats=%d",
+            SelfTestLogVerbose(L"[beat] frame=%d sim=%.4f dip=%.4f beats=%d",
                         g_beatFrame, g_display.beatSimSeconds(), g_display.beatOffsetDip(),
                         static_cast<int>(g_display.beatCount()));
         }
@@ -2320,7 +2350,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         //   ratio= 是**实际显示**的 R(t)，ratio_new= 是数据这一次给的高度（未衰减的那个）。
         {
             const std::wstring hex = AmbienceHex(g_display.ambienceColor());
-            SelfTestLog(L"[ambience] ratio_new=%.6f ratio=%.6f depth=%.6f color=%ls "
+            SelfTestLogVerbose(L"[ambience] ratio_new=%.6f ratio=%.6f depth=%.6f color=%ls "
                         L"intensity=%.6f unreadable=%d",
                         g_display.ambienceRatioTarget(), g_display.ambienceRatioShown(),
                         g_display.ambienceDepthShown(), hex.c_str(),
@@ -2339,7 +2369,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // 诊断（只在导帧这一条路径上）：这一帧底部那行字的**原文**，以及它是从
             // 哪个速率状态、哪个平滑速率算出来的。导帧进程没有控制台，PNG 里的字又要
             // OCR 才读得回来，所以把帧携带的那串字符逐字写进日志——验收要比的就是这一份。
-            SelfTestLog(L"[frame] amount=%hs status=%hs rate=%.10f zeroTime=\"%ls\" (utf8bytes=%zu)",
+            SelfTestLogVerbose(L"[frame] amount=%hs status=%hs rate=%.10f zeroTime=\"%ls\" (utf8bytes=%zu)",
                         frame.amountText.c_str(),
                         dshb::RateStatusName(g_display.rateEstimate().status),
                         g_display.rateDisplay(), WidenUtf8(frame.zeroTimeText).c_str(),
@@ -2347,13 +2377,13 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // "今日已 X.XX¥" 的**原文**：和上面那行同一个理由 —— PNG 里的字要 OCR 才读得
             // 回来，而验收要比的就是帧携带的这串字符。它为空只有两种情况（算不出来时
             // 也不是空，是 "今日已 --.--¥"）：账户欠款（没有可显示的余额），或者关闭态。
-            SelfTestLog(L"[frame] today=\"%ls\" (utf8bytes=%zu)",
+            SelfTestLogVerbose(L"[frame] today=\"%ls\" (utf8bytes=%zu)",
                         WidenUtf8(frame.todayUsageText).c_str(), frame.todayUsageText.size());
             // 关闭态的导帧证据：这一帧**真的**交给渲染层的每一个字段都要留痕 ——
             // 屏幕上的"文字全无"是"这些字段全空 + amountText 就是那两个字"的结果，
             // 量像素量到的墨迹必须能从这一行对上号。
             if (dshb::ShutdownActive()) {
-                SelfTestLog(L"[close] k=%d clicks=%d R_d=%.2f R=%.6f beatDip=%.4f jitterDip=%.4f "
+                SelfTestLogVerbose(L"[close] k=%d clicks=%d R_d=%.2f R=%.6f beatDip=%.4f jitterDip=%.4f "
                             L"contentScale=%.4f | amount=\"%ls\" showAmount=%d symbol=\"%ls\" "
                             L"status=\"%ls\" countdown=\"%ls\" zeroTime=%zu curvePoints=%zu "
                             L"curveHasData=%d places=%zu",
@@ -2375,7 +2405,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // 两者不同 -> 正在滚动；一次相同 -> 已经落定。用来验证"不是突变"。
             static int dbgTick = 0;
             if (++dbgTick % 6 == 0) {
-                SelfTestLog(L"[dbg] 显示值=%.4f 目标值=%.4f", g_display.value(), g_display.target());
+                SelfTestLogVerbose(L"[dbg] 显示值=%.4f 目标值=%.4f", g_display.value(), g_display.target());
             }
             const int64_t nowWall = static_cast<int64_t>(NowWallMs());
             const dshb::ConnState st = g_states.Evaluate(nowWall);
@@ -2406,9 +2436,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             renderer.StartShutdownParticles();
             renderer.SetShutdownParticlesAge(particleAge);
             const std::string line = renderer.ShutdownParticlesLog();
-            SelfTestLog(L"[shutdown] k=%d ageMs=%.1f %ls", g_frameNo, particleAge * 1000.0,
+            SelfTestLogVerbose(L"[shutdown] k=%d ageMs=%.1f %ls", g_frameNo, particleAge * 1000.0,
                         WidenUtf8(line).c_str());
-            SelfTestLog(L"[shutdown] 粒子颜色取本帧氛围色 color=%ls（就是上面 [ambience] 那一行）",
+            SelfTestLogVerbose(L"[shutdown] 粒子颜色取本帧氛围色 color=%ls（就是上面 [ambience] 那一行）",
                         AmbienceHex(g_display.ambienceColor()).c_str());
         }
 
@@ -2418,22 +2448,22 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         // 绘制路径里做文件 I/O 会把进程弄崩（本项目踩过两次）。取一次就清空。
         {
             const std::string diag = dshb::CurveDebugText();
-            if (!diag.empty()) SelfTestLog(L"[drawdiag] %ls", WidenUtf8(diag).c_str());
+            if (!diag.empty()) SelfTestLogVerbose(L"[drawdiag] %ls", WidenUtf8(diag).c_str());
         }
 
         // 曲线状态的诊断（存储里有几个点、计时器停在哪一帧）：导帧量像素时，
         // "这一帧到底是滚动中的第几帧、环里是哪几个点"必须能从日志里对上。
-        SelfTestLog(L"[curve] %hs", dshb::CurveStateLine().c_str());
+        SelfTestLogVerbose(L"[curve] %hs", dshb::CurveStateLine().c_str());
 
         // 诊断写文件放在绘制**之后**：绘制路径里做 I/O 会让进程崩（实测）
         dshb::DumpLayoutProbe();
-        SelfTestLog(L"[export] %ls 帧=%d 时刻=%.3fs 结果=%ls 画布=%dx%d",
+        SelfTestLogVerbose(L"[export] %ls 帧=%d 时刻=%.3fs 结果=%ls 画布=%dx%d",
                     g_exportPath, g_frameNo, t, ok ? L"成功" : L"失败",
                     size.widthPx, size.heightPx);
         // ===== TEMPORARY: inner-glow re-bake accounting (task 2) =====
         if (g_logGlowStats) {
             const dshb::InnerGlowBakeCounters& g = dshb::InnerGlowBakeStats();
-            SelfTestLog(L"[glow] coverageBakes=%d coverageWorstMs=%.3f tintBakes=%d "
+            SelfTestLogVerbose(L"[glow] coverageBakes=%d coverageWorstMs=%.3f tintBakes=%d "
                         L"tintWorstMs=%.3f tintTotalMs=%.3f frames=%d",
                         g.coverageBakes, g.coverageWorstMs, g.tintBakes, g.tintWorstMs,
                         g.tintTotalMs, g.frames);
@@ -2452,7 +2482,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     if (g_selftestB) {
         int failed = 0;
         auto expect = [&](bool cond, const wchar_t* what) {
-            SelfTestLog(L"[check] %ls: %ls", cond ? L"PASS" : L"FAIL", what);
+            SelfTestLogVerbose(L"[check] %ls: %ls", cond ? L"PASS" : L"FAIL", what);
             if (!cond) ++failed;
         };
 
@@ -2596,7 +2626,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 for (int i = 0; i < 200; ++i) dd.Update(step);
                 const double walked = (dd.value() - 100.0) / 100.0;
                 if (walked < 0.6 || walked > 0.66) {
-                    SelfTestLog(L"[check]   一个 τ 后走了 %.3f（期望约 0.63）", walked);
+                    SelfTestLogVerbose(L"[check]   一个 τ 后走了 %.3f（期望约 0.63）", walked);
                 }
             }
 
@@ -2637,7 +2667,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 de.Update(1.0 / 60.0);              // 一帧最多走 5.4% 的差距
                 const double after = de.value();
                 // 总是打印，别让它藏在条件里——上一版就是这么白查一轮的
-                SelfTestLog(L"[check]   追赶中途: mid=%.4f after=%.4f target=150", mid, after);
+                SelfTestLogVerbose(L"[check]   追赶中途: mid=%.4f after=%.4f target=150", mid, after);
 
                 // ★ 断言"朝新目标走、且不越过去"，方向由目标决定，不由我想当然决定。
                 //   上一版这里写的是"after < mid"（假设它该下降），可当前值 110.8
@@ -2647,7 +2677,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             }
         }
 
-        SelfTestLog(L"[check] 小计：失败 %d 项", failed);
+        SelfTestLogVerbose(L"[check] 小计：失败 %d 项", failed);
         CoUninitialize();
         return failed == 0 ? 0 : 9;
     }
@@ -2696,7 +2726,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 //   序列里只喂一次 0，会被这条规则挡掉（实测：real=0 完全不生效）。
                 //   这里补喂一次让确认成立。
                 if (g_seq[idx] == 0.0) g_display.OnSample(g_states.lastGood());
-                SelfTestLog(L"[seq] t=%.2fs 第 %d 个值 -> real=%.2f", elapsed, idx, g_seq[idx]);
+                SelfTestLogVerbose(L"[seq] t=%.2fs 第 %d 个值 -> real=%.2f", elapsed, idx, g_seq[idx]);
             }
         }
         // ★ elapsed 取**总时间**（clock.Total()），不是逐帧累加 dt：主循环在窗口没有焦点
@@ -2751,7 +2781,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 lastKind = line.kind;
                 lastMinutes = line.minutesToZero;
                 ++emitted;
-                SelfTestLog(L"[rate] t=%.1fs status=%hs rate=%.10f pairs=%lld medianSlope=%.10f "
+                SelfTestLogVerbose(L"[rate] t=%.1fs status=%hs rate=%.10f pairs=%lld medianSlope=%.10f "
                             L"zeroTime=\"%ls\"",
                             elapsed, dshb::RateStatusName(estimate.status),
                             g_display.rateDisplay(), static_cast<long long>(estimate.pairCount),
@@ -2782,11 +2812,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 dumped = true;
                 const int64_t nowWall2 = static_cast<int64_t>(NowWallMs());
                 const dshb::ConnState st2 = g_states.Evaluate(nowWall2);
-                SelfTestLog(L"[layout] state=%ls showAmount=%d symbol=%ls amount=%hs",
+                SelfTestLogVerbose(L"[layout] state=%ls showAmount=%d symbol=%ls amount=%hs",
                             dshb::ConnStateName(st2), renderer.widgetFrame().showAmount ? 1 : 0,
                             renderer.widgetFrame().currencySymbol,
                             renderer.widgetFrame().amountText.c_str());
-                SelfTestLog(L"[layout] display: hasValue=%d value=%.4f target=%.4f tau=%.3f",
+                SelfTestLogVerbose(L"[layout] display: hasValue=%d value=%.4f target=%.4f tau=%.3f",
                             g_display.hasValue() ? 1 : 0, g_display.value(), g_display.target(),
                             g_display.tau);
             }
@@ -2798,7 +2828,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             // 两者不同 -> 正在滚动；一次相同 -> 已经落定。用来验证"不是突变"。
             static int dbgTick = 0;
             if (++dbgTick % 6 == 0) {
-                SelfTestLog(L"[dbg] 显示值=%.4f 目标值=%.4f", g_display.value(), g_display.target());
+                SelfTestLogVerbose(L"[dbg] 显示值=%.4f 目标值=%.4f", g_display.value(), g_display.target());
             }
             const int64_t nowWall = static_cast<int64_t>(NowWallMs());
             const dshb::ConnState st = g_states.Evaluate(nowWall);
@@ -2843,6 +2873,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             //   宽字符的后果实测就是日志里出现乱码 —— 同一个坑 WidenUtf8 上面那段注释
             //   早就写过，这里只是又多了一个踩它的入口。
             while (g_apiSource.PollLog(&apiLine)) {
+                std::wstring logPollLine;   // 这一条到底是 UTF-8 还是纯 ASCII，下面判
                 // 含非 ASCII 字节 -> 是 UTF-8 文本，必须解码；纯 ASCII 两路等价。
                 bool nonAscii = false;
                 for (const char c : apiLine) {
@@ -2852,9 +2883,20 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                     }
                 }
                 if (nonAscii) {
-                    SelfTestLog(L"[api t=%.1fs] %ls", elapsed, WidenUtf8(apiLine).c_str());
+                    logPollLine = WidenUtf8(apiLine);
                 } else {
-                    SelfTestLog(L"[api t=%.1fs] %hs", elapsed, apiLine.c_str());
+                    logPollLine.assign(apiLine.begin(), apiLine.end());
+                }
+                // 每 10 秒一条 "status=Ok" / "interval ->" 是生产里最大的噪声源
+                // （一天约八千条），但**失败必须留**：用户报"不显示余额"时，
+                // "Ok" 与"超时 / 401 / 连不上"的区别就是全部线索。
+                // 所以这一条按**内容**分，而不是整条 gate。
+                const bool routine = apiLine.find("status=Ok") != std::string::npos ||
+                                     apiLine.find("interval ->") != std::string::npos;
+                if (routine) {
+                    SelfTestLogVerbose(L"[api t=%.1fs] %ls", elapsed, logPollLine.c_str());
+                } else {
+                    SelfTestLog(L"[api t=%.1fs] %ls", elapsed, logPollLine.c_str());
                 }
             }
             // 连续失败到第 5 次才显示 --.--（阈值在 tuning.h）。
@@ -2909,15 +2951,15 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 const int cx = (g_panelRectClient.left + g_panelRectClient.right) / 2;
                 const int cy = (g_panelRectClient.top + g_panelRectClient.bottom) / 2;
                 if (ctStage == 0) {
-                    SelfTestLog(L"[click-test] 手势 1：干净的单击（预期只写『干净的单击：算点击』）");
+                    SelfTestLogVerbose(L"[click-test] 手势 1：干净的单击（预期只写『干净的单击：算点击』）");
                     g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
                     FinishLeftGesture(cx, cy);
                 } else if (ctStage == 1) {
-                    SelfTestLog(L"[click-test] 手势 2：从数字区拖出 40px（预期『移动 40px：算拖动，不算点击』）");
+                    SelfTestLogVerbose(L"[click-test] 手势 2：从数字区拖出 40px（预期『移动 40px：算拖动，不算点击』）");
                     g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64(); g_pressValid = true;
                     FinishLeftGesture(cx + 40, cy);
                 } else {
-                    SelfTestLog(L"[click-test] 手势 3：按住 900ms 再松（预期『算长按，不算点击』那一行）");
+                    SelfTestLogVerbose(L"[click-test] 手势 3：按住 900ms 再松（预期『算长按，不算点击』那一行）");
                     g_pressX = cx; g_pressY = cy; g_pressTick = GetTickCount64() - 900; g_pressValid = true;
                     FinishLeftGesture(cx, cy);
                 }
@@ -2966,7 +3008,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 //   返回 0 = 被挡住。故意在这里调，而不是靠"别处不会再调"来保证。
                 const int second = renderer.StartShutdownParticles();
                 const std::string line = renderer.ShutdownParticlesLog();
-                SelfTestLog(L"[shutdown] t=%.3fs 触发（紧接着第二次调用返回 %d = G5 挡住） %ls",
+                SelfTestLogVerbose(L"[shutdown] t=%.3fs 触发（紧接着第二次调用返回 %d = G5 挡住） %ls",
                             elapsed, second, WidenUtf8(line).c_str());
             }
             if (g_particleTimesOpen) {
@@ -3019,7 +3061,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                     std::sort(v.begin(), v.end());
                     return v[static_cast<std::size_t>(q * static_cast<double>(v.size() - 1) + 0.5)];
                 };
-                SelfTestLog(L"[framestats] frames=%zu present=%ls raster p50=%.3fms p99=%.3fms "
+                SelfTestLogVerbose(L"[framestats] frames=%zu present=%ls raster p50=%.3fms p99=%.3fms "
                             L"max=%.3fms | interval p50=%.3fms p99=%.3fms",
                             g_allTimes.rasterMs.size(), g_noPresent ? L"no" : L"yes",
                             pct(g_allTimes.rasterMs, 0.50), pct(g_allTimes.rasterMs, 0.99),
@@ -3054,14 +3096,14 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         if (g_particleTimesOpen && !renderer.shutdownParticlesActive()) {
             g_particleTimesOpen = false;
             const std::string line = renderer.ShutdownParticlesLog();
-            SelfTestLog(L"[shutdown] 播放结束 %ls", WidenUtf8(line).c_str());
+            SelfTestLogVerbose(L"[shutdown] 播放结束 %ls", WidenUtf8(line).c_str());
             auto percentile = [](std::vector<double> v, double q) {
                 if (v.empty()) return 0.0;
                 std::sort(v.begin(), v.end());
                 const std::size_t i = static_cast<std::size_t>(q * static_cast<double>(v.size() - 1) + 0.5);
                 return v[i];
             };
-            SelfTestLog(L"[shutdown] frames=%zu raster p50=%.3fms p99=%.3fms max=%.3fms | "
+            SelfTestLogVerbose(L"[shutdown] frames=%zu raster p50=%.3fms p99=%.3fms max=%.3fms | "
                         L"interval p50=%.3fms p99=%.3fms（§11.3 预算 p99 < 8 ms）",
                         g_particleTimes.rasterMs.size(),
                         percentile(g_particleTimes.rasterMs, 0.50),
@@ -3074,7 +3116,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         if (FAILED(lastHr)) {
             ++failures;
             if (failures <= 3) {
-                SelfTestLog(L"[render] 第 %llu 帧失败: hr=0x%08lX",
+                SelfTestLogVerbose(L"[render] 第 %llu 帧失败: hr=0x%08lX",
                             static_cast<unsigned long long>(frames),
                             static_cast<unsigned long>(lastHr));
             }
@@ -3085,11 +3127,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                                                            : g_selfTestSeconds)) break;        // ===== TEMPORARY: bounded real-loop run so the glow accounting can be logged =====
         if (g_realFrames > 0 && ++g_realFrameCount >= g_realFrames) {
             const dshb::InnerGlowBakeCounters& g = dshb::InnerGlowBakeStats();
-            SelfTestLog(L"[glow] REAL SCREEN PATH  coverageBakes=%d coverageWorstMs=%.3f "
+            SelfTestLogVerbose(L"[glow] REAL SCREEN PATH  coverageBakes=%d coverageWorstMs=%.3f "
                         L"tintBakes=%d tintWorstMs=%.3f tintTotalMs=%.3f frames=%d",
                         g.coverageBakes, g.coverageWorstMs, g.tintBakes, g.tintWorstMs,
                         g.tintTotalMs, g.frames);
-            SelfTestLog(L"[glow] real-path frames=%d（--real-frames 到了就退出）", g_realFrameCount);
+            SelfTestLogVerbose(L"[glow] real-path frames=%d（--real-frames 到了就退出）", g_realFrameCount);
             break;
         }
         // ===== END TEMPORARY =====
@@ -3102,11 +3144,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         MsgWaitForMultipleObjectsEx(0, nullptr, 1, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
     }
 
-    SelfTestLog(L"[render] frames=%llu elapsed=%.2fs 平均单帧=%.3fms 平均刷新率=%.1fHz 失败=%d",
+    SelfTestLogVerbose(L"[render] frames=%llu elapsed=%.2fs 平均单帧=%.3fms 平均刷新率=%.1fHz 失败=%d",
                 static_cast<unsigned long long>(frames), elapsed,
                 frames ? frameMsSum / static_cast<double>(frames) : 0.0,
                 elapsed > 0.0 ? static_cast<double>(frames) / elapsed : 0.0, failures);
-    SelfTestLog(L"[win] 自检完成，最后 Present hr=0x%08lX",
+    SelfTestLogVerbose(L"[win] 自检完成，最后 Present hr=0x%08lX",
                 static_cast<unsigned long>(lastHr));
 
     renderer.Destroy();

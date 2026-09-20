@@ -18,8 +18,8 @@ namespace dshb {
 
 struct AppPaths {
     std::wstring dataDir;      // %LOCALAPPDATA%\deepseek-balance
-    std::wstring samples;      // dataDir\samples.jsonl   —— 采样记录
-    std::wstring log;          // dataDir\widget.log      —— 运行日志（轮转 ≤5MB×3）
+    std::wstring log;          // dataDir\dshb.log        —— 运行日志。单一文件、1 MB 上限、
+                               //   超了截断重开；实现与理由都在 dshb_log.h
     std::wstring config;       // dataDir\config.json     —— 窗口位置等设置
     bool writable = false;     // 目录是否真的能建、能写
     std::wstring unwritableReason;   // 不能写时的原因（进日志用）

@@ -7,6 +7,7 @@
 //   3. 「关闭」那一项菜单，以及"点的是不是我们自己的图标/菜单"这个判断。
 
 #include "tray.h"
+#include "dshb_log.h"   // 日志落点与写入的唯一实现（托盘曾是三个写入者之一）
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -15,6 +16,7 @@
 #include <shellapi.h>    // Shell_NotifyIconW / Shell_NotifyIconGetRect / NOTIFYICONIDENTIFIER
 #include <wincodec.h>    // IWICImagingFactory / 缩放器（高质量重采样）
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -51,7 +53,9 @@ constexpr UINT_PTR kMenuPanelTimeoutMs = 2000;
 // 日志（定义在本文件下面：托盘模块必须自己能说话，见那一段的注释）。
 // ★ 为什么这里先声明一次：这个模块的两处日志（菜单面板、图标安装）在文件里前后分开，
 //   而日志函数只有一份定义 —— 声明放在最上面，谁用到谁就不用管定义在哪。
+//   TrayLog = 无条件写；TrayLogVerbose = 只有开发/测试调用才写（判据在 dshb_log.h）。
 void TrayLog(const wchar_t* fmt, ...);
+void TrayLogVerbose(const wchar_t* fmt, ...);
 
 // 面板窗口过程（定义在下面；PopupMenu 要拿它的地址去注册窗口类）。
 LRESULT CALLBACK MenuPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -174,7 +178,7 @@ void CloseMenuPanelOnTimeout() {
         g_menuOwner = nullptr;
         return;
     }
-    TrayLog(L"[tray] 菜单面板弹了 %u ms 没收到任何输入：按时限自己收回（非模态，进程一直活着）",
+    TrayLogVerbose(L"[tray] 菜单面板弹了 %u ms 没收到任何输入：按时限自己收回（非模态，进程一直活着）",
             static_cast<unsigned>(kMenuPanelTimeoutMs));
     DrainMenuPanel();
     g_menuOwner = nullptr;
@@ -213,7 +217,7 @@ void ActivateMenuPanel(int which, int px, int py) {
     // 不相等说明面板在弹出之后被系统挪过（DPI 变化/多屏切换），那一下的落点判断就不可信 ——
     // 所以两个数都写进日志，而不是只写一个。
     // ★ "点在里面吗"报的是**真的比出来的那个结果**（inside），不是按 which 猜的。
-    TrayLog(L"[tray] 菜单面板收到输入：%ls（消息坐标=(%d,%d)；那一条矩形 (客户区) "
+    TrayLogVerbose(L"[tray] 菜单面板收到输入：%ls（消息坐标=(%d,%d)；那一条矩形 (客户区) "
             L"(%ld,%ld,%ld,%ld) = %ldx%ld，(屏幕) (%ld,%ld,%ld,%ld)；点在里面吗？%ls）"
             L" -> 投递 kMsgTrayMenu=%u 给属主 hwnd=%p",
             what, px, py, itemClient.left, itemClient.top, itemClient.right, itemClient.bottom,
@@ -335,34 +339,47 @@ LRESULT CALLBACK MenuPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// 日志与 main.cpp 的 SelfTestLog 同格式、同落点（exe 同目录的 selftest.log）。
-// ★ 为什么这里自己写一份而不是共享 main.cpp 那个：main.cpp 的 SelfTestLog 在匿名
-//   namespace 里，托盘模块（以及 tools/trayprobe.cpp）够不着它；而这个模块**必须**
+// 日志落到哪、写不写，收口在 src\dshb_log.h（那边写着为什么：这个程序曾有**三个**
+// 写入者各写各的 exe 同目录，所有者报的"运行完在目录下冒出 selftest.log"就是这么来的）。
+// ★ 这里**自己写一份**而不是共享 main.cpp 那个，仍然成立：main.cpp 的 SelfTestLog 在
+//   匿名 namespace 里，托盘模块（以及 tools/trayprobe.cpp）够不着它；而这个模块**必须**
 //   自己能说话 —— "图标加上去了/摘掉了"这两行就是设计 §10.3 的验收依据。
-//   两份的格式只有一处定义在这里（'[' 开头、UTF-8、一行一条），没有第二套约定。
+//   两份只是**入口名字**不同，落点与写入实现是同一处（dshb::LogWriteV）。
+//
+// TrayLog        —— 无条件写（失败、以及"图标加上了/摘掉了"这类用户看得见的结果）
+// TrayLogVerbose —— 只有开发/测试调用才写（菜单面板的逐步细节、图标源尺寸……）
+void TrayLogImpl(const wchar_t* fmt, va_list args) {
+    // ★ 毫秒时间戳：这次排查里最要紧的问题是"两条面板日志之间隔了多久" ——
+    //   同一次右键里的重入是**毫秒级**的，而"用户点了两次"是秒级的。
+    //   没有时间戳时这两种情形在日志里长得一模一样（所有者日志里成对的那几条就是），
+    //   于是无法区分"重入"和"点两次"。自己取一次时钟，不依赖调用方传时间。
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t head[32];
+    swprintf_s(head, L"[%02u:%02u:%02u.%03u] ", st.wHour, st.wMinute, st.wSecond,
+               st.wMilliseconds);
+    // ★ 时间戳与正文必须**一次写完**：dshb::LogWriteV 是一行一开关文件，
+    //   分两次调用会写成两行（而且中间还夹着一次截断判定的机会）。
+    std::wstring line = head;
+    wchar_t body[1024];
+    _vsnwprintf_s(body, _TRUNCATE, fmt, args);
+    line += body;
+    dshb::LogLine(L"%ls", line.c_str());
+}
+
 void TrayLog(const wchar_t* fmt, ...) {
-    static wchar_t path[MAX_PATH] = L"";
-    if (path[0] == L'\0') {
-        if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return;
-        if (wchar_t* slash = wcsrchr(path, L'\\')) *(slash + 1) = L'\0';
-        wcscat_s(path, L"selftest.log");
-    }
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, path, L"a, ccs=UTF-8") == 0 && f) {
-        // ★ 毫秒时间戳：这次排查里最要紧的问题是"两条面板日志之间隔了多久" ——
-        //   同一次右键里的重入是**毫秒级**的，而"用户点了两次"是秒级的。
-        //   没有时间戳时这两种情形在日志里长得一模一样（所有者日志里成对的那几条就是），
-        //   于是无法区分"重入"和"点两次"。自己取一次时钟，不依赖调用方传时间。
-        SYSTEMTIME st{};
-        GetLocalTime(&st);
-        fwprintf(f, L"[%02u:%02u:%02u.%03u] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        va_list args;
-        va_start(args, fmt);
-        vfwprintf(f, fmt, args);
-        va_end(args);
-        fwprintf(f, L"\n");
-        fclose(f);
-    }
+    va_list args;
+    va_start(args, fmt);
+    TrayLogImpl(fmt, args);
+    va_end(args);
+}
+
+void TrayLogVerbose(const wchar_t* fmt, ...) {
+    if (!dshb::LogVerboseEnabled()) return;
+    va_list args;
+    va_start(args, fmt);
+    TrayLogImpl(fmt, args);
+    va_end(args);
 }
 
 // 面板的窗口类只注册一次（进程级）。
@@ -751,7 +768,7 @@ bool TrayIcon::Install(HWND hwnd, UINT id) {
         std::vector<unsigned char> big(static_cast<std::size_t>(bigPx) * bigPx * 4, 0);
         UINT bigW = 0, bigH = 0, smallW = 0, smallH = 0;
         hIcon_ = detail::CreateScaledIcon(frame, bigPx, big.data(), &bigW, &bigH);
-        TrayLog(L"[tray] 图标源：%ux%u 内嵌 PNG（解码后强制转成 32bppBGRA 保住 alpha）-> "
+        TrayLogVerbose(L"[tray] 图标源：%ux%u 内嵌 PNG（解码后强制转成 32bppBGRA 保住 alpha）-> "
                 L"大 %ux%u 画布内容 %ux%u / 小 %ux%u，重采样=WIC Fant（非最近邻），"
                 L"长边等比、居中、空边透明",
                 srcW, srcH, bigPx, bigPx, bigW, bigH, smallPx, smallPx);
@@ -907,7 +924,7 @@ void TrayIcon::RefreshIconRect() {
     // 只在**变化**时记一行：这一行一秒一次会被刷爆，而它要回答的只是
     // "系统给没给我们的图标矩形、什么时候给不出来"。
     if (changed) {
-        TrayLog(L"[tray] 图标矩形（Shell_NotifyIconGetRect 精确值）：(%ld,%ld,%ld,%ld) "
+        TrayLogVerbose(L"[tray] 图标矩形（Shell_NotifyIconGetRect 精确值）：(%ld,%ld,%ld,%ld) "
                 L"= %ldx%ld 像素",
                 r.left, r.top, r.right, r.bottom, r.right - r.left, r.bottom - r.top);
     }
@@ -1155,7 +1172,7 @@ HWND TrayIcon::PopupMenu(HWND hwnd) {
     const RECT item = MenuItemRect(panel, RectSpace::Screen);
     RECT wr{};
     GetWindowRect(panel, &wr);
-    TrayLog(L"[tray] 菜单面板已弹出（**非模态**：帧循环照常跑）：面板=%p 窗口=(%ld,%ld,%ld,%ld) "
+    TrayLogVerbose(L"[tray] 菜单面板已弹出（**非模态**：帧循环照常跑）：面板=%p 窗口=(%ld,%ld,%ld,%ld) "
             L"「关闭」那一条=(%ld,%ld,%ld,%ld) 尺寸=%dx%d dpi=%u 光标=(%ld,%ld) 落点=(%d,%d) "
             L"AttachThreadInput=%ls 弹出时前台=%ls 时限=%u ms",
             panel, wr.left, wr.top, wr.right, wr.bottom, item.left, item.top, item.right,

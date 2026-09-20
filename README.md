@@ -47,8 +47,22 @@ build\dshb.exe
 没有安装步骤，没有注册表写入。
 
 `--selftest --seconds=N` 跑 N 秒后自动退出，并把窗口与 DPI 的事实、帧统计写进
-**exe 旁边的 `selftest.log`**（路径来自 `GetModuleFileNameW`，所以是 exe 所在目录，
-不是当前工作目录）。程序是 GUI 子系统，**没有控制台，写 stdout 等于丢掉** —— 所以日志只落文件。
+**`%LOCALAPPDATA%\deepseek-balance\dshb.log`**（与 `curve.json` 同目录）。
+程序是 GUI 子系统，**没有控制台，写 stdout 等于丢掉** —— 所以日志只落文件。
+
+日志的落点、写不写、写多大，**全部收口在 `src\dshb_log.h`**，改之前先读那一段：
+
+- **落点**：`%LOCALAPPDATA%\deepseek-balance\dshb.log`。**绝不写到 exe 旁边** ——
+  所有者报过"运行完在目录下冒出一个 selftest.log"，而当时是**三个写入者**
+  （`main.cpp` / `tray.cpp` / `renderer.cpp`）各写各的 exe 同目录。
+- **写不写**：命令行里出现任何 `--` 开头的开关就算"开发/测试调用"，详细日志（帧率、
+  每轮采样、拖动与托盘菜单的逐步细节）才写。双击 exe 时命令行是空的 → 只写用户报症状时
+  定得了位的那几行（路径、密钥来源、接口主机、托盘图标成败、启动过渡）。两个显式开关：
+  `--log-verbose` / `--log-quiet` 各自压过判据，`--log-file=<路径>` 换落点。
+- **写多大**：单一文件、**1 MB 上限**，超了截断重开。**不做多份轮转** —— 所有者的抱怨
+  正是"目录里冒出文件"，为修它去攒三个 5 MB 的文件方向是反的。
+  实测：生产调用跑 60 秒仍是 **7 行 / 0.7 KB**（几乎全是启动时一次性的），
+  所以正常使用下这个上限基本碰不到。
 
 日常观察用的脚本（都不写数据目录）：
 
@@ -75,11 +89,11 @@ build\dshb.exe
 | --- | --- | --- |
 | `config.json` | `src\panel_drag.cpp` | 面板位置，拖动/吸附后更新 |
 | `curve.json` | `src\curve_store.cpp` | 曲线点历史；**只在余额变化时记点** |
-| `samples.jsonl` | **没有代码在写** | `Paths()` 里声明了它，只有 `--selftest` 的日志会打印这个路径 |
-| `widget.log` | **没有代码在写** | 同上；日志实际写在 exe 旁边的 `selftest.log` |
+| `dshb.log` | `src\dshb_log.h` | 运行日志。单一文件、1 MB 上限；详细程度看这次是不是开发调用 |
+| `samples.jsonl` | **没有代码在写** | `Paths()` 里声明了它，只有 `[paths]` 那一行日志会打印这个路径 |
 | `fx.json`、`wheel-trace.log` | **没有代码在写** | 已删功能留下的旧文件，不会被读 |
 
-后三行是历史遗留，不是设计。看到它们不要以为有功能在用。
+最后两行是历史遗留，不是设计。看到它们不要以为有功能在用。
 
 **测试时永远不要碰所有者自己的 `config.json` / `curve.json`。**
 
@@ -144,7 +158,9 @@ build\dshb.exe --curve-store=C:\tmp\curve.json --config=C:\tmp\config.json
 
 | 开关 | 作用 |
 | --- | --- |
-| `--selftest [--seconds=N]` | 跑 N 秒，把窗口/DPI/帧统计写进 exe 旁的 `selftest.log` |
+| `--selftest [--seconds=N]` | 跑 N 秒，把窗口/DPI/帧统计写进日志（落点见上；它本身就会打开详细日志） |
+| `--log-verbose` / `--log-quiet` | 强制打开 / 关掉详细日志（判据见 `src\dshb_log.h`） |
+| `--log-file=<路径>` | 换日志落点（探针用它把子进程的日志隔离到临时目录） |
 | `--selftest-b` | 金额解析与状态机的自检（不建窗口也能看的那部分） |
 | `--debug` | 显示调试浮层 |
 | `--fixed-amount=N` | 把余额钉在 N，不再取样、不再变化 |

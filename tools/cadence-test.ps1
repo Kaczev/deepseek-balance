@@ -15,7 +15,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $exe  = Join-Path $root 'build\dshb.exe'
-$log  = Join-Path $root 'build\selftest.log'
+# 日志落点：2026-09-19 起不再是 exe 旁边的 selftest.log，而是数据目录里的 dshb.log
+# （唯一出处是 src\dshb_log.h 的 LogFilePath()）。这里跟着挪，否则本脚本会静默读到空文件。
+$log  = Join-Path $env:LOCALAPPDATA 'deepseek-balance\dshb.log'
 
 Get-Process dshb -ErrorAction SilentlyContinue | ForEach-Object { $_.Kill() }
 Start-Sleep -Milliseconds 400

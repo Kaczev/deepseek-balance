@@ -14,7 +14,7 @@ rem  --display freezes the display number, so nothing animates and the picture h
 rem  still. --report writes each place's 纵实际坐标 / 纵显示坐标 to the log and paints
 rem  the table on the window.
 rem
-rem  The log is build\selftest.log. Close it from the tray menu (Esc no longer closes it).
+rem  The log is %%LOCALAPPDATA%%\deepseek-balance\dshb.log (moved out of the exe folder).
 rem ============================================================
 setlocal
 
@@ -39,5 +39,5 @@ set "REP=--report"
 if "%SHOWREP%"=="0" set "REP="
 
 echo [look] real=%REAL% display=%DISP% (frozen) %REP%
-echo [look] the coordinate table goes to build\selftest.log and onto the window.
+echo [look] the coordinate table goes to %%LOCALAPPDATA%%\deepseek-balance\dshb.log and onto the window.
 "%EXE%" --real=%REAL% --display=%DISP% --no-anim %REP%

@@ -4,6 +4,7 @@
 // 鏁板瓧銆佹洸绾裤€侀鑹层€佸績璺抽兘鏄悗闈㈡楠ょ殑浜嬶紙瀹炴柦姝ラ C/D/E锛夈€?
 
 #include "renderer.h"
+#include "dshb_log.h"    // 日志落点与写入的唯一实现（layout 探针曾自己写 exe 同目录）
 #include "heartbeat.h"   // kBeatAMax：窗口区域要留出心跳的行程
 #include "curve.h"   // 单调三次插值（氛围曲线）
 #include "roll_axis.h"
@@ -246,36 +247,30 @@ void SetLayoutProbe(bool on) {
     g_probe.enabled = on;
 }
 
-// 鐢诲畬涔嬪悗鐢卞闈㈣皟鐢細鎶婄粯鍒舵湡闂磋涓嬬殑鏁板€煎啓鍑哄幓銆?
-// **涓嶅湪缁樺埗璺緞閲屽啓鏂囦欢**鈥斺€旈偅浼氭妸杩涚▼寮勫穿銆?
+// 画完之后由外面调用：把绘制期间记下的数值写出去。
+// **不在绘制路径里写文件**——那会把进程弄崩。
 void DumpLayoutProbe() {
     if (!g_probe.enabled || !g_probe.filled) return;
-    wchar_t exe[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    if (wchar_t* slash = wcsrchr(exe, L'\\')) *(slash + 1) = L'\0';
-    std::wstring path = exe;
-    path += L"layout.log";
-
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), L"a, ccs=UTF-8") == 0 && f) {
-        fwprintf(f, L"[layout] 瀹炰綋鍖轰腑蹇?cx=%.2f 绗﹀彿瀹?%.2f 鏁板瓧瀹?%.2f 鍚堝苟鍧楀乏缂?%.2f\n",
-                 g_probe.centerX, g_probe.symbolW, g_probe.digitsW, g_probe.left);
-        fwprintf(f, L"[layout] 鏁板瓧椤?%.2f 鏍囬妗?%.2f,%.2f 鍙宠竟鐣?%.2f\n", g_probe.numberTop,
-                 g_probe.boxLeft, g_probe.boxTop, g_probe.boxRight);
-        fwprintf(f, L"[layout] h(=line advance, 相邻数字间距) = %.4f DIP  [scale 1.0 时等于像素]\n",
-                 g_probe.lineH);
-        const float blockCenter = g_probe.left + (g_probe.symbolW + g_probe.digitsW) * 0.5f;
-        fwprintf(f, L"[layout] 鍚堝苟鍧椾腑蹇?%.2f 涓庡疄浣撳尯涓績涔嬪樊=%.2f锛堢洰鏍囷細鎺ヨ繎 0锛塡n",
-                 blockCenter, blockCenter - g_probe.centerX);
-        if (!g_probe.symbolAlign.empty()) {
-            fwprintf(f, L"[layout] %hs\n", g_probe.symbolAlign.c_str());
-        }
-        if (g_probe.todaySize > 0.0f) {
-            fwprintf(f, L"[layout] 今日已行: 墨迹 %.2f..%.2f (宽 %.2f, 字号 %.1f DIP)\n",
-                     g_probe.todayInkLeft, g_probe.todayInkRight, g_probe.todayInkWidth,
-                     g_probe.todaySize);
-        }
-        fclose(f);
+    // 落点与写入收口在 dshb_log.h（原来是"exe 同目录的 layout.log"——那是所有者报的
+    // "运行完在目录下冒出日志文件"里的**第三个**写入者）。
+    // ★ 逐行走 LogVerbose：这套数值只在 --layout-probe 下有值，而那个开关本身就会让
+    //   "这次是开发调用"成立（判据见 dshb_log.h），所以行为不变。
+    if (g_probe.todaySize > 0.0f) {
+        dshb::LogVerbose(L"[layout] 今日已行: 墨迹 %.2f..%.2f (宽 %.2f, 字号 %.1f DIP)",
+                         g_probe.todayInkLeft, g_probe.todayInkRight, g_probe.todayInkWidth,
+                         g_probe.todaySize);
+    }
+    dshb::LogVerbose(L"[layout] 实体区中心 cx=%.2f 符号宽=%.2f 数字宽=%.2f 合并块左缘=%.2f",
+                     g_probe.centerX, g_probe.symbolW, g_probe.digitsW, g_probe.left);
+    dshb::LogVerbose(L"[layout] 数字顶=%.2f 标题框=%.2f,%.2f 右边界=%.2f", g_probe.numberTop,
+                     g_probe.boxLeft, g_probe.boxTop, g_probe.boxRight);
+    dshb::LogVerbose(L"[layout] h(=line advance, 相邻数字间距) = %.4f DIP  [scale 1.0 时等于像素]",
+                     g_probe.lineH);
+    const float blockCenter = g_probe.left + (g_probe.symbolW + g_probe.digitsW) * 0.5f;
+    dshb::LogVerbose(L"[layout] 合并块中心=%.2f 与实体区中心之差=%.2f（目标：接近 0）", blockCenter,
+                     blockCenter - g_probe.centerX);
+    if (!g_probe.symbolAlign.empty()) {
+        dshb::LogVerbose(L"[layout] %hs", g_probe.symbolAlign.c_str());
     }
 }
 

@@ -113,7 +113,21 @@ void TryMakeDirectory(const std::string& utf8Dir) {
 // fetches, so a wrong system clock can only ever make the store *more* eager to
 // discard -- it can never resurrect stale points -- and a future timestamp yields a
 // negative elapsed time, which never expires.
-int64_t NowSeconds() { return static_cast<int64_t>(::time(nullptr)); }
+//
+// ★ 探针时钟夹具：这台时钟**直接决定一个存储算不算过期**（`kExpirySeconds = 24 h`），
+//   于是任何"把夹具的点和时间钉死在某个绝对值"的用例，都会在真实时钟走过那段之后
+//   整体过期 —— 断言从某一刻起永远为红，而代码一个字都没改。
+//   实测：`panelprobe` 的 case5 把时钟钉在 2026-09-19 12:00，9/20 12:39 再跑就变成
+//   「今天一个带时间的点都没有」→ 三条断言全红（而且 `case5c` 是**因为错误的原因通过**：
+//   它期望 `--.--`，此刻所有 case 都返回 `--.--`）。
+//   形状与 `SetTodayUsageNowForProbe`（widget_display）一致：只有探针会调 setter，
+//   生产路径不调，默认值 0 = 用真实时钟。
+int64_t g_nowOverrideSeconds = 0;
+int64_t NowSeconds() {
+    return g_nowOverrideSeconds > 0 ? g_nowOverrideSeconds
+                                    : static_cast<int64_t>(::time(nullptr));
+}
+
 
 // --- JSON writing ------------------------------------------------------------
 // json_min.h is a READER only (json_min.h: "minimal JSON reader"), so the writer for
@@ -243,6 +257,10 @@ bool ParseWholeSeconds(const std::string& text, int64_t* out) {    if (text.empt
 }
 
 }  // namespace
+
+// 探针时钟夹具的实现。★ 必须留在**匿名 namespace 外面** —— 写在里面就是内部链接，
+// 探针链接得到 .obj 也解析不到符号（实测：LNK2019 无法解析的外部符号）。
+void SetCurveStoreNowForProbe(int64_t nowSeconds) { g_nowOverrideSeconds = nowSeconds; }
 
 const char* CurveLoadResult::StatusName() const {
     switch (status) {

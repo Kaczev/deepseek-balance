@@ -1,5 +1,7 @@
 #include "paths.h"
 
+#include "dshb_log.h"   // LogFilePath()：日志落点与写入的唯一实现
+
 #include <shlobj.h>
 
 #include <cstdio>
@@ -66,8 +68,10 @@ const AppPaths& Paths() {
     }
 
     g_paths.dataDir = Join(base, L"deepseek-balance");
-    g_paths.samples = Join(g_paths.dataDir, L"samples.jsonl");
-    g_paths.log = Join(g_paths.dataDir, L"widget.log");
+    // ★ 日志路径不在这里拼：它是一个需要与写入端一致、并且有上限策略的东西，
+    //   收口在 dshb_log.h 的 LogFilePath()（那边写着为什么——曾经有三个写入者
+    //   各写各的 exe 同目录）。这里只把那个结果报出去，供 `[paths]` 那一行使用。
+    g_paths.log = LogFilePath();
     g_paths.config = Join(g_paths.dataDir, L"config.json");
 
     std::wstring reason;

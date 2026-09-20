@@ -124,10 +124,10 @@ std::wstring ExeDir() {
     return buf;
 }
 
-// 子进程的日志落点：SelfTestLog 的口径是"exe 旁边那个 selftest.log"，本探针与被测程序
-// 在同一个目录里，所以这是同一个文件。
-std::wstring LogPath() { return ExeDir() + L"selftest.log"; }
-
+// 子进程的日志落点。★ 2026-09-19 起**不再**是"exe 旁边那个 selftest.log"：
+// 所有者报"运行完在目录下冒出日志文件"，产品的日志挪到了 %LOCALAPPDATA%\deepseek-balance\dshb.log。
+//   形状与 --curve-store= 同一条规矩：测试的落点由测试给，不碰产品的落点。
+//   （定义放在 TempPath 之后 —— 下面那段就是它。）
 unsigned long long FileSize(const std::wstring& path) {
     WIN32_FILE_ATTRIBUTE_DATA info{};
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info)) return 0;
@@ -150,6 +150,15 @@ std::wstring TempPath(const std::wstring& leaf) {
     wchar_t dir[MAX_PATH]{};
     if (GetTempPathW(MAX_PATH, dir) == 0) return std::wstring();
     return std::wstring(dir) + leaf;
+}
+
+// 子进程的日志落点：探针自己的临时文件，通过 --log-file= 交给子进程，自己读同一个。
+// ★ 为什么不用产品那个落点（%LOCALAPPDATA%\...\dshb.log，唯一出处是 dshb::Paths().log）：
+//   日志只有一个落点之后，探针拉起的子进程会与所有者正在跑的挂件**写同一个文件**，
+//   而这里是按**字节偏移**读它（先记大小、再读新增部分）—— 两个进程同时写会互相干扰，
+//   而且探针的噪声会进所有者会去看的那份日志。
+std::wstring LogPath() {
+    return TempPath(L"dshb-dragprobe-" + std::to_wstring(GetCurrentProcessId()) + L"-log.log");
 }
 
 bool ReadFileText(const std::wstring& path, std::string* out) {
@@ -354,6 +363,9 @@ bool LaunchChild(Child* child, const std::wstring& configPath, const std::wstrin
     child->logFrom = FileSize(LogPath());
 
     std::wstring cmd = L"\"" + g_exePath + L"\" --force-new-instance";
+    // --log-file=：把子进程的日志指到本次探针自己的临时文件。★ 必须有：日志只有一个落点，
+    //   而所有者可能正跑着一个挂件，两个进程写同一个文件会互相干扰（下面按字节偏移读它）。
+    cmd += L" --log-file=\"" + LogPath() + L"\"";
     // --force-new-instance：所有者自己那个实例可能正跑着。--api=off：量帧率时不能有后台
     // HTTP 线程插进来。--curve-store=：测试绝不能写所有者的 curve.json。
     if (!configPath.empty()) cmd += L" --config=\"" + configPath + L"\"";

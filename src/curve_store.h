@@ -300,7 +300,6 @@ public:
     // §2.3 applied to "now": would the stored data be discarded right now?
     // True when update_at is unknown, since nothing usable is stored then.
     bool Expired(int64_t nowSeconds) const;
-
     // The newest point's value for the PRIMARY currency, or "" when there is none.
     // The value the next Append() compares against (§2.1).
     const std::string& lastPrimaryText() const { return lastPrimaryText_; }
@@ -316,5 +315,12 @@ private:
     std::string lastPrimaryCurrency_;  // which currency that value belongs to
     std::string clearReason_;          // "stale" / "no timestamp" / empty
 };
+
+// 探针时钟夹具（见 curve_store.cpp 里的说明）：把"现在"钉在一个固定值。
+// ★ 为什么需要它：这台时钟直接决定一个存储**算不算过期**（kExpirySeconds = 24 h）。
+//   夹具若把点和时间钉死在某个绝对值，真实时钟走过 24 小时之后**整个存储过期、
+//   点全被丢掉**，于是"今天没有带时间的点"→ 断言从某一刻起永远为红，代码却一个字没改。
+//   0 = 用真实时钟（默认）；**只有探针会调它**，生产路径不调。
+void SetCurveStoreNowForProbe(int64_t nowSeconds);
 
 }  // namespace dshb
