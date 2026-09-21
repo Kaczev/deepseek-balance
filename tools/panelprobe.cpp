@@ -4,15 +4,15 @@
 //   panelprobe --verbose  also print the assembled point list
 //
 // The property under test, in one sentence: **the panel draws the newest 12 points of
-// whatever the store holds, never more**, so raising CurveStore::kCapacity from 12 to 120
-// changes the data layer and leaves the panel alone.
+// whatever the store holds, never more**, so the store's capacity can grow (it now covers
+// a whole day of changes) and the panel stays where it is.
 //
 // Why this needs its own probe instead of one more case in storeprobe: storeprobe does
 // not link widget_display.cpp (that layer pulls in Win32 and the ambience model), and the
 // property under test is a *display* property that a *store* constant can break. The
 // failure it guards is specific and was real: BuildFrameCurve used to feed the whole
 // store into an 11-slot layout, which was correct only as long as the two numbers
-// happened to be equal. With a 120-point ring and no slice, all 120 points get laid out
+// happened to be equal. Without the slice, every point the store holds gets laid out
 // on 11 slots and the curve collapses into a thread.
 //
 // ★ How it reaches the layer: through the real file path (Save -> SetCurveStorePath ->
@@ -87,6 +87,18 @@ std::string TempPath(const char* name) {
     std::string out(static_cast<std::size_t>(need - 1), '\0');
     WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, out.data(), need, nullptr, nullptr);
     return out;
+}
+
+bool FileExists(const std::string& path) {
+    const std::wstring wide = Wide(path);
+    if (wide.empty()) return false;
+    const DWORD attributes = GetFileAttributesW(wide.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+void RemoveFile(const std::string& path) {
+    const std::wstring wide = Wide(path);
+    if (!wide.empty()) DeleteFileW(wide.c_str());
 }
 
 // A curve store built through the real Append() path, so "only a change becomes a point"
@@ -490,8 +502,229 @@ int main(int argc, char** argv) {
                    got == want);
         }
 
+        // (5e) A FULL DAY OF CHANGES -- one per poll -- is still counted in full. This is
+        //      the case that makes the ring's capacity a DISPLAY-visible number, and it is
+        //      the reason the capacity is derived from the poll rhythm rather than picked.
+        //
+        //      The store appends a point only where the balance CHANGED (curve_store §2.1),
+        //      so once the ring is full every append also EVICTS the oldest point of today.
+        //      When today's sum is taken over the ring -- which is what TodayUsageFromStore
+        //      does -- the evicted step's drop leaves the sum with it, and the title line
+        //      counts DOWN while the balance counts down too. Measured on the real machine
+        //      while the ring held 120 points: "今日已" read 9.45 with 120 points covering
+        //      00:51-21:50, and the next eviction cost 0.13 against a 0.01 arrival, so each
+        //      append made the line smaller by 0.12. The owner saw it as 10 -> 9.99 -> 9.45.
+        //
+        //      The fixture is one local day's WORTH OF POLLS, every one of them a change: 8640
+        //      points, the number a day can produce at the fixed 10 s rhythm (kCapacity is
+        //      that number plus the baseline slot -- see case 5f for why the slot is needed).
+        //      Every value is one cent below the previous one, so the drops between the points
+        //      are exactly 8639 cents and nothing else.
+        //      ★ What is asserted: the line equals that sum, the ring's points are all still
+        //        here, and every one of them is dated today. At capacity 120 the line comes
+        //        out 119 cents instead of 8639 -- the ring kept only the newest 120 points.
+        //      ★ What this case does NOT cover: the day's FIRST drop, the one that spans
+        //        midnight. It has no point before midnight, so that drop does not exist in its
+        //        fixture and its total is not evidence about it. Case 5f is that check.
+        {
+            dshb::CurveStore store;
+            // 1000.00 at the day's first poll, then one cent less every 10 s: the amount is
+            // integer arithmetic in cents, so the expected total is exact and is not read
+            // back from the store (a sum derived from the store would agree with the bug).
+            // ★ 8640 polls is the ceiling a calendar day can hold (10 s apart, so a later
+            //   point would land on the next day). It is written as a number rather than as
+            //   kCapacity on purpose: kCapacity carries one extra slot for the baseline, and
+            //   a fixture that grew with it would stop testing the ceiling.
+            constexpr int kPoints = 8640;
+            constexpr int kStepSeconds = 10;   // tuning.h's kApiIntervalMs, in seconds
+            int64_t cent = 100000;
+            for (int i = 0; i < kPoints; ++i) {
+                char amount[32];
+                std::snprintf(amount, sizeof(amount), "%lld.%02lld", static_cast<long long>(cent / 100),
+                              static_cast<long long>(cent % 100));
+                FeedPoint(&store, amount, midnight + 1 + static_cast<int64_t>(i) * kStepSeconds);
+                cent -= 1;
+            }
+            // One drop per pair of consecutive points: the first of the day's points opens the
+            // series, so a day of kPoints points holds kPoints-1 drops.
+            const long long wantCents = static_cast<long long>(kPoints) - 1;
+            const long long smallestCent = cent;   // one cent below the last point fed
+
+            const std::string got = TodayLineAt(store, "today-full", kNow);
+            // The line is "<4 Chinese chars> <amount>¥"; the amount is ASCII "W.FF", read as
+            // CENTS so the comparison is exact integer arithmetic and never a float.
+            long long gotCents = -1;
+            const std::size_t space = got.find(' ');
+            const std::size_t dot = got.find('.', space == std::string::npos ? 0 : space);
+            if (space != std::string::npos && dot != std::string::npos && dot + 3 <= got.size()) {
+                const long long whole = std::stoll(got.substr(space + 1, dot - space - 1));
+                const long long frac = std::stoll(got.substr(dot + 1, 2));
+                gotCents = whole * 100 + frac;
+            }
+            const bool counted = gotCents == wantCents;
+
+            // The raw material, counted independently: every point the line sums over must
+            // be dated today. The line's own arithmetic is not allowed to be the only
+            // witness -- if the ring lost a point, this count says so first.
+            long long datedToday = 0;
+            for (std::size_t i = 0; i < store.size(); ++i) {
+                if (store.At(i).atValid && store.At(i).at >= midnight) ++datedToday;
+            }
+            const bool allToday = datedToday == kPoints && store.size() == kPoints;
+
+            std::printf("    today fixture (local day %s, midnight=%lld): %d distinct values, "
+                        "1000.00 descending 0.01 every %d s -> today's spend is %lld.%02lld\n",
+                        localDay.c_str(), static_cast<long long>(midnight), kPoints, kStepSeconds,
+                        static_cast<long long>(wantCents / 100),
+                        static_cast<long long>(wantCents % 100));
+            h.Req("case5e", "a full day of changes -- one per poll -- is still reported as the "
+                            "whole day's spend",
+                   "fed " + Num(kPoints) + " distinct values one cent apart in one local day, "
+                   "ring capacity=" + Num(static_cast<long long>(dshb::CurveStore::kCapacity)) +
+                       "; store holds " + Num(static_cast<long long>(store.size())) + " points (" +
+                       Num(datedToday) + " dated today), lowest balance " +
+                       Num(static_cast<long long>(smallestCent / 100)) + "." +
+                       Num(static_cast<long long>(smallestCent % 100)) + " -> \"" + got + "\" = " +
+                       Num(gotCents) + " cents, want " + Num(wantCents) +
+                       " cents (a ring too small for the day loses today's oldest drops, and this "
+                       "line then counts DOWN while the balance counts down)",
+                   counted && allToday);
+        }
+
+        // (5f) THE DAY'S FIRST DROP SPANS MIDNIGHT, and the ring has to still hold the point
+        //      it hangs from. TodayUsageFromStore takes its baseline from the newest point
+        //      BEFORE local midnight (see the long note above that function: the store records
+        //      no point at midnight because nothing changed then), and today's first drop is
+        //      measured from it. That baseline is one point older than any point of today, so a
+        //      day that actually uses its 8640 changes evicts it unless the ring has one slot
+        //      for it -- and losing it drops the whole overnight fall out of "今日已".
+        //      ★ The fixture is case 5e's day plus that baseline (yesterday 1000.00), and the
+        //        day opens with a 100.00 fall instead of one cent, so the missing step is
+        //        unmistakable in the total: 100.00 + 0.01 x 8639 = 186.39, not 86.39.
+        //      ★ It is a separate case and not a tightening of 5e because the two measure
+        //        different things: 5e measures "the whole day fits", 5f measures "the day's
+        //        first drop survives the day". 5e's fixture cannot see this one at all (it has
+        //        no point before midnight).
+        {
+            dshb::CurveStore store;
+            constexpr int kDayPoints = 8640;      // a full day of polls, as in case 5e
+            constexpr int kStepSeconds = 10;
+            FeedPoint(&store, "1000.00", midnight - 10);   // yesterday 23:59:50: the baseline
+
+            // The day opens 100.00 lower than yesterday's close, then falls one cent per poll.
+            int64_t cent = 90000;                 // 900.00
+            for (int i = 0; i < kDayPoints; ++i) {
+                char amount[32];
+                std::snprintf(amount, sizeof(amount), "%lld.%02lld",
+                              static_cast<long long>(cent / 100),
+                              static_cast<long long>(cent % 100));
+                FeedPoint(&store, amount, midnight + 1 + static_cast<int64_t>(i) * kStepSeconds);
+                cent -= 1;
+            }
+            // 100.00 across midnight + one cent per pair of the day's points.
+            const long long wantCents = 10000 + static_cast<long long>(kDayPoints) - 1;
+
+            const std::string got = TodayLineAt(store, "today-baseline", kNow);
+            long long gotCents = -1;
+            const std::size_t space = got.find(' ');
+            const std::size_t dot = got.find('.', space == std::string::npos ? 0 : space);
+            if (space != std::string::npos && dot != std::string::npos && dot + 3 <= got.size()) {
+                const long long whole = std::stoll(got.substr(space + 1, dot - space - 1));
+                const long long frac = std::stoll(got.substr(dot + 1, 2));
+                gotCents = whole * 100 + frac;
+            }
+
+            // The two facts the total rests on, counted independently of the line: the ring
+            // still carries the one point dated before midnight, and it still carries the
+            // whole day.
+            long long beforeMidnight = 0;
+            long long datedToday = 0;
+            for (std::size_t i = 0; i < store.size(); ++i) {
+                if (!store.At(i).atValid) continue;
+                if (store.At(i).at < midnight) ++beforeMidnight;
+                else ++datedToday;
+            }
+            const bool bothHeld = beforeMidnight == 1 && datedToday == kDayPoints;
+            const bool counted = gotCents == wantCents;
+
+            std::printf("    midnight fixture (local day %s): yesterday 1000.00 @ midnight-10 s, "
+                        "then %d changes today opening with a 100.00 drop -> today's spend is "
+                        "%lld.%02lld\n",
+                        localDay.c_str(), kDayPoints, static_cast<long long>(wantCents / 100),
+                        static_cast<long long>(wantCents % 100));
+            h.Req("case5f", "a full day of changes keeps the midnight baseline, so the drop that "
+                            "spans midnight is counted",
+                   "yesterday 1000.00 @ midnight-10 s, then " + Num(kDayPoints) +
+                       " changes today (first one 100.00 lower), ring capacity=" +
+                       Num(static_cast<long long>(dshb::CurveStore::kCapacity)) + "; ring holds " +
+                       Num(static_cast<long long>(store.size())) + " points (" +
+                       Num(beforeMidnight) + " dated before midnight, " + Num(datedToday) +
+                       " today) -> \"" + got + "\" = " + Num(gotCents) + " cents, want " +
+                       Num(wantCents) + " cents (with the baseline evicted only the day's own " +
+                       Num(static_cast<long long>(kDayPoints) - 1) +
+                       " drops remain: the whole overnight fall leaves the total)",
+                   counted && bothHeld);
+        }
+
         // Restore the real clock for anything that runs after this case.
         dshb::SetTodayUsageNowForProbe(0);
+    }
+
+    // -----------------------------------------------------------------------
+    // (6) The FIRST point of an empty store reaches the file. "Empty" is the state of a new
+    //     install, and of a store the 86400 s rule has just cleared (curve_store §2.3) -- and
+    //     in both, the point appended by the very next change is the only record there is. The
+    //     display layer decides whether to save by asking "did the ring change?", and it asks
+    //     that of a SLICE of the ring (the newest handful of points, so a frame does not copy
+    //     a day of them). An empty and a one-point store have different sizes but their slices
+    //     both hold one point, so a size-blind comparison answers "nothing changed" exactly
+    //     where the answer matters most: nothing is written, and a crash loses the first change.
+    //
+    //     The sample goes in the way production feeds it -- DisplayedAmount::OnSample, the
+    //     function the widget calls with every fetched balance -- so this is the real path and
+    //     not a call to the store.
+    // -----------------------------------------------------------------------
+    {
+        const std::string path = TempPath("firstpoint");
+        if (!path.empty()) RemoveFile(path);
+        dshb::SetCurveStorePath(Wide(path));       // loads: nothing there -> the store is empty
+
+        const bool absentBefore = !path.empty() && !FileExists(path);
+        h.Req("case6a", "the fixture starts with no curve file at all, so \"saved\" and \"not "
+                        "saved\" can be told apart",
+               "empty store pointed at " + path + " -> file exists=" +
+                   (FileExists(path) ? "YES (the case cannot distinguish anything)" : "no"),
+               absentBefore);
+
+        dshb::DisplayedAmount display;
+        dshb::Sample sample{};
+        sample.wallMs = static_cast<int64_t>(::time(nullptr)) * 1000;
+        sample.amountsOk = true;
+        sample.currency = "CNY";
+        sample.total = dshb::Amount::FromYuanDouble(48.80);
+        dshb::CurrencyAmount entry{};
+        entry.currency = "CNY";
+        entry.total = sample.total;
+        entry.ok = true;
+        sample.entries.push_back(entry);
+        display.OnSample(sample);                  // -> FeedCurve -> Append + Save
+
+        const bool written = FileExists(path);
+        // Read the file back instead of trusting the display layer's own state: "it was saved"
+        // is a claim about the bytes on disk.
+        dshb::CurveStore reloaded;
+        const dshb::CurveLoadResult loaded = written ? reloaded.Load(path) : dshb::CurveLoadResult{};
+        const bool onePoint = loaded.ok && reloaded.size() == 1;
+        h.Req("case6b", "the first change of a new install is written to the curve file",
+               "empty store + one sample (48.80) through OnSample -> file exists=" +
+                   std::string(written ? "yes" : "NO (the first change would be lost on a crash)") +
+                   ", reloads as " + Num(static_cast<long long>(reloaded.size())) + " point(s), ok=" +
+                   std::string(loaded.ok ? "yes" : "no") + " (" + loaded.detail + ")",
+               written && onePoint && absentBefore);
+
+        // Leave the display layer pointing at an empty store again: this probe's other cases
+        // each install their own fixture, and a stray point would be one more thing to explain.
+        dshb::SetCurveStorePath(Wide(path + "-cleared.json"));
     }
 
     std::printf("checks: %d passed, %d failed\n", h.passed, h.failed);

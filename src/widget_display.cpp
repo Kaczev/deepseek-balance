@@ -3,7 +3,7 @@
 #include "amount.h"        // Amount / ParseAmount：纵坐标从十进制原文解析，不用二进制浮点
 #include "curve_store.h"
 
-#include <windows.h>   // WideCharToMultiByte（把宽路径转成数据层要的 UTF-8）   // CurveStore：12 点环形、只记变化、curve.json（规格 §2）
+#include <windows.h>   // WideCharToMultiByte（把宽路径转成数据层要的 UTF-8）
 
 #include <algorithm>
 #include <cmath>
@@ -396,9 +396,9 @@ double StepIntoPointPerMinute(const CurveStorePoint& previous, const CurveStoreP
 // 没有两个可用点（首次运行、只有一个点、时间戳缺失）-> 返回 0：
 // 那时"这一步"根本不存在，颜色就是基准色（R = 0），不编造。
 double StepIntoNewestPointPerMinute() {
-    const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
-    if (points.size() < 2) return 0.0;
-    return StepIntoPointPerMinute(points[points.size() - 2], points.back());
+    const std::size_t n = g_curveStore.size();
+    if (n < 2) return 0.0;
+    return StepIntoPointPerMinute(g_curveStore.At(n - 2), g_curveStore.At(n - 1));
 }
 
 // 这一步有多陡（元/分钟）：**从最后一次变化，量到这一拍**。
@@ -430,8 +430,9 @@ double StepIntoNewestPointPerMinute() {
 //   R 的衰减曲线整体晚一个采样间隔（实测：陡降后平静 60 秒，R 量成 0.6227 而不是 0.4995，
 //   因为 Δt 只算了 50 秒）。Δ 由调用方按"上一个样本的时间"传进来。
 double StoreStepPerMinuteAt(int64_t nowSeconds) {
-    const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
-    if (points.empty()) return 0.0;
+    // ★ 就地读（`At`），不整环拷贝：这是每帧一次的路径，而环的容量是"一整天的变化数"。
+    const std::size_t n = g_curveStore.size();
+    if (n == 0) return 0.0;
 
     // ---- 首选：从"最后一次变化"量到"现在" ----
     //  ★ 无论这一拍**有没有落点**，量的都是同一段：最新那个点（= 最后一次变化）
@@ -440,10 +441,10 @@ double StoreStepPerMinuteAt(int64_t nowSeconds) {
     //    ★ 这一点我一开始分成了两条分支，分别量"最后两个点之间"和"最新点 → 现在"，
     //      于是同一个 60 秒被量成 50 秒或 60 秒，取决于那一拍落没落点 —— 两条路必须
     //      给出同一个答案，而"同一个答案"只有把端点定死才能保证。
-    if (points.size() >= 2 && nowSeconds > points.back().at) {
+    if (n >= 2 && nowSeconds > g_curveStore.At(n - 1).at) {
         Amount newestAmount;
-        if (CurveValueOfEntry(points.back(), &newestAmount)) {
-            double dt = static_cast<double>(nowSeconds - points.back().at);
+        if (CurveValueOfEntry(g_curveStore.At(n - 1), &newestAmount)) {
+            double dt = static_cast<double>(nowSeconds - g_curveStore.At(n - 1).at);
             if (dt < 1.0) dt = 1.0;            // 同一秒、或时间戳没变：至少按 1 秒算
             if (dt >= kStepGapAwayThresholdSeconds) dt = kStepGapCapSeconds;
             // ★ 参数顺序 = (上一个量, 这一个量, Δt)：`StepPerMinute` 算的是 (cur - prev)。
@@ -452,12 +453,12 @@ double StoreStepPerMinuteAt(int64_t nowSeconds) {
             return StepPerMinute(newestAmount.ToDouble(), g_currentStepFromBalance, dt);
         }
     }
-    if (points.size() < 2) return 0.0;             // 只有一个点且没有"现在"：无从判断
+    if (n < 2) return 0.0;             // 只有一个点且没有"现在"：无从判断
 
     // ---- 退回：存储里最后两个可用点（时间戳缺失的那几个点在这里被跳过）----
-    for (std::size_t i = points.size(); i-- > 1;) {
-        const CurveStorePoint& cur = points[i];
-        const CurveStorePoint& prev = points[i - 1];
+    for (std::size_t i = n; i-- > 1;) {
+        const CurveStorePoint& cur = g_curveStore.At(i);
+        const CurveStorePoint& prev = g_curveStore.At(i - 1);
         if (!cur.atValid || !prev.atValid) continue;
         double dt = static_cast<double>(cur.at - prev.at);
         if (!(dt > 0.0)) continue;
@@ -525,7 +526,14 @@ bool SamePoints(const std::vector<CurveStorePoint>& a, const std::vector<CurveSt
 // 记录文件的路径（main 启动时给一次）。为空 = 不落盘（导帧路径就是这样）。
 
 void FeedCurve(const Sample& s) {
-    std::vector<CurveStorePoint> before = g_curveStore.Points();
+    // ★ 只留显示宽那几个点（= 下面 `g_curveOldValid` 用的那一段），不是整环：
+    //   环里是一整天的变化数，这个函数每次轮询只跑一次，但没有理由在这里付一份
+    //   8600 个点的字符串拷贝。
+    const std::size_t beforeCount = g_curveStore.size();
+    const std::size_t beforeKeep =
+        (beforeCount < kCurveDisplayPoints) ? beforeCount : kCurveDisplayPoints;
+    // 上一拍屏幕上那 11 个点（见下面 `keep` 的说明）：比较与旧极值都只用这一段。
+    const std::vector<CurveStorePoint> before = g_curveStore.Newest(beforeKeep);
     std::vector<double> beforeValues;
     const bool beforeOk = CurveValues(before, &beforeValues);
 
@@ -577,9 +585,16 @@ void FeedCurve(const Sample& s) {
     //     像素证据见文件上方"两个『这一步有多陡』"那一段。颜色走这一条，衰减走那一条。
     g_curveStore.Append(obs, s.wallMs / 1000, std::string());
     // ★ 判定"追加了一个点"看的是**存储自己的状态**，不是 Append() 返回值的含义：
-    //   点数变了，或者环里的内容变了（容量到顶时 size() 不动，但最老的点会被挤掉）。
-    const std::vector<CurveStorePoint> after = g_curveStore.Points();
-    const bool appended = !SamePoints(before, after);
+    //   点数变了（空存储的第一个点就是这一条：前后**都空**，内容比较看不出任何差别），
+    //   或者这一段的内容变了（容量到顶时点数不动，但最老的点会被挤掉）。
+    //   比较只在**同一段**（上一拍屏幕上那 11 个）上进行，不是整环：环里是一整天的变化数，
+    //   而"曲线要不要滚动"只由这 11 个点决定 —— 拿整环比等于每拍比 8600 个点。
+    //   段长取 min(现有, 11)：环满之后"最老的点被挤掉"照样会让这一段的内容变化。
+    //   ★ 点数必须单独比：只比内容会让"空存储的第一个点"判成没追加 → 不落盘、不滚动，
+    //     全新安装（或被 86400 秒规则清空之后）第一次变化崩掉就丢。
+    const std::size_t afterCount = g_curveStore.size();
+    const std::vector<CurveStorePoint> after = g_curveStore.Newest(beforeKeep);
+    const bool appended = (afterCount != beforeCount) || !SamePoints(before, after);
     const double stepIntoNewest = StepIntoNewestPointPerMinute();
     // 回填：把"终止于最新那个点的那一步"的颜色写到**它的前一个点**上 —— 那一段就是这一步。
     // 颜色里的余额用前一个点自己的值（D 要按它自己的余额算，不能用最新那个点的）。
@@ -593,9 +608,9 @@ void FeedCurve(const Sample& s) {
     //      名字（curve.json 只存条目），而一个会话里所有点的主币种都是同一个 ——
     //      接口换主币种时，上一个点与这一个点之间本来就没有可比性。
     {
-        const std::vector<CurveStorePoint> pts = g_curveStore.Points();
-        if (pts.size() >= 2) {
-            const CurveStorePoint& prevPoint = pts[pts.size() - 2];
+        const std::size_t n = g_curveStore.size();
+        if (n >= 2) {
+            const CurveStorePoint& prevPoint = g_curveStore.At(n - 2);
             const CurveStorePoint::Entry* primary = prevPoint.Find(obs.primaryCurrency);
             Amount prevAmount{};
             if (primary != nullptr && !primary->missing && !primary->text.empty() &&
@@ -620,9 +635,9 @@ void FeedCurve(const Sample& s) {
     //     颜色只是贴在**已经算好的**那一段上的标签。"两点的线不平滑"正是不能为颜色快一拍
     //     把几何退回两点的原因。
     {
-        const std::vector<CurveStorePoint> pts = g_curveStore.Points();
-        if (!pts.empty()) {
-            const CurveStorePoint::Entry* primary = pts.back().Find(obs.primaryCurrency);
+        const std::size_t n = g_curveStore.size();
+        if (n > 0) {
+            const CurveStorePoint::Entry* primary = g_curveStore.At(n - 1).Find(obs.primaryCurrency);
             Amount newestAmount{};
             if (primary != nullptr && !primary->missing && !primary->text.empty() &&
                 ParseAmount(primary->text, &newestAmount)) {
@@ -638,12 +653,11 @@ void FeedCurve(const Sample& s) {
     g_stepMemory.current = StoreStepPerMinuteAt(g_currentStepFromAt);   // 原始量（元/分钟）
     g_stepMemory.valid = true;
 
-    // ★ 判定"追加了一个点"看的是**存储自己的状态**，不是 Append() 返回值的含义：
-    //   点数变了，或者环里的内容变了（容量到顶时 size() 不动，但最老的点会被挤掉）。
+    // ★ 判定"追加了一个点"看的是**存储自己的状态**（见上面那一段的说明），
     //   只比 size() 会在环满之后永远看不到新点（那时曲线会在生产里停住不滚）。
     if (!appended) return;
 
-    // 落盘：只在"真的追加了一个点"之后写（12 个点，代价极小；崩溃最多丢最后一次）
+    // 落盘：只在"真的追加了一个点"之后写（一次写一整天的变化数；崩溃最多丢最后一次）
     const std::string& cp = dshb::CurveStorePath();
     if (!cp.empty()) (void)g_curveStore.Save(cp);
 
@@ -676,23 +690,22 @@ void BuildFrameCurve(WidgetFrame* f) {
     f->curve.clear();
     f->curveHasData = false;
 
-    // ★ 面板的显示集与存储容量**解耦**（所有者 2026-09-19：容量 12 -> 120）。
-    //   这一层要的永远是"最新 12 个点"（11 个在看 + 1 个进场），那是一个**显示**常量
-    //   （kCurveDisplayPoints），不是存储的容量。存储从 12 涨到 120 之后，直接拿全部
-    //   存储点往下算会让滚动那一瞬间（first = 0）把 120 个点全塞进 11 个槽位——
-    //   间距变成 1/119，曲线被压成一条细丝再滑过去，面板就坏了。
-    //   所以入口先切片，后面对 n 的一切（槽位基准、span、裁剪）都基于切片自己的 size；
-    //   容量是 12 还是 120，画出来的东西逐像素相同。
-    //   代价：每次多一次 vector 拷贝（最多 12 个点，一帧一次，可以忽略）。
-    const std::vector<CurveStorePoint> allPoints = g_curveStore.Points();
-    const std::size_t keep = (allPoints.size() > kCurveDisplayPoints + 1)
+    // ★ 面板的显示集与存储容量**解耦**：这一层要的永远是"最新 12 个点"（11 个在看
+    //   + 1 个进场），那是一个**显示**常量（kCurveDisplayPoints），不是存储的容量
+    //   （curve_store.h 的 kCapacity 是一整天的变化数）。直接拿全部存储点往下算，
+    //   滚动那一瞬间（first = 0）会把整环塞进 11 个槽位 —— 间距变成 1/(n-1)，
+    //   曲线被压成一条细丝再滑过去，面板就坏了。
+    //   所以入口先切片，后面对 n 的一切（槽位基准、span、裁剪）都基于切片自己的 size。
+    //   ★ 切片用 `Newest(keep)`：它只拷这 12 个点。以前这里先 `Points()` 拿到整环
+    //     再切末尾 —— 环长到一天的变化数之后，那一份拷贝就是每帧 620 KB 的字符串。
+    const std::size_t storedCount = g_curveStore.size();
+    const std::size_t keep = (storedCount > kCurveDisplayPoints + 1)
                                  ? (kCurveDisplayPoints + 1)
-                                 : allPoints.size();
-    const std::vector<CurveStorePoint> points(allPoints.end() - static_cast<std::ptrdiff_t>(keep),
-                                              allPoints.end());
-    const std::size_t n = points.size();
+                                 : storedCount;
+    const std::size_t n = keep;
     if (n == 0) return;                         // 没有数据：渲染层画带子正中的平线
 
+    const std::vector<CurveStorePoint> points = g_curveStore.Newest(keep);
     std::vector<double> values;
     if (!CurveValues(points, &values)) return;
 
@@ -711,7 +724,7 @@ void BuildFrameCurve(WidgetFrame* f) {
     // 画哪些点、各自在哪个槽位：
     //   静止：最新 11 个，槽位 0..10（最老在左、最新在右边缘）。
     //   滚动：切片里全部点（最多 12 个 —— 切片在上面的入口就做完了，所以存储里
-    //         有 120 个点也一样），槽位再右移 0.1×(1−进度)——于是"第 12 个"
+    //         有一整天的变化数也一样），槽位再右移 0.1×(1−进度)——于是"第 12 个"
     //         从 x=1.1 进来、整条以**线性**进度左移一格，走完时正好落在"最新 11 个"。
     const double slotBase = static_cast<double>(n) - 1.0 - static_cast<double>(kCurveSegments);
     const std::size_t first = scrolling ? 0 : shownBegin;
@@ -788,10 +801,45 @@ void BuildFrameCurve(WidgetFrame* f) {
 //    "没有时间"，照样传成 atValid=false 交给估计器（它会因此报"不显著"），
 //    **绝不**拿存储的全局 update_at 顶替——那会把"没人测量过"变成一个时间。
 std::vector<RateInputPoint> RateInputForCurrency(const std::string& currency) {
-    const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
+    // ★ 就地读（`At`），并且只做**估计器真正会看的那一段**：估计器只保留最新点往前
+    //   kRateWindowSeconds（1800 s）之内的点，窗口外的点它照样丢掉。以前这里先把整环
+    //   拷成一个 vector，环涨到一整天的变化数之后，那就是每帧 8600 个点加一遍解析。
+    //   ★ 窗口端点与估计器**同一套算法**（最新的**可用**点，即时间戳和金额都读得出的
+    //     那个）——用存储里最新那个点的时刻会少算：最新点恰好没有时间戳时，估计器的
+    //     窗口从更早的那个可用点起算，照它裁会把区间内最早的那些点提前丢掉。
+    //   ★ 这一裁也让 RateEstimate 的**输入侧计数**（pointsSeen / undatedPoints /
+    //     unusablePoints）只数窗口内的点：窗口外那些点不再被看见。估计器自己本来就只按
+    //     窗口计算，所以判定与数值不受影响（见 rate_estimator.h 那几个字段上的说明）；
+    //     没有读方依赖"整环有多少个点"这个数。
+    const std::size_t total = g_curveStore.size();
+    std::size_t keepFrom = 0;
+    for (std::size_t i = total; i-- > 0;) {
+        const CurveStorePoint& point = g_curveStore.At(i);
+        if (!point.atValid) continue;
+        bool usable = false;
+        if (currency.empty()) {
+            Amount amount;
+            usable = CurveValueOfEntry(point, &amount);
+        } else {
+            const CurveStorePoint::Entry* entry = point.Find(currency);
+            Amount amount;
+            usable = entry != nullptr && !entry->missing && !entry->text.empty() &&
+                     ParseAmount(entry->text, &amount);
+        }
+        if (!usable) continue;
+        if (kRateWindowSeconds > 0) {
+            while (keepFrom + 1 < total &&
+                   point.at - g_curveStore.At(keepFrom).at > kRateWindowSeconds) {
+                ++keepFrom;
+            }
+        }
+        break;
+    }
+
     std::vector<RateInputPoint> out;
-    out.reserve(points.size());
-    for (const CurveStorePoint& point : points) {
+    out.reserve(total - keepFrom);
+    for (std::size_t i = keepFrom; i < total; ++i) {
+        const CurveStorePoint& point = g_curveStore.At(i);
         RateInputPoint p;
         p.at = point.at;
         p.atValid = point.atValid;
@@ -868,10 +916,10 @@ void DiffSpan(const std::string& a, const std::string& b, int* from, int* to) {
 //   浮点再比等于把"相同"也交给舍入去裁决（设计 §3.1 就是为此定下的整数存储）。
 bool CurveStartBalance(Amount* outAmount) {
     if (outAmount == nullptr) return false;
-    const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
-    for (std::size_t i = points.size(); i-- > 0;) {
+    // 就地读（`At`）：这是启动一次的路径，但环里是一整天的变化数，没有理由为此拷一份。
+    for (std::size_t i = g_curveStore.size(); i-- > 0;) {
         Amount amount;
-        if (CurveValueOfEntry(points[i], &amount)) {
+        if (CurveValueOfEntry(g_curveStore.At(i), &amount)) {
             *outAmount = amount;
             return true;
         }
@@ -1337,7 +1385,9 @@ void DisplayedAmount::AdvanceRate(double dtSeconds) {
     //   输入还是曲线存储的点，只是**换了公式**：这一轮没有新增采样文件，也没有改
     //   "只在余额变化时记点"那条规则（曲线规格 §2.1）。见 rate_estimator.h 的"哪个是哪个"。
     //   仍然是每帧重算：输入（存储的点）只在采样到达时变，但窗口滑动是**时间**的函数，
-    //   所以"每帧算一次"正是让窗口跟着墙钟走的那一步（一次 7140 个点对是微秒级）。
+    //   所以"每帧算一次"正是让窗口跟着墙钟走的那一步（估计器只取最新 1800 s 内的点，
+    //   也就是最多 180 个、16110 个点对，一次算完是微秒级 —— 存储里放着多少点不改变
+    //   这个数，见 tuning.h 的 3d 段）。
     rateEstimate_ = EstimateRateTheilSen(RateInputForCurrency(currencyShown_));
 
     // 目标：只有显著（余额在掉）时才是正数；不显著 / 空 / 不消耗都以 0 为目标。
@@ -1412,9 +1462,9 @@ void PrimeHistoryForDemo(int points) {
                                      20.15, 20.14, 20.13, 19.90, 20.10, 20.12};
     const int want = points;
     const int table = (want < 12) ? want : 12;   // <12 时取表尾那几个
-    // ★ >12 时多喂的那些点是**填充**，它们的值不重要；2026-09-19（kCapacity 12 -> 120）
-    //   之后它们**留在环里**（以前会被 12 格的环挤掉），所以 --history-demo=20 现在
-    //   画出来的是"最新 12 个"这些话里的第 8..12 个 + 填充点 —— 面板照旧只取最新 12 个
+    // ★ >12 时多喂的那些点是**填充**，它们的值不重要；它们**留在环里**（环的容量是
+    //   一整天的变化数，见 curve_store.h 的 kCapacity），所以 --history-demo=20 画出来的
+    //   是"最新 12 个"这些话里的第 8..12 个 + 填充点 —— 面板照旧只取最新 12 个
     //   （BuildFrameCurve 入口切片），所以画面仍然只受最后 12 个点影响。
     const int prefix = want - table;
     // ★ 固定基准时刻 + 固定步长（所有者 2026-09-17 的要求）。
@@ -1855,14 +1905,18 @@ int64_t TodayStartSeconds(int64_t nowSeconds) {
 
 TodayUsage TodayUsageFromStore(const std::string& currency) {
     TodayUsage usage;
-    const std::vector<CurveStorePoint> points = g_curveStore.Points();   // 旧 -> 新
+    // ★ 就地读（`At`），不整环拷贝：这是每帧一次的路径，而这一行的口径要求看
+    //   **今天全部**的点 —— 环里正是这些东西（容量 = 一天的轮询数），所以它不能像
+    //   速率那样只取一个窗口。
+    const std::size_t total = g_curveStore.size();
     const int64_t todayStart = TodayStartSeconds(TodayUsageNowSeconds());
 
     // 基线：今天之前**最后一个**有时间、有金额的点。找不到就是"零点到第一次变化之间
     // 没有办法量的那一段"（见上面 1）。
     bool haveBaseline = false;
     AmountRaw baselineRaw = 0;
-    for (const CurveStorePoint& point : points) {
+    for (std::size_t i = 0; i < total; ++i) {
+        const CurveStorePoint& point = g_curveStore.At(i);
         if (!point.atValid || point.at >= todayStart) break;
         Amount amount;
         if (CurveValueOfEntryIn(point, currency, &amount)) {
@@ -1877,7 +1931,8 @@ TodayUsage TodayUsageFromStore(const std::string& currency) {
     bool haveBefore = haveBaseline;
     AmountRaw beforeRaw = baselineRaw;
     bool anyToday = false;
-    for (const CurveStorePoint& point : points) {
+    for (std::size_t i = 0; i < total; ++i) {
+        const CurveStorePoint& point = g_curveStore.At(i);
         if (!point.atValid || point.at < todayStart) continue;
         Amount amount;
         if (!CurveValueOfEntryIn(point, currency, &amount)) continue;   // 这个点没有可用金额

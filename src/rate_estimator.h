@@ -127,14 +127,20 @@ struct RateEstimate {
     // 新口径专用：一共算了多少个点对（= C(窗口点数, 2)）。诊断用。
     long long pairCount = 0;
 
-    // 诊断用，全部是"看到了什么"，不参与判定：
-    int pointsSeen = 0;        // 调用方给了几个点
+    // 诊断用，全部是"看到了什么"，不参与判定。
+    // ★ 这几个计数说的是**窗口内**的点，不是调用方给进来的整条序列：估计器只保留最新点
+    //   往前 kRateWindowSeconds 之内的点，窗口外的点在计数之前就已经不算了。
+    //   调用方的输入侧也做了同一件事（widget_display 的 RateInputForCurrency 先把序列裁到
+    //   同一个窗口，因为环的容量是一整天的变化数、每帧不该为了窗口外那些点解析一遍）。
+    //   两边用的是**同一套**窗口端点（最新的可用点 = 时间戳与金额都读得出的那个），所以
+    //   "窗口内的点数"只有这一个答案；对这些计数的读方只有 note 与探针。
+    int pointsSeen = 0;        // 窗口内一共看到几个点
     int usablePoints = 0;      // 金额与时间都可用的点：**全部**留在窗口里（不剔除任何点）
     int decreasingSteps = 0;   // 其中下降的台阶数——显著性判据数的就是它
     int risingSteps = 0;       // 上升的台阶数（诊断：它们只贡献 0，不作废窗口）
     int64_t dropSumRaw = 0;    // 下降台阶之和（定点）——就是分子
-    int undatedPoints = 0;     // 没有时间的点（连续的没时间点算一段，见 .cpp）
-    int unusablePoints = 0;    // 没有可用金额的点
+    int undatedPoints = 0;     // 窗口内没有时间的点（连续的没时间点算一段，见 .cpp）
+    int unusablePoints = 0;    // 窗口内没有可用金额的点
     int64_t spanSeconds = 0;   // 最老到最新一个可用点之间的跨度
     std::string note;          // 一句话说明为什么是不显著；显著时也留着"看到了什么"
 };
@@ -203,7 +209,9 @@ RateEstimate EstimateRate(const std::vector<RateInputPoint>& pointsOldestFirst);
 //       窗口本身（1800 s）已经限定了时间跨度。
 //    6. ★ 也不做"取整到 N 位、取整后为 0 就当不显著"那一条：中位数是一个真实测量到的
 //       斜率，把"确实量到了一点消耗"取整成"读不出来"是编数，不是诚实。
-//    7. 点对数 = C(n,2)：120 个点是 7140 对，一次算完是微秒级，所以点数不设上限。
+//    7. 点对数 = C(n,2)，而 n 是**窗口内**的点数：窗口 1800 s、轮询 10 s，所以
+//       n 最多 180 => 16110 个点对，一次算完是微秒级。存储能放多少点不改变这个数
+//       （窗口把它截住了），所以点数不设上限。
 RateEstimate EstimateRateTheilSen(const std::vector<RateInputPoint>& pointsOldestFirst);
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-// curve_store.h -- the curve data layer: 120-point ring, "only record changes",
+// curve_store.h -- the curve data layer: 8641-point ring, "only record changes",
 //                  curve.json persistence, and the stale-data invalidation rule.
 //
 // SOURCE OF TRUTH: `不入库文件\曲线规格.md` (§2), the owner's own spec rewritten
@@ -36,25 +36,41 @@
 // ---------------------------------------------------------------------------
 // §2.2 Ring of points
 // ---------------------------------------------------------------------------
-//   Capacity 120 (owner, 2026-09-19; was 12). WHAT CHANGED IS ONLY THE NUMBER --
-//   every rule above (§2.1 "only a change becomes a point", §2.3 the invalidation
-//   rule, §2.4 one file) is untouched, and so is the file format: `curve.json` is
-//   the same JSON, it simply may carry up to 120 points now. A file written by the
-//   12-point build loads fine and keeps its newest points.
-//
-//   ★ WHY 120, and why it is NOT an invitation to start recording every poll:
-//     the ring has to hold enough CHANGES to cover the estimator's window
-//     (kRateWindowSeconds = 1800 s, tuning.h). Twelve points was the display's
-//     need (11 drawn + 1 incoming) and nothing more, so a quiet account ran out of
-//     points long before it ran out of window.
-//   ★ AND THE DISPLAY IS STILL 12: the panel draws the newest 12 of whatever the
-//     ring holds -- that slice is the display layer's own constant
-//     (widget_display.cpp's kCurveDisplayPoints), deliberately NOT kCapacity. Before
-//     2026-09-19 the display happened to use the store's whole contents, which was
-//     only correct because the two numbers happened to be equal; raising the
-//     capacity to 120 without slicing would have fed 120 points to a 12-slot layout.
+//   Capacity 8641. The number is derived, not chosen:
+//     8640 = 24 x 60 x 60 / 10 s, where 10 s is tuning.h's kApiIntervalMs -- the fixed
+//            poll rhythm (§2.3; the old 30/10/3 adaptive cadence is dead and no longer
+//            exists to shorten it). One poll appends at most one point (§2.1), so 8640 is
+//            the largest number of CHANGES one calendar day can produce.
+//     1    = the day's BASELINE: the newest point from before midnight. "今日已 X.XX¥"
+//            (widget_display.cpp's TodayUsageFromStore) needs that point to count the
+//            day's first drop -- the one that spans midnight. A ring holding only today's
+//            8640 points loses it the moment the 8640th change evicts it, and the whole
+//            overnight drop leaves the total silently.
+//   Every rule above (§2.1 "only a change becomes a point", §2.3 the invalidation rule,
+//   §2.4 one file) is untouched.
+//   ★ THE COST, stated so nobody has to rediscover it: the capacity equals that ceiling
+//     exactly and has no headroom. If kApiIntervalMs ever drops below 10 s, a busy day
+//     produces more changes than the ring holds and "今日已 X.XX¥" starts under-counting
+//     again -- the oldest points of today are the first to be evicted. Lowering the poll
+//     interval therefore REQUIRES raising the 8640 by the same factor. The 1 is not spare
+//     capacity either: a day that reaches 8640 changes spends it on the baseline.
+//   ★ The file format is unchanged: `curve.json` is the same JSON, it may just carry
+//     up to 8641 points now, so a file written by an older build loads fine and keeps
+//     its newest points.
+//   ★ AND THE DISPLAY IS STILL 12: the panel draws the newest 12 of whatever the ring
+//     holds -- that slice is the display layer's own constant (widget_display.h's
+//     kCurveDisplayPoints), deliberately NOT kCapacity. The two numbers are decoupled
+//     on purpose: a capacity that grows to cover a day must not change how many
+//     points are laid out on 11 slots.
 //   Fewer than 12 points is legal (the display layer flattens the left side; that
 //   is not this file's job).
+//
+//   ★ THE RING LIVES ON THE HEAP, and that is a requirement, not a preference: at
+//     sizeof(CurveStorePoint) = 72 B the ring is ~620 KB, while an MSVC frame gets
+//     1 MB of stack. An inline array would put those 620 KB in every CurveStore's
+//     frame -- and probes build several stores in one scope, so the inline array is an
+//     immediate stack overflow (tools/panelprobe.cpp, case 2).
+//     buf_ is a std::vector sized once at construction; buf_[i] still means "slot i".
 //
 // ---------------------------------------------------------------------------
 // §2.3 Timestamps and the invalidation rule
@@ -231,11 +247,17 @@ struct CurveLoadResult {
 // ---------------------------------------------------------------------------
 class CurveStore {
 public:
-    // §2.2: the owner's ring size (2026-09-19: 12 -> 120). NOT the display width --
-    // the panel slices the newest 12 out of this, see the §2.2 note above.
-    static constexpr std::size_t kCapacity = 120;
+    // §2.2: the ring size -- one day of changes plus the day's baseline point (see the
+    // §2.2 note above for the derivation and the cost of having no headroom). NOT the
+    // display width -- the panel slices the newest 12 out of this.
+    static constexpr std::size_t kCapacity = 8641;
     // §2.3: the owner's chosen threshold, in seconds. Not tunable on purpose.
     static constexpr int64_t kExpirySeconds = 86400;
+
+    // The ring is sized once, here, and never resized: every slot is addressable from
+    // the moment the store exists, which is the invariant the rest of this file relies
+    // on. The allocation is ~620 KB (see §2.2) -- paid once per store, not per frame.
+    CurveStore() : buf_(kCapacity) {}
 
     // -- persistence: one file, `curve.json` --------------------------------
 
@@ -277,7 +299,17 @@ public:
     void Clear();
 
     // Oldest -> newest (the newest point is the last element).
+    // ★ COPIES THE WHOLE RING, so it is for the probes and for one-off paths only.
+    //   Inside a frame loop or a per-poll path use size() + At(i) instead: at the
+    //   capacity above this call is ~620 KB of string copies per call.
     std::vector<CurveStorePoint> Points() const;
+
+    // The i-th point, oldest = 0, in the SAME order Points() returns: At(0) is the
+    // oldest, At(size() - 1) the newest. Reads in place -- no copy, no allocation --
+    // which is why the per-frame paths use it. The caller guarantees i < size().
+    // ★ The modulo is the ring: the slots are cyclic, so start_ + i can run past the end
+    //   of the buffer once the ring is full (the oldest slot rotates back to slot 0).
+    const CurveStorePoint& At(std::size_t i) const { return buf_[(start_ + i) % kCapacity]; }
 
     // Overwrite the colour of the point BEFORE the newest one (value, time and entries
     // untouched). Used to stamp "the step whose END is the newest point" onto the point it
@@ -297,6 +329,8 @@ public:
     bool SetColorOfNewest(const std::string& colorHex);
 
     // The newest n points, oldest -> newest; fewer when the store holds fewer.
+    // ★ COPIES n points, not the whole ring: this is what the 12-point display slice
+    //   asks for.
     std::vector<CurveStorePoint> Newest(std::size_t n) const;
 
     std::size_t size() const { return count_ < kCapacity ? count_ : kCapacity; }
@@ -318,9 +352,11 @@ public:
     const std::string& lastPrimaryCurrency() const { return lastPrimaryCurrency_; }
 
 private:
-    CurveStorePoint buf_[kCapacity]{};
-    std::size_t count_ = 0;   // points written in total (may exceed the capacity)
-    std::size_t next_ = 0;    // next slot to write
+    // On the heap: at kCapacity the slots are ~620 KB and a stack frame is 1 MB, so an
+    // inline array overflows the stack as soon as two stores share a scope (see §2.2).
+    std::vector<CurveStorePoint> buf_;
+    std::size_t start_ = 0;   // slot holding the oldest live point, ALWAYS < kCapacity
+    std::size_t count_ = 0;   // live points (never exceeds kCapacity)
     int64_t updateAt_ = 0;    // §2.4 "update_at": the last update, in seconds
     bool updateAtValid_ = false;
     std::string lastPrimaryText_;      // verbatim text of the newest point's value

@@ -159,64 +159,60 @@ void AppendJsonString(std::string& out, const std::string& text) {
     out += '"';
 }
 
-std::string Serialize(int64_t updateAt, bool updateAtValid, const std::vector<CurveStorePoint>& points) {
-    std::string out = "{\n  \"update_at\": ";
-    if (updateAtValid) {
+}  // namespace
+
+namespace {
+
+// One point as a JSON object member of the "points" array, exactly the bytes the file has
+// always carried (the separators, the members and their order are the format, not a detail).
+void AppendPointJson(std::string& out, const CurveStorePoint& point, bool first) {
+    out += first ? "\n    {" : ",\n    {";
+    for (std::size_t k = 0; k < point.entries.size(); ++k) {
+        const CurveStorePoint::Entry& entry = point.entries[k];
+        out += (k == 0) ? " " : ", ";
+        AppendJsonString(out, entry.currency);
+        out += ": ";
+        if (entry.missing) {
+            out += "null";
+        } else {
+            // The digits as recorded -- "18.80" stays "18.80" (acceptance 3).
+            AppendJsonString(out, entry.text);
+        }
+    }
+    // ★ §2.3b: the point's OWN time, in epoch seconds. An UNDATED point is written
+    //   as an explicit null rather than being stamped with the global update_at:
+    //   the round trip has to remember "nobody measured when this happened", and
+    //   a bare omission could not be told apart from a point whose sole currency
+    //   failed to parse. Null is also what makes an all-undated file reload as
+    //   undated instead of as a set of points that all share one instant.
+    // The separator before the timestamp member is unconditional: an object always
+    // carries "at", so the member before it is never the last one.
+    out += ", ";
+    if (point.atValid) {
         char buf[32];
-        std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(updateAt));
+        std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(point.at));
+        out += "\"at\": ";
         out += buf;
     } else {
-        // Nothing has been timestamped yet; null is honest and reloads as "start over".
-        out += "null";
+        out += "\"at\": null";
     }
-    out += ",\n  \"points\": [";
-    for (std::size_t i = 0; i < points.size(); ++i) {
-        out += (i == 0) ? "\n    {" : ",\n    {";
-        for (std::size_t k = 0; k < points[i].entries.size(); ++k) {
-            const CurveStorePoint::Entry& entry = points[i].entries[k];
-            out += (k == 0) ? " " : ", ";
-            AppendJsonString(out, entry.currency);
-            out += ": ";
-            if (entry.missing) {
-                out += "null";
-            } else {
-                // The digits as recorded -- "18.80" stays "18.80" (acceptance 3).
-                AppendJsonString(out, entry.text);
-            }
-        }
-        // ★ §2.3b: the point's OWN time, in epoch seconds. An UNDATED point is written
-        //   as an explicit null rather than being stamped with the global update_at:
-        //   the round trip has to remember "nobody measured when this happened", and
-        //   a bare omission could not be told apart from a point whose sole currency
-        //   failed to parse. Null is also what makes an all-undated file reload as
-        //   undated instead of as a set of points that all share one instant.
-        // The separator before the timestamp member is unconditional: an object always
-        // carries "at", so the member before it is never the last one.
+    // ★ The ambience colour of that instant. Written ONLY when the point actually
+    //   carries one: a point loaded from a pre-colour file must come back out of
+    //   Save() byte-identical, and a caller that recorded no colour never gets one
+    //   invented for it. The member name is "color" (American) to match the JSON
+    //   the rest of the file already speaks ("update_at", "points").
+    if (!point.color.empty()) {
         out += ", ";
-        if (points[i].atValid) {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(points[i].at));
-            out += "\"at\": ";
-            out += buf;
-        } else {
-            out += "\"at\": null";
-        }
-        // ★ The ambience colour of that instant. Written ONLY when the point actually
-        //   carries one: a point loaded from a pre-colour file must come back out of
-        //   Save() byte-identical, and a caller that recorded no colour never gets one
-        //   invented for it. The member name is "color" (American) to match the JSON
-        //   the rest of the file already speaks ("update_at", "points").
-        if (!points[i].color.empty()) {
-            out += ", ";
-            out += "\"color\": ";
-            AppendJsonString(out, points[i].color);
-        }
-        if (!points[i].entries.empty()) out += " ";
-        out += "}";
+        out += "\"color\": ";
+        AppendJsonString(out, point.color);
     }
-    out += points.empty() ? "]\n}\n" : "\n  ]\n}\n";
-    return out;
+    if (!point.entries.empty()) out += " ";
+    out += "}";
 }
+
+}  // namespace
+
+namespace {
 
 // --- JSON reading ------------------------------------------------------------
 
@@ -235,7 +231,8 @@ bool IsHexColor(const std::string& text) {
 // Converts a verbatim JSON number token into whole seconds.
 // Rejects anything that is not a plain integer in range, so "1789537189.5" or "1e3"
 // can never be silently turned into a timestamp pointing at the wrong time.
-bool ParseWholeSeconds(const std::string& text, int64_t* out) {    if (text.empty() || text.size() > 19) return false;
+bool ParseWholeSeconds(const std::string& text, int64_t* out) {
+    if (text.empty() || text.size() > 19) return false;
     std::size_t i = 0;
     bool negative = false;
     if (text[0] == '-') {
@@ -464,18 +461,19 @@ CurveLoadResult CurveStore::Load(const std::string& path) {
     updateAt_ = updateAt;
     updateAtValid_ = true;
     count_ = 0;
-    next_ = 0;
+    start_ = 0;
     const std::size_t total = loaded.size();
     const std::size_t keep = std::min(total, kCapacity);
     for (std::size_t i = total - keep; i < total; ++i) {
-        buf_[next_] = loaded[i];   // the ring keeps the newest 12 in order
-        next_ = (next_ + 1) % kCapacity;
+        buf_[i - (total - keep)] = loaded[i];   // the ring keeps the newest kCapacity in order
         ++count_;
     }
     if (count_ > 0) {
         // The newest point's first entry is the primary currency again: the file keeps
         // the response's own order, so the change comparison survives the reload.
-        const CurveStorePoint& newest = buf_[(next_ + kCapacity - 1) % kCapacity];
+        // (start_ is 0 here -- the loop above fills the slots from 0 -- so the newest point
+        // is the last one written; read it through At() like every other live point.)
+        const CurveStorePoint& newest = At(count_ - 1);
         lastPrimaryCurrency_ = newest.entries.front().currency;
         lastPrimaryText_ = newest.entries.front().missing ? std::string() : newest.entries.front().text;
     }
@@ -494,7 +492,24 @@ CurveLoadResult CurveStore::Load(const std::string& path) {
 
 bool CurveStore::Save(const std::string& path) const {
     // Written oldest -> newest, so the newest point is the last array element (§2.4).
-    const std::string bytes = Serialize(updateAt_, updateAtValid_, Points());
+    // ★ The ring is serialized IN PLACE (`At`), never through a copy of it: this call runs on
+    //   every recorded change -- every 10 s while the balance is moving -- and a whole-ring
+    //   copy at kCapacity is ~900 µs of string traffic per append (§2.2's measurement).
+    const std::size_t live = size();
+    std::string out = "{\n  \"update_at\": ";
+    if (updateAtValid_) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(updateAt_));
+        out += buf;
+    } else {
+        // Nothing has been timestamped yet; null is honest and reloads as "start over".
+        out += "null";
+    }
+    out += ",\n  \"points\": [";
+    for (std::size_t i = 0; i < live; ++i) {
+        AppendPointJson(out, At(i), i == 0);
+    }
+    out += (live == 0) ? "]\n}\n" : "\n  ]\n}\n";
 
     const std::size_t cut = path.find_last_of("\\/");
     if (cut != std::string::npos && cut > 0) {
@@ -502,7 +517,7 @@ bool CurveStore::Save(const std::string& path) const {
     }
 
     std::string error;
-    return WriteFileBytes(path, bytes, &error);
+    return WriteFileBytes(path, out, &error);
 }
 
 // ---------------------------------------------------------------------------
@@ -510,9 +525,12 @@ bool CurveStore::Save(const std::string& path) const {
 // ---------------------------------------------------------------------------
 
 void CurveStore::Clear() {
-    for (CurveStorePoint& point : buf_) point = CurveStorePoint{};
+    // The slots themselves are left alone: only what At() addresses is ever read (the live
+    // window [start_, start_ + count_) modulo the capacity), and a later Append overwrites
+    // the slot it takes. Releasing the strings of every dead slot would walk the whole ring
+    // for nothing.
     count_ = 0;
-    next_ = 0;
+    start_ = 0;
     updateAt_ = 0;
     updateAtValid_ = false;
     lastPrimaryText_.clear();
@@ -524,17 +542,24 @@ std::vector<CurveStorePoint> CurveStore::Points() const {
     std::vector<CurveStorePoint> out;
     const std::size_t live = size();
     out.reserve(live);
-    const std::size_t start = (count_ < kCapacity) ? 0 : next_;   // oldest first
     for (std::size_t i = 0; i < live; ++i) {
-        out.push_back(buf_[(start + i) % kCapacity]);
+        out.push_back(At(i));
     }
     return out;
 }
 
 std::vector<CurveStorePoint> CurveStore::Newest(std::size_t n) const {
-    std::vector<CurveStorePoint> all = Points();
-    if (n == 0 || all.size() <= n) return (n == 0) ? std::vector<CurveStorePoint>() : all;
-    return std::vector<CurveStorePoint>(all.end() - static_cast<std::ptrdiff_t>(n), all.end());
+    const std::size_t live = size();
+    if (n == 0) return std::vector<CurveStorePoint>();
+    if (live <= n) return Points();
+    // Only the n requested points are copied -- copying the whole ring to slice the
+    // last few out of it was the entire cost of this call.
+    std::vector<CurveStorePoint> out;
+    out.reserve(n);
+    for (std::size_t i = live - n; i < live; ++i) {
+        out.push_back(At(i));
+    }
+    return out;
 }
 
 bool CurveStore::Expired(int64_t nowSeconds) const {
@@ -570,7 +595,12 @@ bool CurveStore::Append(const CurveObservation& obs, int64_t nowSeconds,
         // The last recorded value of the PRIMARY currency. When the newest point does
         // not carry it, there is nothing to compare against and the value counts as
         // changed (the same answer as "we could not read the old value").
-        const CurveStorePoint& newest = buf_[(next_ + kCapacity - 1) % kCapacity];
+        // ★ THE NEWEST POINT IS `At(size() - 1)`, never `buf_[count_ - 1]`: the slots are
+        //   cyclic, so after a single eviction (start_ != 0) the slot holding the newest
+        //   point is not the last one in the buffer. Reading the wrong slot breaks §2.1's
+        //   comparison -- an unchanged balance would look changed and would append a point
+        //   on every poll, which is exactly the "erase the flat stretch" rule inverted.
+        const CurveStorePoint& newest = At(size() - 1);
         const CurveStorePoint::Entry* lastPrimary = newest.Find(lastPrimaryCurrency_);
 
         // ★ Compare AMOUNTS, not text. "18.80" and "18.8" are the same balance written
@@ -634,8 +664,15 @@ bool CurveStore::Append(const CurveObservation& obs, int64_t nowSeconds,
         point.entries.push_back(CurveStorePoint::Entry{obs.primaryCurrency, primary->text, false});
     }
 
-    buf_[next_] = std::move(point);
-    next_ = (next_ + 1) % kCapacity;
+    // A full ring evicts its oldest point in the same step that appends: the day the
+    // store can describe is exactly kCapacity changes long (§2.2), and the panel's
+    // today-total is computed over what the ring still holds. The slot index is taken
+    // modulo the capacity -- a full ring's write slot is slot 0 again.
+    if (count_ == kCapacity) {
+        start_ = (start_ + 1) % kCapacity;   // drop the oldest
+        --count_;
+    }
+    buf_[(start_ + count_) % kCapacity] = std::move(point);
     ++count_;
     lastPrimaryText_ = primary->text;
     lastPrimaryCurrency_ = obs.primaryCurrency;
@@ -654,8 +691,7 @@ bool CurveStore::Append(const CurveObservation& obs, int64_t nowSeconds,
 // ★ 点数不足 2 时返回 false（没有"前一个点"可写）。
 bool CurveStore::SetColorOfPrevNewest(const std::string& colorHex) {
     if (count_ < 2) return false;
-    const std::size_t prev = (next_ + kCapacity - 2) % kCapacity;
-    buf_[prev].color = IsHexColor(colorHex) ? colorHex : std::string();
+    buf_[(start_ + count_ - 2) % kCapacity].color = IsHexColor(colorHex) ? colorHex : std::string();
     return true;
 }
 
@@ -672,8 +708,7 @@ bool CurveStore::SetColorOfPrevNewest(const std::string& colorHex) {
 //   所以先写哪个都对。
 bool CurveStore::SetColorOfNewest(const std::string& colorHex) {
     if (count_ == 0) return false;
-    const std::size_t newest = (next_ + kCapacity - 1) % kCapacity;
-    buf_[newest].color = IsHexColor(colorHex) ? colorHex : std::string();
+    buf_[(start_ + count_ - 1) % kCapacity].color = IsHexColor(colorHex) ? colorHex : std::string();
     return true;
 }
 

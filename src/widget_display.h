@@ -369,9 +369,11 @@ private:
 
 
 // 曲线上的一个点：x、y 都归一化到实体区 [0,1]。
-// ★ 2026-09-19：`kCapacity` 与"面板画几个点"**解耦**了。存储的容量在
-//   curve_store.h（120），面板的**显示宽**是下面这个常量（11 个在看 + 1 个进场）——
-//   BuildFrameCurve 在入口把存储切成"最新 12 个"，之后所有的槽位与极值都基于切片。
+// ★ `kCapacity` 与"面板画几个点"是**两个数**（故意的）：
+//   存储的容量在 curve_store.h（一整天的变化数），面板的**显示宽**是下面这个常量
+//   （11 个在看 + 1 个进场）—— BuildFrameCurve 在入口把存储切成"最新 12 个"，之后
+//   所有的槽位与极值都基于切片。显示宽不随存储容量走：容量从 12 涨到一天的变化数之后，
+//   `kCurveDisplayPoints` 还是 11。
 //   把它挪到头文件是为了让验收探针（tools/panelprobe.cpp）能对着**同一个数**断言，
 //   而不是在探针里再抄一遍数字。
 inline constexpr std::size_t kCurveDisplayPoints = 11;   // 可见点数；段数 = 它 - 1
@@ -448,7 +450,7 @@ void SetCountdownText(const wchar_t* text);
 // ★ 规格 §2 之后它喂的是**曲线存储**（Append，只记变化那一条规则照旧生效），
 //   不是旧的 SampleHistory；N=12 时正好得到"11 个点在看 + 第 12 个刚进来"的滚动起点。
 // ★ 这里说的 12 是**显示宽**（kCurveDisplayPoints），它和存储容量（curve_store.h 的
-//   kCapacity，2026-09-19 起是 120）从那一刻起就是两个数：喂 N > 12 也能用，
+//   kCapacity，一整天的变化数）是两个数：喂 N > 12 也能用，
 //   面板只会画出最新 12 个（BuildFrameCurve 入口切片）。
 void PrimeHistoryForDemo(int points);
 

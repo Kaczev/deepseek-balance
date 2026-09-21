@@ -296,8 +296,29 @@ std::string PointSummary(const std::vector<CurveStorePoint>& points) {
     return out + "]";
 }
 
-bool SamePoints(const std::vector<CurveStorePoint>& a, const std::vector<CurveStorePoint>& b) {
-    if (a.size() != b.size()) return false;
+// One long evidence line must stay readable: at the ring's capacity the full point list is
+// thousands of values, so the count is always printed and only the ends are spelled out.
+std::string HeadTail(const std::string& list, std::size_t head, std::size_t tail) {
+    std::vector<std::string> items;
+    std::size_t begin = 1;               // skip the "["
+    for (std::size_t i = 1; i <= list.size(); ++i) {
+        if (i == list.size() || list[i] == ',') {
+            items.push_back(list.substr(begin, i - begin));
+            begin = i + 1;
+        }
+    }
+    if (items.size() <= head + tail) return list;
+    std::string out = "[";
+    for (std::size_t i = 0; i < head; ++i) out += (i == 0 ? "" : ",") + items[i];
+    out += " ,... " + std::to_string(items.size() - head - tail) + " more ..., ";
+    for (std::size_t i = items.size() - tail; i < items.size(); ++i) {
+        out += items[i];
+        if (i + 1 < items.size()) out += ",";
+    }
+    return out + "]";
+}
+
+bool SamePoints(const std::vector<CurveStorePoint>& a, const std::vector<CurveStorePoint>& b) {    if (a.size() != b.size()) return false;
     for (std::size_t i = 0; i < a.size(); ++i) {
         if (a[i].entries.size() != b[i].entries.size()) return false;
         for (std::size_t k = 0; k < a[i].entries.size(); ++k) {
@@ -354,10 +375,9 @@ void RunChecks(Harness* h, const ProbeDir& probe, bool verbose) {
     }
 
     // -----------------------------------------------------------------------
-    // (2) FIFTEEN MORE THAN THE RING HOLDS: exactly kCapacity points, and they are the
+    // (2) MORE THAN THE RING HOLDS: exactly kCapacity points, and they are the
     //     NEWEST kCapacity. Spec §2.2, acceptance 2. Compared by contents, not by count.
-    //     ★ The fixture is derived from kCapacity (was hardcoded as 15 vs a 12-point
-    //     ring, 2026-09-19: the owner raised the capacity to 120). A hardcoded fixture
+    //     ★ The fixture is derived from kCapacity, never hardcoded: a hardcoded count
     //     would silently stop overflowing the ring the next time the capacity changes,
     //     and this check would keep passing while proving nothing.
     // -----------------------------------------------------------------------
@@ -402,7 +422,8 @@ void RunChecks(Harness* h, const ProbeDir& probe, bool verbose) {
         h->Req("case2", "ring holds exactly the newest kCapacity of kCapacity+3 distinct values",
                "fed " + Num(total) + " distinct values, ring capacity=" +
                    Num(static_cast<long long>(CurveStore::kCapacity)) + "; memory=" +
-                   Num(static_cast<long long>(mem.size())) + " points " + AllTexts(mem, "CNY") +
+                   Num(static_cast<long long>(mem.size())) + " points " +
+                   HeadTail(AllTexts(mem, "CNY"), 3, 3) +
                    " [contentsMatch=" + (contentsMatch ? "y" : "N") + " newestThree=" +
                    (newestThree ? "y" : "N") + " newest(3)=" +
                    (newest3.empty() ? std::string("<none>") : AmountText(newest3.front(), "CNY")) +
@@ -412,6 +433,48 @@ void RunChecks(Harness* h, const ProbeDir& probe, bool verbose) {
                    (AllTexts(disk, "CNY") == AllTexts(mem, "CNY") ? "y" : "N") + " pointsLoaded=" +
                    Num(reloaded.pointsLoaded) + "] file=" +
                    Num(static_cast<long long>(disk.size())) + " points",
+               ok);
+    }
+
+    // -----------------------------------------------------------------------
+    // (2b) THE RING HAS WRAPPED: §2.1 still compares against the NEWEST point.
+    //      The slots are cyclic, so once the ring has evicted a point the newest point is
+    //      no longer the last slot in the buffer -- it is at (start + count - 1) % capacity.
+    //      Anything that reads "the newest point" as the last slot starts comparing against
+    //      a point from the middle of the day, decides the balance changed, and appends on
+    //      EVERY poll while the balance is in fact flat (measured: 6 points [1..6], feed
+    //      777.00 -> [2,3,4,5,6,777], feed the same 777.00 again -> [3,4,5,6,777,777]).
+    //      That inverts the rule this whole file exists for, so the wrap-around is checked
+    //      here rather than assumed from the un-wrapped case (1), which cannot see it.
+    //      ★ The case proves it is not vacuous: it asserts the eviction did happen (the
+    //        oldest value is gone and size() did not grow) before it asserts the flat fetch.
+    // -----------------------------------------------------------------------
+    {
+        CurveStore store;
+        const int total = static_cast<int>(CurveStore::kCapacity) + 1;   // one eviction
+        // One second apart: the whole fixture stays inside the store's 86400 s expiry rule,
+        // so the last fetch is a §2.1 comparison and not a §2.3 discard.
+        Feed(&store, CountUp(1, total), kAnchor - 20000, 1);
+
+        const std::string newestBefore = Num(total) + ".00";
+        const bool evicted = store.size() == CurveStore::kCapacity &&
+                             AmountText(store.At(0), "CNY") == "CNY=\"2.00\"";
+        // The same value the newest point already holds: §2.1 says "no point, timestamp only".
+        const bool again = store.Append(Cny(newestBefore), kAnchor);
+        const std::vector<CurveStorePoint> after = store.Points();
+        const bool stillNewest = after.size() == CurveStore::kCapacity &&
+                                 AmountText(after.back(), "CNY") == "CNY=\"" + newestBefore + "\"";
+        const bool oldestKept = AmountText(after.front(), "CNY") == "CNY=\"2.00\"";
+        const bool ok = evicted && !again && stillNewest && oldestKept;
+        h->Req("case2b", "after the ring has wrapped, an unchanged value still appends nothing",
+               "fed " + Num(total) + " distinct values (capacity " +
+                   Num(static_cast<long long>(CurveStore::kCapacity)) +
+                   " -> one eviction; oldest is now " +
+                   AmountText(after.front(), "CNY") + "), then fed the newest value " +
+                   newestBefore + " again -> appended=" + std::string(again ? "yes (WRONG)" : "no") +
+                   ", size=" + Num(static_cast<long long>(after.size())) + ", newest=" +
+                   AmountText(after.back(), "CNY") + " (evictionHappened=" +
+                   (evicted ? "yes" : "NO") + ")",
                ok);
     }
 

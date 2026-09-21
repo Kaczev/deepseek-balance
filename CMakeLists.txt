@@ -67,9 +67,9 @@ target_compile_definitions(apiprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN
 target_include_directories(apiprobe PRIVATE src)
 target_link_libraries(apiprobe PRIVATE winhttp)
 
-# store probe: curve data layer (12-point ring, append-on-change, curve.json,
-# invalidation). Offline, no network and no shared state; like apiprobe and tauprobe
-# it carries its own main() so the widget's argument parsing stays untouched.
+# store probe: curve data layer (a ring covering a whole day of changes, append-on-change,
+# curve.json, invalidation). Offline, no network and no shared state; like apiprobe and
+# tauprobe it carries its own main() so the widget's argument parsing stays untouched.
 add_executable(storeprobe tools/storeprobe.cpp src/curve_store.cpp src/amount.cpp src/json_min.cpp)
 target_compile_definitions(storeprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(storeprobe PRIVATE src)
@@ -93,10 +93,10 @@ target_include_directories(ratebaseline PRIVATE src)
 
 # panel probe: the panel's curve DISPLAY SET vs the store's capacity (widget_display.cpp's
 # BuildFrameCurve vs curve_store.h's kCapacity). It links the whole display layer -- that is
-# the point: the failure it guards (120 store points laid out on 11 slots) lives exactly on
-# the seam between the two, and neither storeprobe nor rateprobe can see across it.
-# It reaches the display layer through the real file door (Save -> SetCurveStorePath ->
-# Load), writes only to %TEMP%, and opens no socket.
+# the point: the failure it guards (a store holding more points than the panel has slots)
+# lives exactly on the seam between the two, and neither storeprobe nor rateprobe can see
+# across it. It reaches the display layer through the real file door (Save -> SetCurveStorePath
+# -> Load), writes only to %TEMP%, and opens no socket.
 add_executable(panelprobe tools/panelprobe.cpp src/widget_display.cpp src/heartbeat.cpp src/state_machine.cpp src/amount.cpp src/curve_store.cpp src/json_min.cpp src/rate_estimator.cpp)
 target_compile_definitions(panelprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(panelprobe PRIVATE src)
@@ -162,3 +162,14 @@ add_executable(trayprobe tools/trayprobe.cpp src/tray.cpp src/tray.rc src/widget
 target_compile_definitions(trayprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
 target_include_directories(trayprobe PRIVATE src)
 target_link_libraries(trayprobe PRIVATE shell32 ole32 windowscodecs gdi32 user32)
+
+# capacity probe: what the curve ring's SIZE costs. It links the display layer because the
+# numbers that matter -- the bytes a store occupies, what one whole-ring copy costs, and what
+# one frame costs when the ring is full -- belong to the store and to the frame loop at once.
+# Like panelprobe it fills the store through the real Append() path and reaches the display
+# layer through the real file door (Save -> SetCurveStorePath -> Load), writes only to %TEMP%,
+# and opens no socket. It asserts nothing; it prints milliseconds, and the threshold ("a frame
+# is 16.7 ms") is read by a person.
+add_executable(capacityprobe tools/capacityprobe.cpp src/widget_display.cpp src/heartbeat.cpp src/state_machine.cpp src/amount.cpp src/curve_store.cpp src/json_min.cpp src/rate_estimator.cpp)
+target_compile_definitions(capacityprobe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_include_directories(capacityprobe PRIVATE src)

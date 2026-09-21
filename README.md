@@ -224,10 +224,10 @@ build\dshb.exe --curve-store=C:\tmp\curve.json --config=C:\tmp\config.json
 | 目标 | 量什么 |
 | --- | --- |
 | `closeprobe` | 关闭流程的状态机。为什么离线：真机上 R 只升不降，冷启动 R=0，"第 1 击把 R 钉到 0.50"要等 75 秒才看得见；这里用毫秒跑完 100 秒仿真时间 |
-| `panelprobe` | 显示层的曲线点数与存储容量之间的缝（120 个存储点铺在 11 个槽位上）—— 这条缝 `storeprobe` 和 `rateprobe` 都看不到 |
+| `panelprobe` | 显示层的曲线点数与存储容量之间的缝（存储里一整天的变化数铺在 11 个槽位上）—— 这条缝 `storeprobe` 和 `rateprobe` 都看不到 |
 | `trayprobe` | 图标资源本身：`src\tray.rc` 嵌进 exe 的 RCDATA 被加载出来，逐个 HICON 导成 PNG 叠在深浅两种底上。**裸跑 `trayprobe` 不碰通知区域** |
 | `rateprobe` | 消费速率估计器与"多久清零"的措辞。估计器不取时钟、不读文件，所以只需估计器与常量表 |
-| `storeprobe` | 曲线数据层：12 点环、变化才追加、`curve.json`、失效规则 |
+| `storeprobe` | 曲线数据层：8641 点环（= 一天的轮询数 8640 + 零点前那个基线点）、变化才追加、`curve.json`、失效规则 |
 | `beatprobe` | 心跳位移波形：包络形状、逐帧跳变、振幅与周期两条律。**它盖不到生产触发循环**（那在 `widget_display.cpp` 的 `AdvanceBeat` 里），计时器在这里是复刻的夹具 |
 | `apiprobe` | 余额接口的传输、解析与错误分流，外加一个离线用例 |
 | `ratebaseline` | 旧公式 vs 新公式并排跑在**真实 `curve.json`** 上（外加可选合成序列） |
