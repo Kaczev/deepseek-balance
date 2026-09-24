@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="deepseek-balance" version="0.2.0.0"/>
+  <assemblyIdentity type="win32" name="deepseek-balance" version="0.2.4.0"/>
 
   <!-- Per-Monitor V2：不声明就会被系统位图拉伸，150% 屏上直接变糊（设计 §11.2.1） -->
   <application xmlns="urn:schemas-microsoft-com:asm.v3">

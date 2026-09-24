@@ -24,6 +24,7 @@
 #include <windows.h>
 #include <objbase.h>    // CoInitializeEx / COINIT_APARTMENTTHREADED
 #include <shellapi.h>   // CommandLineToArgvW
+#include <dwmapi.h>     // DwmGetWindowAttribute：DWM 的遮挡（cloaked）判据（EDIT B）
 #include "curve.h"       // --curve-selftest
 
 #include <wtsapi32.h>   // 锁屏/解锁通知（J4）
@@ -33,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>   // std::memcpy（可见性探针里读 WTS 返回的枚举）
 
 namespace {
 
@@ -199,6 +201,16 @@ bool g_noPresent = false;
 // 它是 §11.3 预算的通用口径：粒子那一段的 p50/p99 只有跟同一台的基线比才有意义。
 int g_frameStatsFrames = 0;
 ParticleFrameTimes g_allTimes;
+
+// 逐帧的 UI 线程 CPU 记账（与 g_allTimes 同一批帧一起累加，退出时打一行）。
+// ★ 为什么要有它：QPC 只给墙钟，一帧里有多少是**本线程真的在跑**、多少是在等垂直空白 /
+//   等 DWM，只看墙钟分不出来（Present 的等待也被算进"渲染耗时"里）。GetThreadTimes 给的
+//   是本线程占用的 CPU，于是同一帧能拆成 {渲染 CPU, 渲染等待, 渲染之外 CPU}。
+double g_allRenderCpuTotalMs = 0.0;    // RenderFrame 那一段的本线程 CPU（累计）
+double g_allOtherCpuTotalMs = 0.0;     // 渲染之后到下一帧开始之前那一块（累计）
+double g_allIterWallTotalMs = 0.0;     // 迭代墙钟：这一次迭代开始 -> 下一次迭代开始
+unsigned long long g_allFramesCounted = 0;
+long long g_prevIterBeginQpc = 0;
 
          // --pause-test：注入"锁屏/解锁"，验证 J4（不用真锁屏）
 double g_realAmount = -1.0;   // --real=R（-1 = 未给；0 是合法金额！）
@@ -1575,6 +1587,98 @@ void CommitDelayed() {
     g_stash = s;
 }
 
+// ---------------------------------------------------------------------------
+// 可见性闸门（EDIT B）——"窗口被完全遮挡或最小化时，动画必须降频或暂停"
+// ---------------------------------------------------------------------------
+// 规格出处：v0.2 设计.md §11.3 :931 与 §11.5 :961（写成"必须"）；验收条目 I3
+// （v0.2 实施步骤.md :1066）要求遮挡期间帧日志的行数增量下降 ≥ 10 倍，**同时**每 10 秒
+// 仍有一条采样。所以这里只停"出帧"：一个字节都不碰 BalanceSource 的 10 秒节奏，也不碰
+// Pause/ResumeNow 与既有的 WM_POWERBROADCAST / WM_WTSSESSION_CHANGE 处理。
+//
+// ★ 为什么不用 DXGI_STATUS_OCCLUDED：交换链是 FLIP_SEQUENTIAL（renderer.cpp 的
+//   CreateSwapChainForComposition 建的那一条），在这条路上它**永远不会**出现，也没有
+//   DXGI_PRESENT_TEST / RegisterOcclusionStatusWindow（findings.md F9 已取证）。所以判据
+//   只能用现成的信号拼：
+//     · IsIconic(hwnd)                       —— 最小化（系统自己说的）
+//     · DwmGetWindowAttribute(DWMWA_CLOAKED) —— 被 DWM 遮挡（别的虚拟桌面等）
+//     · 抽点 WindowFromPoint                  —— 被别的窗口盖住。挂件是 WS_EX_TOPMOST，
+//                                                能盖住它的只可能是更高层的窗口
+//     · 会话被锁/断连                         —— 用户根本看不到它，与"被遮挡"是同一件事
+//   ★ 已知的误判（**不花钱去修**，§11.2.4 明确说真独占全屏与 UAC 安全桌面要放弃）：
+//     WindowFromPoint 会被"看不到的置顶窗口"骗到。它只会在不该停时停，恢复条件同样是
+//     "探针又能看到自己"，即 ≤ 2×探测周期。
+//
+// ★ 探测频率 = 250 ms（4 次/秒），而**不是**每帧：
+//   · 这几个判据都是系统调用（DWM 查询、命中测试），每帧做就等于把省下来的钱又花回去 ——
+//     本任务明令"新的检查不许变成新的逐帧工作量"；
+//   · 恢复口径：A14 写"退出遮挡后 ≤ 2 s 恢复"，250 ms 给出 8 倍余量；
+//   · 4 次/秒的代价在噪声量级（几次只读 API 调用，不做窗口枚举）。
+//   ★ 遮挡**期间也照这个频率探**：否则"怎么发现已经恢复"没有答案，窗口会永远停在那儿。
+constexpr double kVisibilityProbeSeconds = 0.25;
+
+// 会话是不是被锁/断连（锁屏之后用户看不到任何东西）。
+// ★ 直接问系统、不自己记状态：WM_WTSSESSION_CHANGE 只在"我们收到了那条消息"时才准，
+//   而主循环在遮挡期间是睡着的 —— 靠消息维护的状态会漏。
+bool SessionInvisible() {
+    LPWSTR buf = nullptr;
+    DWORD bytes = 0;
+    const DWORD kConnectState = 8;   // WTSConnectState
+    if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
+                                     static_cast<WTS_INFO_CLASS>(kConnectState), &buf, &bytes)) {
+        return false;   // 问不出来就当作可见：宁可多画，也不要因为查询失败把画面冻住
+    }
+    WTS_CONNECTSTATE_CLASS s = WTSActive;
+    if (buf && bytes >= sizeof(WTS_CONNECTSTATE_CLASS)) {
+        std::memcpy(&s, buf, sizeof(WTS_CONNECTSTATE_CLASS));
+    }
+    if (buf) WTSFreeMemory(buf);
+    return s != WTSActive;
+}
+
+bool WindowOccluded() {
+    if (!g_hwnd) return false;
+    if (IsIconic(g_hwnd)) return true;
+    if (SessionInvisible()) return true;
+
+    BOOL cloaked = FALSE;
+    // DWMWA_CLOAKED 的字面值是 14（避开 dwmapi 头文件顺序问题；那是公开稳定的 ABI）。
+    if (SUCCEEDED(DwmGetWindowAttribute(g_hwnd, 14, &cloaked, sizeof(cloaked))) && cloaked) {
+        return true;
+    }
+
+    // 被别的窗口盖住：在**实体区**里取 3x3 个点问"这一点最上面是谁"。
+    // ★ 只探实体区、不探外扩画布：外扩的 80 DIP 余量平时是透明的，上面永远压着桌面，
+    //   拿它当判据会把自己一直判成被遮挡。
+    RECT rc{};
+    if (!GetWindowRect(g_hwnd, &rc)) return false;
+    const LONG insetX = static_cast<LONG>((rc.right - rc.left) * 0.15);
+    const LONG insetY = static_cast<LONG>((rc.bottom - rc.top) * 0.15);
+    // ★ 判据是"**大多数**抽点都落在同一个别的窗口上"，不是"有一个点被别人占了"。
+    //   为什么：桌面上随时可能有别的窗口压住挂件的一角（做过实测：一块浏览器窗口横跨
+    //   挂件的左半边），单点判据会把"大部分还看得见"误判成"完全被遮挡"，而规格要的是
+    //   **完全**遮挡。取 9 点里的 6 点、且必须是同一个 hwnd，才判定为看不见。
+    const LONG xs[3] = {rc.left + insetX, (rc.left + rc.right) / 2, rc.right - insetX};
+    const LONG ys[3] = {rc.top + insetY, (rc.top + rc.bottom) / 2, rc.bottom - insetY};
+    HWND foreign = nullptr;
+    int foreignHits = 0;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            POINT pt{};
+            pt.x = xs[i];
+            pt.y = ys[j];
+            const HWND at = WindowFromPoint(pt);
+            if (!at || at == g_hwnd) continue;
+            if (!foreign) {
+                foreign = at;
+                ++foreignHits;
+            } else if (at == foreign) {
+                ++foreignHits;
+            }
+        }
+    }
+    return foreignHits >= 6;
+}
+
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -2683,12 +2787,38 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     }
 
     Clock clock;
+    // ★ --no-curve / --no-present 必须在**真实帧循环**里也生效：它们以前只有导出路径
+    //   那一个调用点（都在 `if (g_exportFrame)` 里），于是"关掉曲线""摘掉等垂直空白"
+    //   这两个 A/B 在活进程上从来没成立过 —— 量到的是两组一模一样的画面（A/A）。
+    //   曲线层那个开关（关闭态那一段）只在状态真的变化时才动它，正常运行时不动。
+    dshb::SetCurveEnabled(!g_noCurve);
+    if (g_noPresent) dshb::SetNoPresentForProbe(true);
     double elapsed = 0.0;
     double lastLoopSeconds = 0.0;   // 上一帧的墙钟时刻（未钳制的帧间隔靠它算）
     uint64_t frames = 0;
     double frameMsSum = 0.0;
     HRESULT lastHr = S_OK;
     int failures = 0;
+    // ---- 每帧的 UI 线程 CPU 记账：只有 --frame-stats 时才收 ----
+    double cpuRenderTotalMs = 0.0, cpuOtherTotalMs = 0.0;
+    // （这里不再留临时诊断计数器）
+    g_prevIterBeginQpc = 0;   // 第一帧不量迭代墙钟（它跨了启动）
+    ULONGLONG cpuMarkKernel = 0, cpuMarkUser = 0;
+    auto ThreadCpuMs = [](ULONGLONG k, ULONGLONG u) {
+        return static_cast<double>(k + u) / 10000.0;   // FILETIME 的单位是 100 ns
+    };
+    // ★ 量的是**本线程**（UI 线程）的 CPU，不是进程的。约束有两条，都是量出来的：
+    //   ① 字段与打印写的是"渲染 CPU / 渲染之外 CPU"，用进程时间就名不副实；而且进程时间
+    //      含别的线程，差值可能大于同一段的墙钟 —— 用它时"等待 = 墙钟 − CPU"印出过
+    //      -0.104 / -0.937 ms 的负数。一个印出负等待的仪器比没有仪器更坏，所以那两个
+    //      派生字段已经删掉，现在只打三个实测量。
+    auto SampleCpu = [](ULONGLONG* k, ULONGLONG* u) -> bool {
+        FILETIME c{}, e{}, kt{}, ut{};
+        if (!GetThreadTimes(GetCurrentThread(), &c, &e, &kt, &ut)) return false;
+        *k = (static_cast<ULONGLONG>(kt.dwHighDateTime) << 32) | kt.dwLowDateTime;
+        *u = (static_cast<ULONGLONG>(ut.dwHighDateTime) << 32) | ut.dwLowDateTime;
+        return true;
+    };
 
     for (;;) {
         MSG msg{};
@@ -2700,6 +2830,18 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         }
         if (!g_running) break;
 
+        // 记账起点。★ 顺序有讲究：这里的 CPU 标记与上一次迭代末尾那一个一起，恰好夹出
+        //   "渲染之后 -> 下一帧开始之前"这一块（消息泵 + 1 ms 等待）花掉的本线程 CPU。
+        ULONGLONG cpuFrameBeginK = 0, cpuFrameBeginU = 0;
+        if (g_frameStatsFrames > 0) {
+            const bool haveBegin = SampleCpu(&cpuFrameBeginK, &cpuFrameBeginU);
+            if (haveBegin && cpuMarkKernel != 0) {
+                cpuOtherTotalMs += ThreadCpuMs(cpuFrameBeginK, cpuFrameBeginU) -
+                                   ThreadCpuMs(cpuMarkKernel, cpuMarkUser);
+            }
+        }
+        LARGE_INTEGER iterFreq{}, iterBeginQpc{};
+        if (g_frameStatsFrames > 0) { QueryPerformanceFrequency(&iterFreq); QueryPerformanceCounter(&iterBeginQpc); }
         const double dt = clock.Tick();
 
         // --seq：每 g_seqStep 秒把实际数字换成序列里的下一个。
@@ -3030,8 +3172,53 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             }
         }
 
+        // ---- 可见性闸门（EDIT B）----
+        // 看不见的时候**不出帧**：省掉的是整条绘制路径（底色/蒙光/边框/曲线/正文 + Present）。
+        // 看得见的时候**一帧都不省**：E 心跳波形.md :30 那条"单帧跳变 ≤35% 幅度"的判据要求
+        // 95 ms 的上升段被 60/144 Hz 真实采到，所以可见状态下帧率与 Sleep 都不许动。
+        //
+        // ★ 位置与顺序（返工两次才定下来）：闸门**必须**在所有"该不该结束循环"的判断之后。
+        //   它靠 `continue` 省掉一帧，而任何排在它后面的语句在这一帧就不会被执行 —— 早期版本
+        //   把闸门放在这一帧最前面，于是 `--seconds` 的截止、粒子播完的关闭条件全都被饿死：
+        //   遮挡中被挡住多久就跑多久，进程退不出去（实测 `--seconds=25` 在遮挡下 60 s 仍在跑）。
+        //   现在每一次迭代都先判"到点没有、该关没有"，只有确认还要继续画下去，才问"这一帧
+        //   值不值得画"。省帧是优化，退出是正确性，优化不许压在正确性上面。
+        //
+        // ★ 关闭流程在飞时也跳过闸门：粒子要由 RenderFrame 推进，而闸门会跳过 RenderFrame。
+        bool gateSkippedFrame = false;
+        if (!g_closeWaitParticles) {
+            static bool wasOccluded = false;
+            static double lastProbeSeconds = -1.0e9;
+            const double nowSeconds = GetTickCount64() / 1000.0;   // ms 精度、单调、不回拨
+            if (nowSeconds - lastProbeSeconds >= kVisibilityProbeSeconds) {
+                lastProbeSeconds = nowSeconds;
+                if (WindowOccluded()) {
+                    // 睡到下一次探测。★ 用 Sleep 而不是等消息：没有任何消息会在"还被盖着"
+                    // 这件事变化时到达，等消息就等于永远不醒。
+                    // ★ 不碰 g_elapsed / elapsed：它们取自 Clock::Total() 的绝对时刻，
+                    //   画面上"过了多久"不会被这段睡眠改变（时钟断层见 §5.4）。
+                    wasOccluded = true;
+                    Sleep(static_cast<DWORD>(kVisibilityProbeSeconds * 1000.0));
+                    gateSkippedFrame = true;
+                } else if (wasOccluded) {
+                    wasOccluded = false;
+                    // 复用表整批作废：被盖住的这段时间里画布/渲染目标可能都被换过
+                    // （DPI 变更走的就是 Resize -> Create），按旧画布算出来的几何体与排版
+                    // 盒子一个都不能再信。
+                    renderer.ForgetReusableObjects();
+                }
+            }
+        }
+
+
+        // ★ 只在"这一帧要出"的时候才组装与渲染。闸门跳过的那一帧到这里只是跳过，
+        //   下面那些"该不该结束循环"的判断照常执行（见闸门处的说明）。
+        double ms = 0.0;   // 这一帧的渲染墙钟；闸门跳过的那一帧保持 0（那一帧没有渲染）
+        if (gateSkippedFrame) {
+            // 这一帧不出：闸门已经判过了。什么也不画，只把"这一帧的渲染耗时记 0"走完，
+            // 好让下面那些**该不该结束循环**的判断照常拿到一个完整的一帧（见闸门处的说明）。
+        } else {
         // 组装这一帧要显示的东西，交给渲染层。渲染层不关心余额是怎么来的。
-        {
             const dshb::ConnState st = g_states.Evaluate(static_cast<int64_t>(NowWallMs()));
             const bool currencyKnown = g_states.hasGood() && (g_display.shownCurrency() == "CNY" || g_display.shownCurrency() == "USD");
             renderer.SetWidgetFrame(dshb::BuildWidgetFrame(
@@ -3040,13 +3227,28 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                  : ((g_display.shownCurrency() == "USD") ? L"$" : L""))));
         }
 
+        ULONGLONG cpuRenderK = 0, cpuRenderU = 0;
+        bool haveRenderMark = false;
+        if (g_frameStatsFrames > 0) haveRenderMark = SampleCpu(&cpuRenderK, &cpuRenderU);
         LARGE_INTEGER a, b, freq;
         QueryPerformanceFrequency(&freq);
         QueryPerformanceCounter(&a);
         lastHr = renderer.RenderFrame(elapsed);
         QueryPerformanceCounter(&b);
-        const double ms = static_cast<double>(b.QuadPart - a.QuadPart) * 1000.0 /
-                          static_cast<double>(freq.QuadPart);
+        if (g_frameStatsFrames > 0) {
+            ULONGLONG renderEndK = 0, renderEndU = 0;
+            if (haveRenderMark && SampleCpu(&renderEndK, &renderEndU)) {   // 紧贴 RenderFrame 的返回
+                cpuRenderTotalMs += ThreadCpuMs(renderEndK, renderEndU) - ThreadCpuMs(cpuRenderK, cpuRenderU);
+
+                cpuMarkKernel = renderEndK;   // 留给下一次迭代开头对出"渲染之外"那一块
+                cpuMarkUser = renderEndU;
+            } else {
+                cpuMarkKernel = 0;   // 这一帧两支标记不配对 -> 下一次不记"渲染之外"
+                cpuMarkUser = 0;
+            }
+        }
+        ms = static_cast<double>(b.QuadPart - a.QuadPart) * 1000.0 /
+             static_cast<double>(freq.QuadPart);
         ++frames;
         frameMsSum += ms;
         if (g_particleTimesOpen) g_particleTimes.rasterMs.push_back(ms);
@@ -3055,6 +3257,21 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         if (g_frameStatsFrames > 0) {
             g_allTimes.rasterMs.push_back(ms);
             g_allTimes.intervalMs.push_back(loopIntervalMs);
+            // 迭代墙钟：纯粹是"这一次迭代开始 -> 下一次迭代开始"，含 1 ms 等待，
+            // 与 intervalMs 同一口径；与 CPU 那两个标记互不依赖。
+            if (g_prevIterBeginQpc != 0) {
+                g_allIterWallTotalMs += static_cast<double>(iterBeginQpc.QuadPart - g_prevIterBeginQpc) *
+                                        1000.0 / static_cast<double>(iterFreq.QuadPart);
+            }
+            g_prevIterBeginQpc = iterBeginQpc.QuadPart;
+            // ★ 累加的是**这一帧的增量**（cpuRenderTotalMs/cpuOtherTotalMs 是帧内临时值）。
+            //   早先这里累加的是那两个帧内累计量本身 —— 等于对同一个数再加 n 遍，量出来的
+            //   "每帧 CPU"会按帧数平方增长（1000 帧时报 353 ms/帧，而进程全程只有 1.4 CPU 秒）。
+            g_allRenderCpuTotalMs += cpuRenderTotalMs;
+            g_allOtherCpuTotalMs += cpuOtherTotalMs;
+            cpuRenderTotalMs = 0.0;
+            cpuOtherTotalMs = 0.0;
+            g_allFramesCounted++;
             if (static_cast<int>(g_allTimes.rasterMs.size()) >= g_frameStatsFrames) {
                 auto pct = [](std::vector<double> v, double q) {
                     if (v.empty()) return 0.0;
@@ -3067,6 +3284,30 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                             pct(g_allTimes.rasterMs, 0.50), pct(g_allTimes.rasterMs, 0.99),
                             pct(g_allTimes.rasterMs, 1.00), pct(g_allTimes.intervalMs, 0.50),
                             pct(g_allTimes.intervalMs, 0.99));
+                // 同一批帧的三个**实测量**（毫秒/帧）：
+                //   iterWall   = 迭代墙钟（这一次迭代开始 -> 下一次开始，含帧间等待）
+                //   renderWall = RenderFrame 的墙钟（= raster 均值）
+                //   renderCpu  = RenderFrame 里**本线程**（UI 线程）在跑的 CPU；otherCpu = 渲染之外
+                //                的本线程 CPU。★ 这两个是**线程**口径，不是进程口径 ——
+                //                它们不能直接与 A18 的"进程 CPU（单核 %）"对账：进程还有
+                //                BalanceSource 那条轮询线程，A18 量的是两者之和。
+                // ★ 不派发"等待 = 墙钟 − CPU"这类差值字段：它是推断，口径一错就印出负数
+                //   （用进程时间时实测 -0.104 / -0.937 ms）。要判断在不在等，看 iterWall 与
+                //   renderWall 的关系就够了。
+                const double nFrames = static_cast<double>(g_allFramesCounted);
+                double rasterSum = 0.0;
+                for (double v : g_allTimes.rasterMs) rasterSum += v;
+                const double renderWallMs = g_allTimes.rasterMs.empty()
+                                                ? 0.0
+                                                : rasterSum / static_cast<double>(g_allTimes.rasterMs.size());
+                SelfTestLogVerbose(L"[framestats-cpu] frames=%llu iterWall=%.3fms renderWall=%.3fms "
+                            L"renderCpu=%.3fms otherCpu=%.3fms ms/frame",
+                            static_cast<unsigned long long>(g_allFramesCounted),
+                            g_allIterWallTotalMs / nFrames,
+                            renderWallMs,
+                            g_allRenderCpuTotalMs / nFrames,
+                            g_allOtherCpuTotalMs / nFrames);
+
                 g_running = false;
                 PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
                 break;

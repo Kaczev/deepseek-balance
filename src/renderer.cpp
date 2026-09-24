@@ -24,6 +24,8 @@
 #include <cstdlib> // std::getenv（同上）
 #include <cstring> // std::strcmp
 #include <string>
+#include <unordered_map>   // 复用表（排版结果 / 曲线几何体与刷子）
+#include <unordered_set>   // 复用表：这一帧用到过哪些曲线颜色
 #include <vector>
 
 namespace dshb {
@@ -173,6 +175,278 @@ struct GlowCache {
         coverage.clear();
     }
 };
+
+// ---------------------------------------------------------------------------
+// 复用表（设计 §11.3 P-5「每帧重建渐变对象 → 缓存各档位对象」）
+// ---------------------------------------------------------------------------
+//  规格禁的是"每帧重建"，不是"每次调用都要造一个新的"。这里换掉的**只是对象的生命周期**：
+//  同一个输入第二次起把对象取回来用；每帧算出来的值、颜色、变换、绘制顺序一个都不动。
+//  所以判据仍然是 §11.3 的 p50/p99，而不是"有没有引入新画法"。
+//
+//  ★ 为什么必须显式失效，而不是指望键自己过期：排版结果取决于**建它时**格式对象里的
+//    字号，而键里只有一个 `IDWriteTextFormat*` 地址 —— 槽位里的格式被换掉之后地址会被
+//    复用，那时键就撞上了。所以"这个进程的复用表不可信了"这件事交给 Renderer 的
+//    生命周期去说（Create / Destroy 各作废一次），不指望地址是身份证。
+//  ★ 曲线那部分的设备资源（刷子、停靠集）**归属创建它们的渲染目标**，所以要按渲染目标
+//    分槽：屏幕与导帧用的软件目标各一套，换目标时按目标自己的资源重建。跨目标复用设备
+//    资源会直接画不出来 —— 这不是性能问题，是正确性问题。
+
+struct TextLayoutKey {
+    IDWriteTextFormat* fmt = nullptr;
+    float maxWidth = 0.0f;
+    float maxHeight = 0.0f;
+    std::wstring text;
+    bool operator==(const TextLayoutKey& o) const {
+        return fmt == o.fmt && maxWidth == o.maxWidth && maxHeight == o.maxHeight &&
+               text == o.text;
+    }
+};
+struct TextLayoutKeyHash {
+    std::size_t operator()(const TextLayoutKey& k) const {
+        std::size_t h = reinterpret_cast<std::size_t>(k.fmt);
+        h = h * 1099511628211ull ^ static_cast<std::size_t>(static_cast<unsigned>(k.maxWidth * 8.0f));
+        h = h * 1099511628211ull ^ static_cast<std::size_t>(static_cast<unsigned>(k.maxHeight * 8.0f));
+        for (const wchar_t c : k.text) h = h * 131u + static_cast<std::size_t>(c);
+        return h;
+    }
+};
+struct TextLayoutCache {
+    std::unordered_map<TextLayoutKey, IDWriteTextLayout*, TextLayoutKeyHash> layouts;
+
+    // 取一条排版结果；没有就建一条并把所有权留在这里。
+    //  ★ 盒子（maxWidth / maxHeight）**必须**进水键：下面那几个量法的结论确实取决于
+    //    盒子有多宽 —— GlyphAdvanceDip 特意用 kOneGlyphBoxDip 这个紧盒子，因为一个字形
+    //    的 overhang 是量到排版**盒边**的，宽盒子里会返回一个约 -248 的右悬空。
+    //  ★ 建失败不记进表，所以一次失败不会把空结果永久钉住。
+    //  ★ 工厂是这个类自己的（共享工厂，进程里只有一份）：不依赖文件后半段
+    //    DebugWriteFactory 的定义顺序 —— 匿名 namespace 里跨块的名字在链接期是
+    //    各自独立的符号，靠前向声明去够那个定义会得到一个 LNK2019（试过）。
+    static IDWriteFactory* WriteFactory() {
+        static IDWriteFactory* factory = nullptr;
+        if (!factory) {
+            if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                           reinterpret_cast<IUnknown**>(&factory)))) {
+                factory = nullptr;
+            }
+        }
+        return factory;
+    }
+
+    IDWriteTextLayout* Get(const std::wstring& text, IDWriteTextFormat* fmt, float maxWidth,
+                           float maxHeight) {
+        if (!fmt || text.empty()) return nullptr;
+        IDWriteFactory* dw = WriteFactory();
+        if (!dw) return nullptr;
+        const TextLayoutKey key{fmt, maxWidth, maxHeight, text};
+        const auto it = layouts.find(key);
+        if (it != layouts.end()) return it->second;
+        IDWriteTextLayout* layout = nullptr;
+        if (FAILED(dw->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), fmt,
+                                        maxWidth, maxHeight, &layout)) ||
+            !layout) {
+            return nullptr;
+        }
+        layouts.emplace(key, layout);
+        return layout;
+    }
+
+    void Clear() {
+        for (auto& kv : layouts) {
+            if (kv.second) kv.second->Release();
+        }
+        layouts.clear();
+    }
+};
+TextLayoutCache g_textLayouts;
+
+// 单个字形那一套量法专用的紧盒子（说明见 kOneGlyphBoxDip）。
+constexpr float kOneGlyphBoxHeightDip = 128.0f;
+
+// 氛围曲线：一套"点列 -> 段几何体"，加一支按颜色取停靠集的刷子助手。
+struct CurvePointKey {
+    float x = 0.0f;
+    float y = 0.0f;
+};
+struct CurveGeomKey {
+    std::vector<CurvePointKey> pts;
+    float rectLeft = 0.0f;
+    float rectTop = 0.0f;
+    float rectRight = 0.0f;
+    float rectBottom = 0.0f;
+    bool operator==(const CurveGeomKey& o) const {
+        if (rectLeft != o.rectLeft || rectTop != o.rectTop || rectRight != o.rectRight ||
+            rectBottom != o.rectBottom) {
+            return false;
+        }
+        if (pts.size() != o.pts.size()) return false;
+        for (std::size_t i = 0; i < pts.size(); ++i) {
+            if (pts[i].x != o.pts[i].x || pts[i].y != o.pts[i].y) return false;
+        }
+        return true;
+    }
+};
+struct CurveGeomKeyHash {
+    std::size_t operator()(const CurveGeomKey& k) const {
+        // ★ 四个矩形边**全部**进哈希（早先漏了 rectTop），坐标按位入哈希而不是乘 64 取整：
+        //   乘 64 会把一个像素内的不同坐标压成同一个桶，那是"键碰撞"的经典来源。
+        //   哈希碰撞只会让查找慢一点（operator== 仍然逐点比较），取整则是真的键不等价。
+        std::size_t h = 1469598103934665603ull;
+        auto mixf = [&h](float v) {
+            std::uint32_t bits = 0;
+            std::memcpy(&bits, &v, sizeof(float));
+            h = (h ^ static_cast<std::size_t>(bits)) * 1099511628211ull;
+        };
+        for (const CurvePointKey& p : k.pts) {
+            mixf(p.x);
+            mixf(p.y);
+        }
+        mixf(k.rectLeft);
+        mixf(k.rectTop);
+        mixf(k.rectRight);
+        mixf(k.rectBottom);
+        return h;
+    }
+};
+struct CurveGeomSlot {
+    CurveGeomKey key;
+    bool valid = false;
+    std::vector<ID2D1PathGeometry*> segs;   // 第 i 条 = pts[i] -> pts[i+1]
+    std::unordered_map<std::uint32_t, ID2D1LinearGradientBrush*> brushes;
+    std::unordered_set<std::uint32_t> current;   // 这一帧用过哪些颜色
+
+    void Release() {
+        for (ID2D1PathGeometry* g : segs) {
+            if (g) g->Release();
+        }
+        segs.clear();
+        for (auto& kv : brushes) {
+            if (kv.second) kv.second->Release();
+        }
+        brushes.clear();
+        current.clear();
+        valid = false;
+    }
+
+    bool Matches(const CurveGeomKey& k) const { return valid && key == k; }
+    void AdoptKey(const CurveGeomKey& k) { key = k; valid = true; }
+
+    ID2D1PathGeometry* SegmentAt(std::size_t i) const {
+        return (i < segs.size()) ? segs[i] : nullptr;
+    }
+
+    // 点列变了就把这一整套段几何体重建一次。
+    //  ★ 传进来的点**必须已经是画布像素坐标**：改前的代码就是在像素空间里建几何体
+    //    （`px()/py()` 算出来的 a/b），而图形是被 `DrawGeometry` 用同一个点阵描边的。
+    //    早期版本把归一化坐标（0..1）写进几何体、只把像素坐标用在刷子轴上，结果整条曲线
+    //    缩进单位方块里、屏幕上根本没有曲线 —— 那是真实回归，注释留着防复发。
+    //  ★ 先建新的、成了再放旧的：建失败时留一张**空**表（valid 保持 false），于是这一帧
+    //    什么都不画、下一帧会再试一次 —— 不会出现"一半新一半旧"的几何体。
+    bool Rebuild(ID2D1Factory* fac, const CurveGeomKey& k) {
+        std::vector<ID2D1PathGeometry*> fresh;
+        fresh.reserve(k.pts.empty() ? 0 : k.pts.size() - 1);
+        for (std::size_t i = 0; i + 1 < k.pts.size(); ++i) {
+            ID2D1PathGeometry* seg = nullptr;
+            if (FAILED(fac->CreatePathGeometry(&seg)) || !seg) break;
+            ID2D1GeometrySink* sink = nullptr;
+            if (FAILED(seg->Open(&sink)) || !sink) {
+                seg->Release();
+                break;
+            }
+            sink->BeginFigure(D2D1::Point2F(k.pts[i].x, k.pts[i].y), D2D1_FIGURE_BEGIN_HOLLOW);
+            sink->AddLine(D2D1::Point2F(k.pts[i + 1].x, k.pts[i + 1].y));
+            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+            sink->Close();
+            sink->Release();
+            fresh.push_back(seg);
+        }
+        if (fresh.empty()) return false;
+        for (ID2D1PathGeometry* g : segs) {
+            if (g) g->Release();
+        }
+        segs.swap(fresh);
+        key = k;
+        valid = true;
+        return true;
+    }
+
+    // 取一支本段要用的刷子：每支刷子是一段**纯色**（两个停靠点同色），按颜色留着。
+    //  ★ 为什么是"每色一支刷子"而不是"一支刷子换停靠集"：D2D 1.0 的
+    //    ID2D1LinearGradientBrush **没有** SetGradientStopCollection / SetGradientStops，
+    //    停靠点是建刷子时烘进去的、改不了（上面那段注释记的就是这件事）。所以能省的是
+    //    "同一颜色不重复建"，一支刷子在它自己的颜色活着的那几帧里被反复用。
+    //  ★ 只有**这一帧用到的**颜色留着：曲线上的颜色随时间换（每 10 秒一个新点进场、
+    //    最老那个点退场），不清就会攒下一整天的调色板。清掉的颜色下次再出现时重建成
+    //    同样的一支 —— 因为刷子的属性只有颜色，重建出来与原来那支逐字节相同。
+    ID2D1LinearGradientBrush* BrushFor(ID2D1RenderTarget* rt, const D2D1_COLOR_F& c,
+                                      const D2D1_POINT_2F& a, const D2D1_POINT_2F& b) {
+        if (!rt) return nullptr;
+        std::uint32_t bb = 0, gg = 0, rr = 0, aa = 0;
+        std::memcpy(&bb, &c.b, sizeof(float));
+        std::memcpy(&gg, &c.g, sizeof(float));
+        std::memcpy(&rr, &c.r, sizeof(float));
+        std::memcpy(&aa, &c.a, sizeof(float));
+        const std::uint32_t ck = bb ^ (gg * 16777619u) ^ (rr * 2246822519u) ^ (aa * 3266489917u);
+        ID2D1LinearGradientBrush* found = nullptr;
+        const auto it = brushes.find(ck);
+        if (it != brushes.end()) {
+            found = it->second;
+        } else {
+            const D2D1_GRADIENT_STOP gs[2] = {{0.0f, c}, {1.0f, c}};
+            ID2D1GradientStopCollection* sc = nullptr;
+            if (FAILED(rt->CreateGradientStopCollection(gs, 2, &sc)) || !sc) return nullptr;
+            const D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES props = {a, b};
+            ID2D1LinearGradientBrush* created = nullptr;
+            const HRESULT hr = rt->CreateLinearGradientBrush(props, sc, &created);
+            sc->Release();   // 刷子自己留了一份引用（与改前逐段建刷子的做法一致）
+            if (FAILED(hr) || !created) return nullptr;
+            brushes.emplace(ck, created);
+            found = created;
+        }
+        current.insert(ck);
+        return found;
+    }
+
+    // 这一帧结束了：把这一帧没碰过的刷子放掉（见 BrushFor 里"不清就会攒下一整天"那句）。
+    void EndFrame() {
+        for (auto it = brushes.begin(); it != brushes.end();) {
+            if (current.count(it->first) == 0) {
+                if (it->second) it->second->Release();
+                it = brushes.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        current.clear();
+    }
+};
+
+// 两套渲染目标各一个分槽（屏幕 / 导帧的软件目标）。换目标时**不动另一槽**：导帧与屏幕
+// 会交替出现，互相挤掉就等于每次导帧重建整套曲线几何体。
+CurveGeomSlot g_curveSlots[2];
+ID2D1RenderTarget* g_curveSlotTarget[2] = {nullptr, nullptr};
+int g_curveSlotNext = 0;
+
+CurveGeomSlot& CurveSlotFor(ID2D1RenderTarget* rt) {
+    for (int i = 0; i < 2; ++i) {
+        if (g_curveSlotTarget[i] == rt) return g_curveSlots[i];
+    }
+    const int idx = g_curveSlotNext;
+    g_curveSlotNext = (g_curveSlotNext + 1) % 2;
+    g_curveSlots[idx].Release();
+    g_curveSlotTarget[idx] = rt;
+    return g_curveSlots[idx];
+}
+
+// 这个进程里的复用表全部作废。只在 Renderer::Create / Destroy 里调：那里是"设备与画布
+// 换了、字体槽可能也换了"的唯一时刻（Resize 走的就是 Create，见 Renderer::Resize）。
+void InvalidateRendererCaches() {
+    g_textLayouts.Clear();
+    for (int i = 0; i < 2; ++i) {
+        g_curveSlots[i].Release();
+        g_curveSlotTarget[i] = nullptr;
+    }
+    g_curveSlotNext = 0;
+}
 
 // 匿名 namespace 从这里开始：下面的布局探针、场景绘制辅助与内蒙光烘焙函数都是
 // 本翻译单元私有的（内蒙光的**声明**区故意留在它外面，见上面）。
@@ -325,6 +599,7 @@ namespace {
 WidgetFrame g_widgetFrame{};
 
 // 璋冭瘯娴眰鐢ㄧ殑 DirectWrite 宸ュ巶涓庢枃鏈牸寮忋€傛噿鍒涘缓锛氫笉甯﹁皟璇曞紑鍏虫椂涓€琛岄兘涓嶅缓銆?
+
 IDWriteFactory* DebugWriteFactory() {
     static IDWriteFactory* factory = nullptr;
     if (!factory) {
@@ -451,18 +726,13 @@ IDWriteTextFormat* TextFormatFor(FontRole role) {
 // 灞呬腑銆佸竷灞€浣欓噺鍒ゆ柇閮介潬瀹冣€斺€?宸笉澶氬眳涓?闈犵溂鐫涙槸鍒や笉鍑烘潵鐨勩€?
 float MeasureTextWidth(const std::wstring& text, IDWriteTextFormat* fmt) {
     if (text.empty() || !fmt) return 0.0f;
-    IDWriteFactory* dw = DebugWriteFactory();
-    if (!dw) return 0.0f;
-    IDWriteTextLayout* layout = nullptr;
-    if (FAILED(dw->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), fmt,
-                                    4096.0f, 256.0f, &layout)) ||
-        !layout) {
-        return 0.0f;
-    }
+    // ★ 排版结果按（格式, 盒子, 文本）复用（见 g_textLayouts）。盒子仍是 4096x256，
+    //   与原来逐字一致，所以量出来的宽度不变；变的只是"这条排版结果还留着"。
+    IDWriteTextLayout* layout = g_textLayouts.Get(text, fmt, 4096.0f, 256.0f);
+    if (!layout) return 0.0f;
     DWRITE_TEXT_METRICS m{};
     float width = 0.0f;
     if (SUCCEEDED(layout->GetMetrics(&m))) width = m.widthIncludingTrailingWhitespace;
-    layout->Release();
     return width;
 }
 
@@ -474,14 +744,10 @@ void MeasureCharOrigins(const std::wstring& text, IDWriteTextFormat* fmt,
                         std::vector<float>* xs, float* lineHeight) {
     xs->clear();
     if (text.empty() || !fmt) return;
-    IDWriteFactory* dw = DebugWriteFactory();
-    if (!dw) return;
-    IDWriteTextLayout* layout = nullptr;
-    if (FAILED(dw->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), fmt, 4096.0f,
-                                    256.0f, &layout)) ||
-        !layout) {
-        return;
-    }
+    // ★ 逐字问的仍然是**同一条**排版结果（盒子 4096x256，与原来逐字一致），只是它不再
+    //   每帧重建。每个字符一次 HitTestTextPosition 是这条量法的定义，不是对象churn，留着。
+    IDWriteTextLayout* layout = g_textLayouts.Get(text, fmt, 4096.0f, 256.0f);
+    if (!layout) return;
 
     DWRITE_TEXT_METRICS m{};
     if (SUCCEEDED(layout->GetMetrics(&m)) && lineHeight) *lineHeight = m.height;
@@ -500,7 +766,6 @@ void MeasureCharOrigins(const std::wstring& text, IDWriteTextFormat* fmt,
         }
         pos += advance;
     }
-    layout->Release();
 }
 
 // ---------------------------------------------------------------------------
@@ -521,34 +786,28 @@ constexpr float kOneGlyphBoxDip = 64.0f;
 // A character's advance (its origin to the next character's origin), in DIP.
 float GlyphAdvanceDip(wchar_t ch, IDWriteTextFormat* fmt) {
     if (!fmt) return 0.0f;
-    IDWriteFactory* dw = DebugWriteFactory();
-    if (!dw) return 0.0f;
     const wchar_t buf[2] = {ch, 0};
-    IDWriteTextLayout* one = nullptr;
-    if (FAILED(dw->CreateTextLayout(buf, 1, fmt, kOneGlyphBoxDip, 128.0f, &one)) || !one)
-        return 0.0f;
+    IDWriteTextLayout* one = g_textLayouts.Get(std::wstring(buf, 1), fmt, kOneGlyphBoxDip,
+                                              kOneGlyphBoxHeightDip);
+    if (!one) return 0.0f;
     DWRITE_TEXT_METRICS m{};
     DWRITE_OVERHANG_METRICS o{};
     float advance = 0.0f;
     if (SUCCEEDED(one->GetMetrics(&m)) && SUCCEEDED(one->GetOverhangMetrics(&o)))
         advance = m.widthIncludingTrailingWhitespace + o.right;
-    one->Release();
     return advance;
 }
 
 // A character's ink width, in DIP (advance minus both side bearings).
 float GlyphInkWidthDip(wchar_t ch, IDWriteTextFormat* fmt) {
     if (!fmt) return 0.0f;
-    IDWriteFactory* dw = DebugWriteFactory();
-    if (!dw) return 0.0f;
     const wchar_t buf[2] = {ch, 0};
-    IDWriteTextLayout* one = nullptr;
-    if (FAILED(dw->CreateTextLayout(buf, 1, fmt, kOneGlyphBoxDip, 128.0f, &one)) || !one)
-        return 0.0f;
+    IDWriteTextLayout* one = g_textLayouts.Get(std::wstring(buf, 1), fmt, kOneGlyphBoxDip,
+                                              kOneGlyphBoxHeightDip);
+    if (!one) return 0.0f;
     DWRITE_OVERHANG_METRICS o{};
     float ink = 0.0f;
     if (SUCCEEDED(one->GetOverhangMetrics(&o))) ink = kOneGlyphBoxDip + o.right + o.left;
-    one->Release();
     return ink;
 }
 
@@ -560,15 +819,12 @@ float GlyphRightBearingDip(wchar_t ch, IDWriteTextFormat* fmt) {
 // A character's left side bearing: how far its ink leans left of its origin.
 float GlyphInkLeftDip(wchar_t ch, IDWriteTextFormat* fmt) {
     if (!fmt) return 0.0f;
-    IDWriteFactory* dw = DebugWriteFactory();
-    if (!dw) return 0.0f;
     const wchar_t buf[2] = {ch, 0};
-    IDWriteTextLayout* one = nullptr;
-    if (FAILED(dw->CreateTextLayout(buf, 1, fmt, kOneGlyphBoxDip, 128.0f, &one)) || !one)
-        return 0.0f;
+    IDWriteTextLayout* one = g_textLayouts.Get(std::wstring(buf, 1), fmt, kOneGlyphBoxDip,
+                                              kOneGlyphBoxHeightDip);
+    if (!one) return 0.0f;
     DWRITE_OVERHANG_METRICS o{};
     one->GetOverhangMetrics(&o);
-    one->Release();
     return -o.left;
 }
 
@@ -601,17 +857,14 @@ float TextInkLeftDip(const std::wstring& text, IDWriteTextFormat* fmt) {
 //  run has to be lifted by exactly the difference between the two ink tops.
 float TextInkTopDip(const std::wstring& text, IDWriteTextFormat* fmt) {
     if (text.empty() || !fmt) return 0.0f;
-    IDWriteFactory* dw = DebugWriteFactory();
-    if (!dw) return 0.0f;
     const wchar_t buf[2] = {text.front(), 0};
-    IDWriteTextLayout* one = nullptr;
-    if (FAILED(dw->CreateTextLayout(buf, 1, fmt, kOneGlyphBoxDip, 128.0f, &one)) || !one)
-        return 0.0f;
+    IDWriteTextLayout* one = g_textLayouts.Get(std::wstring(buf, 1), fmt, kOneGlyphBoxDip,
+                                              kOneGlyphBoxHeightDip);
+    if (!one) return 0.0f;
     DWRITE_LINE_METRICS lm{};
     UINT32 count = 0;
     float top = 0.0f;
     if (SUCCEEDED(one->GetLineMetrics(&lm, 1, &count)) && count > 0) top = lm.baseline;
-    one->Release();
     return top;
 }
 
@@ -772,43 +1025,49 @@ void PaintAmbientCurve(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Wi
     //   重复调用会在第二次返回 D2DERR_WRONG_STATE(0x88990001)，于是循环当场 break、
     //   整条曲线只画出最左边那一段（实测：x[78..82] 20 个像素，而它本该横跨 x=80..395）。
     //   这是本项目踩过的真实回归，注释留着是为了下一个人别再试那条路。
-    //   ★ 每段自己一支刷子听起来贵，但渐变刷一旦建好，它的停靠点是**烘进它自己**的，
+    //   ★ 每段一支刷子听起来贵，但渐变刷一旦建好，它的停靠点是**烘进它自己**的，
     //     而 D2D 1.0 没有"改已有刷子的停靠点"这条路（`SetGradientStops` 两个接口上都没有）。
-    //     所以唯一确定可行的写法就是逐段建：一次 `CreateGradientStopCollection(2)` +
-    //     一次 `CreateLinearGradientBrush`。代价量过（见证据里的一次导出）。
+    //     所以停靠集按**颜色**留、刷子按**颜色**留：曲线一段是纯色，一场曲线里只有
+    //     几种颜色，于是每帧真正要建的刷子从 300 支降到 1~3 支。代价量过（见证据里的一次导出）。
     //   ★ 端点的颜色取的是**控制点**的颜色，不是采样点被 x 夹出来的那一个 ——
     //     所以段与段的接头处颜色严格连续（前段终点 = 后段起点）。
-    for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
-        ID2D1PathGeometry* seg = nullptr;
-        if (FAILED(fac->CreatePathGeometry(&seg)) || !seg) break;
-        ID2D1GeometrySink* k = nullptr;
-        if (FAILED(seg->Open(&k)) || !k) {
-            seg->Release();
-            break;
+    // ★ 复用路线（就是上面那条"一支渐变刷就够"的注释写的做法）：
+    //   · 几何体：按点列与面板矩形留着，输入没变就不重建（键见 CurveGeomKey）；
+    //   · 刷子：按颜色留着，轴用 SetStartPoint/SetEndPoint 逐段改。
+    //   段数、顺序、每段颜色、线宽、绘制顺序一个字都没改 —— 改的只是这些对象活几帧。
+    CurveGeomSlot& slot = CurveSlotFor(rt);
+    // ★ 几何体与刷子都在**画布像素**空间里建，和改前的代码同一套坐标：
+    //   `pts` 是归一化点（渲染层不再改它们），这里一次性换成像素点，线段与刷子轴共用。
+    std::vector<std::pair<float, float>> pix;
+    pix.reserve(pts.size());
+    for (const auto& pt : pts) pix.push_back({px(pt.first), py(pt.second)});
+    CurveGeomKey geomKey;
+    geomKey.pts.reserve(pix.size());
+    for (const auto& pt : pix) geomKey.pts.push_back({pt.first, pt.second});
+    geomKey.rectLeft = 0.0f;
+    geomKey.rectTop = 0.0f;
+    geomKey.rectRight = static_cast<float>(canvas.widthPx);
+    geomKey.rectBottom = static_cast<float>(canvas.heightPx);
+    if (!slot.Matches(geomKey)) {
+        if (!slot.Rebuild(fac, geomKey)) {
+            fac->Release();
+            return;   // no segment geometry at all = the curve cannot be drawn, as before
         }
-        k->BeginFigure(D2D1::Point2F(px(pts[i].first), py(pts[i].second)),
-                       D2D1_FIGURE_BEGIN_HOLLOW);
-        k->AddLine(D2D1::Point2F(px(pts[i + 1].first), py(pts[i + 1].second)));
-        k->EndFigure(D2D1_FIGURE_END_OPEN);
-        k->Close();
-        k->Release();
-
-        ID2D1GradientStopCollection* sc = nullptr;
-        // 纯色：两个停靠点同色（一段只属于它右端那个控制点）。
-        const D2D1_COLOR_F segColor = ColorOfCtrl(srcIndex[i]);
-        const D2D1_GRADIENT_STOP gs[2] = {{0.0f, segColor}, {1.0f, segColor}};
-        ID2D1LinearGradientBrush* gb = nullptr;
-        const D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES props = {
-            D2D1::Point2F(px(pts[i].first), py(pts[i].second)),
-            D2D1::Point2F(px(pts[i + 1].first), py(pts[i + 1].second))};
-        if (SUCCEEDED(rt->CreateGradientStopCollection(gs, 2, &sc)) && sc &&
-            SUCCEEDED(rt->CreateLinearGradientBrush(props, sc, &gb)) && gb) {
-            rt->DrawGeometry(seg, gb, kCurveWidthDip * s);
-        }
-        if (gb) gb->Release();
-        if (sc) sc->Release();
-        seg->Release();
+    } else {
+        slot.AdoptKey(geomKey);
     }
+    for (std::size_t i = 0; i + 1 < pix.size(); ++i) {
+        ID2D1PathGeometry* seg = slot.SegmentAt(i);
+        if (!seg) break;
+        const D2D1_POINT_2F a = D2D1::Point2F(pix[i].first, pix[i].second);
+        const D2D1_POINT_2F b = D2D1::Point2F(pix[i + 1].first, pix[i + 1].second);
+        ID2D1LinearGradientBrush* gb = slot.BrushFor(rt, ColorOfCtrl(srcIndex[i]), a, b);
+        if (!gb) break;   // 建不出来这一色就停在这儿：与改前逐段各建一次的结果相同
+        gb->SetStartPoint(a);
+        gb->SetEndPoint(b);
+        rt->DrawGeometry(seg, gb, kCurveWidthDip * s);
+    }
+    slot.EndFrame();
 
     if (!pts.empty()) {
         // 回归排查（曲线塌到左边缘）留下的痕迹：把这条曲线的**实测范围**留在内存里，
@@ -1099,15 +1358,13 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             // Horizontal centring from measured ink: the first digit's left inset and the
             // last digit's right edge, so the ink box is centred on cx.
             float inkInsetDip = 0.0f;
-            IDWriteTextLayout* one = nullptr;
             const wchar_t chBuf[2] = {target[firstDigit], 0};
-            if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(chBuf, 1, numFmt2, 256.0f, 128.0f,
-                                                               &one)) &&
-                one) {
+            IDWriteTextLayout* one = g_textLayouts.Get(std::wstring(chBuf, 1), numFmt2, 256.0f,
+                                                      128.0f);
+            if (one) {
                 DWRITE_OVERHANG_METRICS o0{};
                 one->GetOverhangMetrics(&o0);
                 inkInsetDip = -o0.left;
-                one->Release();
             }
             const float inkW = MeasureTextWidth(measureText, numFmt2) - inkInsetDip * s;
             // 目标位置：按当前列数把整块（数字 + ¥）居中。
@@ -1132,14 +1389,14 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
             if (g_digitDrawMode == 0 && f.places.empty()) {
             for (size_t i = 0; i < target.size(); ++i) {
                 const float chX = (i < charXs.size()) ? (inkLeft + charXs[i]) : inkLeft;
-                IDWriteTextLayout* li = nullptr;
+                // ★ 一个字符一条排版结果，盒子 256x128 与原来逐字一致；这条结果现在**跨帧
+                //   留着**（键 = 字 + 格式 + 盒子）。画的仍是同一个字、同一个落点。
                 const wchar_t cb[2] = {target[i], 0};
-                if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(cb, 1, numFmt2, 256.0f, 128.0f,
-                                                                   &li)) &&
-                    li) {
+                IDWriteTextLayout* li = g_textLayouts.Get(std::wstring(cb, 1), numFmt2, 256.0f,
+                                                          128.0f);
+                if (li) {
                     rt->DrawTextLayout(D2D1::Point2F(chX, numberTop), li, b,
                                        D2D1_DRAW_TEXT_OPTIONS_NONE);
-                    li->Release();
                 }
             }
             }
@@ -1165,14 +1422,12 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                     const int place = dshb::axis::PlaceOfSlot(f.amountText, static_cast<int>(i));
                     if (place == dshb::axis::kNoPlace) {
                         // 小数点等非数字字符：原位画出，不参与滚动
-                        IDWriteTextLayout* lp = nullptr;
                         const wchar_t cp[2] = {target[i], 0};
-                        if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(cp, 1, numFmt2, 256.0f,
-                                                                          128.0f, &lp)) &&
-                            lp) {
+                        IDWriteTextLayout* lp = g_textLayouts.Get(std::wstring(cp, 1), numFmt2,
+                                                                  256.0f, 128.0f);
+                        if (lp) {
                             rt->DrawTextLayout(D2D1::Point2F(chX, numberTop), lp, b,
                                                D2D1_DRAW_TEXT_OPTIONS_NONE);
-                            lp->Release();
                         }
                         continue;
                     }
@@ -1201,14 +1456,12 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                     for (int k2 = 0; k2 < 2; ++k2) {
                         const float y = yb - static_cast<float>(k2) * h;   // hi 从上面补进来
                         if (y + inkTopDip + inkH < winTop || y + inkTopDip > winBottom) continue;
-                        IDWriteTextLayout* ld = nullptr;
                         const wchar_t cd[2] = {static_cast<wchar_t>(L'0' + draw2[k2]), 0};
-                        if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(cd, 1, numFmt2, 256.0f,
-                                                                          128.0f, &ld)) &&
-                            ld) {
+                        IDWriteTextLayout* ld = g_textLayouts.Get(std::wstring(cd, 1), numFmt2,
+                                                                  256.0f, 128.0f);
+                        if (ld) {
                             rt->DrawTextLayout(D2D1::Point2F(chX, y), ld, b,
                                                D2D1_DRAW_TEXT_OPTIONS_NONE);
-                            ld->Release();
                         }
                     }
                     if (cutLo) rt->PopAxisAlignedClip();
@@ -1240,14 +1493,12 @@ void PaintWidgetText(ID2D1RenderTarget* rt, const CanvasSize& canvas, const Widg
                             : dshb::axis::OffsetOf(st, digit, h);
                         const float y = numberTop + static_cast<float>(off);
                         if (y + inkTopDip + inkH < winTop || y + inkTopDip > winBottom) continue;
-                        IDWriteTextLayout* ld = nullptr;
                         const wchar_t cd[2] = {static_cast<wchar_t>(L'0' + digit), 0};
-                        if (SUCCEEDED(DebugWriteFactory()->CreateTextLayout(cd, 1, numFmt2, 256.0f,
-                                                                          128.0f, &ld)) &&
-                            ld) {
+                        IDWriteTextLayout* ld = g_textLayouts.Get(std::wstring(cd, 1), numFmt2,
+                                                                  256.0f, 128.0f);
+                        if (ld) {
                             rt->DrawTextLayout(D2D1::Point2F(chX, y), ld, b,
                                                D2D1_DRAW_TEXT_OPTIONS_NONE);
-                            ld->Release();
                         }
                     }
                     if (needClip) rt->PopAxisAlignedClip();
@@ -2011,6 +2262,10 @@ CanvasSize Renderer::SizeForWindow(HWND hwnd) {
 
 bool Renderer::Create(HWND hwnd, const CanvasSize& size) {
     Destroy();
+    // 新画布 = 新的渲染目标与新的设备资源：复用表里的每一件都必须重来
+    // （画布换了之后，任何按旧画布算出来的几何体与排版盒子都是错的）。
+    // ★ 放在 Destroy() 之后：Destroy 自己也会作废一次，这里是第二次，代价是一次空遍历。
+    InvalidateRendererCaches();
     hwnd_ = hwnd;
     size_ = size;
     impl_ = new Impl();
@@ -2117,6 +2372,9 @@ bool Renderer::Resize(HWND hwnd) {
 }
 
 void Renderer::Destroy() {
+    // 设备要没了：复用表里凡是归属渲染目标的资源都得在这里放掉，否则目标先死、它们
+    // 还留着 —— 那是悬空引用，下一次 Create 会往一个已经销毁的目标上贴。
+    InvalidateRendererCaches();
     if (impl_) {
         impl_->ReleaseAll();
         delete impl_;
@@ -2124,6 +2382,9 @@ void Renderer::Destroy() {
     }
     ready_ = false;
 }
+
+// 可见性闸门恢复时由宿主调用：复用表整批作废（见 renderer.h 的说明）。
+void Renderer::ForgetReusableObjects() { InvalidateRendererCaches(); }
 
 void Renderer::SetWidgetFrame(const WidgetFrame& frame) {
     widget_ = frame;
@@ -2257,10 +2518,24 @@ HRESULT Renderer::RenderFrame(double elapsedSeconds) {
     d.dc->BeginDraw();
     PaintScene(d.dc, size_, elapsedSeconds, ActivationFlash(elapsedSeconds), debugText_,
                &d.glow, /*isExport=*/false, &particles_);
-    const HRESULT hrEnd = d.dc->EndDraw();
+    HRESULT hrEnd = d.dc->EndDraw();
+    if (hrEnd == D2DERR_RECREATE_TARGET) {
+        // ---- 设备丢失（D6）----
+        // 为什么以前不需要、现在需要：改前每一个 D2D 对象都是"一帧之内建了就放"，设备一丢
+        // 下一帧自然全部重建；这次改动把段几何体、停靠集与刷子**留在了复用表里**，它们归属
+        // 那个已经丢失的设备 —— 不清理就会一直画不出来（一块永远空白的面板），直到用户重启
+        // 进程。所以设备丢失从"自动恢复"变成了"必须处理"。
+        //
+        // 只做错误处理、不动任何绘制值：把复用表整批作废（下次用到时按新设备重建），然后
+        // 把**这一帧原样重画一次**。帧数据没有被改动过，重试画的是同样的内容、同样的顺序、
+        // 同样的变换 —— 所以重试出来的像素与没丢设备时那一帧相同。
+        ForgetReusableObjects();
+        d.dc->BeginDraw();
+        PaintScene(d.dc, size_, elapsedSeconds, ActivationFlash(elapsedSeconds), debugText_,
+                   &d.glow, /*isExport=*/false, &particles_);
+        hrEnd = d.dc->EndDraw();
+    }
     if (FAILED(hrEnd)) {
-        // A0 鐨勬暀璁細杩欓噷澶辫触鏃?Present 浠嶄細杩斿洖 S_OK锛岀敾闈笂鍗翠粈涔堥兘娌℃湁锛?
-        // 鎵€浠ュ繀椤诲湪 EndDraw 杩欎竴灞傚氨鑳界湅瑙佸け璐ャ€?
         return hrEnd;
     }
     if (g_noPresent) return S_OK;   // 量光栅代价：不提交，也就没有等垂直空白那一段

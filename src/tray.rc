@@ -41,19 +41,35 @@ DSHB_ICON_PNG RCDATA "..\\icon.png"
 //   无法从 exe 本身判断自己拿的是哪一版。
 // ★ 全部值都用 ASCII：rc.exe **不认** `\u` 转义（写了会变成字面量 `\u4f59...`，
 //   实测踩过），而字符串块的长度必须是 8 的倍数，所以每块末尾留 \0 填充。
-// ★ 一个版本号活在**四处**，发版时全都要动（漏一处就会出现"包里的 exe 说自己
+// ★ 一个版本号活在**五处**，发版时全都要动（漏一处就会出现"包里的 exe 说自己
 //   是上一版"）：
 //     1. 本文件下面的 FILEVERSION / PRODUCTVERSION，以及 StringFileInfo 里那两条
 //        FileVersion / ProductVersion —— 四段式，exe 属性里显示的就是它们；
 //     2. http_get.cpp 里的 User-Agent 默认值 —— 三段式，服务器看到的是它；
 //     3. dist\README.md 的标题 —— 拿到 zip 的人第一眼看到的；
-//     4. dist 里 zip 的文件名。
-//   （这四处的格式天然不同：资源里必须是四段的 0,2,3,0，User-Agent 惯例是三段的
-//   0.2.3，所以这是**四处手工同步**，没有单一真相 —— 改完务必重建并用上面的
-//   VersionInfo 核一遍。）
-VS_VERSION_INFO VERSIONINFO
- FILEVERSION    0,2,3,0
- PRODUCTVERSION 0,2,3,0
+//     4. dist 里 zip 的文件名；
+//     5. src\app.manifest 的 assemblyIdentity version —— 四段式。清单是链接期进的
+//        exe，所以它坏了会**报链接/构建错**，不会静默不一致（0.2.4 起才开始跟着走，
+//        在此之前它一直停在 0.2.0.0）。
+//   （这五处的格式天然不同：资源与清单是四段的 0,2,4,0，User-Agent 惯例是三段的
+//   0.2.4，所以这是**五处手工同步**，没有单一真相 —— 核版本就用下面的文件属性。）
+// ★★ 类型的编号必须是数字 `1`，**不许写回 `VS_VERSION_INFO`**（0.2.4 实测）。
+//   `VS_VERSION_INFO` 是 winver.h 里的宏，而本文件**一个 #include 都没有**（理由：
+//   全 ASCII、不依赖 SDK 头，见上）；未定义的标识符会被 rc.exe 当成**名字串**，
+//   于是资源类型不是 16、ID 不是 1 —— 编译链接都正常，只是版本资源**永远读不出来**：
+//   GetFileVersionInfoSizeW 返回 0、lastErr=1813 ERROR_RESOURCE_TYPE_NOT_FOUND，
+//   exe 属性里 FileVersion/ProductVersion 全空、FileVersionRaw 显示 0.0.0.0，
+//   而它在 0.2.0~0.2.3 一直是这样、一直没人发现（版本文本**确实**在镜像里，
+//   所以字节级 grep 是搜得到的，只有 Windows 的读取路径看不见 —— 这就是它藏了这么久的原因）。
+//   → 改用数字 `1` 后（另一条等效的路是补 `#include <winver.h>`，但那要给这个
+//     刻意不依赖 SDK 头的文件引一个头，没必要）实测：GetFileVersionInfoSizeW = 1380、
+//     lastErr = 0，属性读回 FileVersion = ProductVersion = "0.2.4.0"、
+//     dwFileVersionMS/LS = 0.2 / 4.0。
+//   → 发版时**照旧核一遍文件属性**（悬停 exe 或 属性→详细信息）；若哪天它又变空，
+//     先看的就是这一行还在不在。
+1 VERSIONINFO
+ FILEVERSION    0,2,4,0
+ PRODUCTVERSION 0,2,4,0
  FILEOS         0x40004L
  FILETYPE       0x1L
 BEGIN
@@ -63,12 +79,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Kaczev\0"
             VALUE "FileDescription",  "DeepSeek balance widget\0"
-            VALUE "FileVersion",      "0.2.3.0\0"
+            VALUE "FileVersion",      "0.2.4.0\0"
             VALUE "InternalName",     "dshb\0"
             VALUE "LegalCopyright",   "MIT License\0"
             VALUE "OriginalFilename", "dshb.exe\0"
             VALUE "ProductName",      "deepseek-balance\0"
-            VALUE "ProductVersion",   "0.2.3.0\0"
+            VALUE "ProductVersion",   "0.2.4.0\0"
         END
     END
     BLOCK "VarFileInfo"

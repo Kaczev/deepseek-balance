@@ -47,7 +47,7 @@ target_compile_definitions(dshb PRIVATE
 
 target_link_libraries(dshb PRIVATE
     d2d1 d3d11 dcomp dwrite windowscodecs
-    user32 gdi32 ole32 uuid shell32 winhttp wtsapi32)
+    user32 gdi32 ole32 uuid shell32 winhttp wtsapi32 dwmapi)
 
 target_sources(dshb PRIVATE src/app.manifest)
 set_property(TARGET dshb PROPERTY VS_DPI_AWARE "PerMonitor")

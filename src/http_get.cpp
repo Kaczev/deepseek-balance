@@ -63,7 +63,7 @@ Response Get(const Request& request) {
         return bad;
     }
 
-    const std::wstring agent = request.userAgent.empty() ? L"deepseek-balance/0.2.3"
+    const std::wstring agent = request.userAgent.empty() ? L"deepseek-balance/0.2.4"
                                                          : request.userAgent;
     InternetHandle session(WinHttpOpen(agent.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));

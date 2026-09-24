@@ -50,6 +50,13 @@ public:
     // 重建画布（DPI 变更时用）
     bool Resize(HWND hwnd);
 
+    // ★ 可见性闸门（EDIT B）恢复时由宿主调用：把渲染器的复用表整批作废。
+    //   为什么要这个口子：复用表里是按**画布与渲染目标**算出来的几何体和排版盒子，
+    //   而窗口被盖住的那段时间里画布可能被换过（DPI 变更走 Resize -> Create）。
+    //   宿主只知道"我又看得见了"，只有渲染器知道那些对象还能不能用；所以把它交回渲染器
+    //   自己判断，而不是让宿主去猜。生产路径上唯一的调用点是主循环的可见性闸门。
+    void ForgetReusableObjects();
+
     // 画一帧并提交。返回 Present 的结果（便于这里直接发现失败）。
     HRESULT RenderFrame(double elapsedSeconds);
 
