@@ -1649,8 +1649,54 @@ bool WindowOccluded() {
     // 被别的窗口盖住：在**实体区**里取 3x3 个点问"这一点最上面是谁"。
     // ★ 只探实体区、不探外扩画布：外扩的 80 DIP 余量平时是透明的，上面永远压着桌面，
     //   拿它当判据会把自己一直判成被遮挡。
+    // ★★ 这一段以前是**坏的**（0.2.4 回归的根因，2026-09-25 实测修正）：抽点算自
+    //   `GetWindowRect`（整块画布），于是它跟上面那句注释正好相反 —— 9 个点里 8 个落在
+    //   外扩余量上。而窗口区域被 `ApplyInputRegion`（renderer.cpp:2402-2446）收到了实体区，
+    //   余量既不参与命中测试也不显示内容，所以那 8 个点量到的是"挂件背后有什么"。
+    //   实测（可见且置顶的挂件、背后一个浏览器窗口）：selfHits=1/9、foreignHits=8 ≥ 6
+    //   → 判"被遮挡" → 每 250 ms 睡一觉，刷新率从 63.8 Hz 掉到 3.6 Hz，挂件被自己冻住。
+    //
+    //   ★ 抽点必须**从命中测试区域本身推出来**，不能从窗口矩形减一个写死的数：
+    //     实测过三种坏法（都是「窗口不是 475x289」引起的，因为窗口宽度会被改）：
+    //       · `--ui-scale=0.6` -> 窗口 285 宽，比实体还窄，"减 80" 得到负数、整段退化成
+    //         改前的代码（旧 bug 原样回来）；
+    //       · `--ui-scale=0.75` -> 抽点只有中间一行落在区域内，3/9，同样判"被遮挡"；
+    //       · 把挂件拖到缩放比例不同的屏（`WM_DPICHANGED`，main.cpp 的 WM_DPICHANGED 处理）
+    //         -> 窗口被系统放大而 `Renderer::Resize` 尺寸不变直接返回（renderer.cpp:2368），
+    //         区域不重建，"减 80" 算出 317、矩形高低反转，0/9 命中。
+    //     `GetWindowRgn` 回的就是「现在真正能命中/真正显示」的那块，三种情形一并成立。
     RECT rc{};
     if (!GetWindowRect(g_hwnd, &rc)) return false;
+    {
+        RECT sample = rc;   // 兜底：区域查不到时退回整块窗口（与改前的判据一致）
+        HRGN rgn = CreateRectRgn(0, 0, 0, 0);
+        // 区域存在时 `GetWindowRgn` 返回类型（非 0）；返回 0 表示"没有区域"，
+        // ERROR 表示取不到 —— 两种都退回 sample。
+        if (rgn && GetWindowRgn(g_hwnd, rgn) > 0) {
+            RECT box{};
+            if (GetRgnBox(rgn, &box) != 0) {   // 0 = NULLREGION / ERROR
+                // 区域框是**客户区坐标**（区域由 SetWindowRgn 按窗口坐标设，无边框窗口
+                // 里两者相同，但这里仍按客户区->屏幕换算一次，免得哪天窗口有了边框）。
+                POINT tl{box.left, box.top};
+                POINT br{box.right, box.bottom};
+                if (ClientToScreen(g_hwnd, &tl) && ClientToScreen(g_hwnd, &br) &&
+                    br.x - tl.x > 0 && br.y - tl.y > 0) {
+                    sample.left = tl.x;
+                    sample.top = tl.y;
+                    sample.right = br.x;
+                    sample.bottom = br.y;
+                }
+            }
+        }
+        if (rgn) DeleteObject(rgn);
+        // 屏内裁剪：抽点落在屏幕之外时 WindowFromPoint 的结果没有意义（它会落在别的
+        // 显示器上或被丢掉），所以只保留仍在窗口矩形里的那部分。
+        if (sample.left < rc.left) sample.left = rc.left;
+        if (sample.top < rc.top) sample.top = rc.top;
+        if (sample.right > rc.right) sample.right = rc.right;
+        if (sample.bottom > rc.bottom) sample.bottom = rc.bottom;
+        if (sample.right - sample.left > 0 && sample.bottom - sample.top > 0) rc = sample;
+    }
     const LONG insetX = static_cast<LONG>((rc.right - rc.left) * 0.15);
     const LONG insetY = static_cast<LONG>((rc.bottom - rc.top) * 0.15);
     // ★ 判据是"**大多数**抽点都落在同一个别的窗口上"，不是"有一个点被别人占了"。
